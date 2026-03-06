@@ -22,5 +22,9 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Blackbox records your microphone alongside call audio to capture both sides of the conversation.</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/tenequm/blackbox/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>8FE6PMYVVKWR12TGUuqeX+C6DJMYZm2FnbEBRtAI7ec=</string>
 </dict>
 </plist>

@@ -1,9 +1,12 @@
+import Sparkle
 import SwiftUI
 
 @main
 struct BlackboxApp: App {
   @NSApplicationDelegateAdaptor private var delegate: AppDelegate
   @State private var monitor = AudioMonitor()
+  private let updaterController = SPUStandardUpdaterController(
+    startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
   init() {
     monitor.startMonitoring()
@@ -11,7 +14,7 @@ struct BlackboxApp: App {
 
   var body: some Scene {
     MenuBarExtra {
-      MenuContent(monitor: monitor)
+      MenuContent(monitor: monitor, updater: updaterController.updater)
     } label: {
       if monitor.isRecording {
         Image(systemName: "waveform.circle.fill")
@@ -51,6 +54,7 @@ struct BlackboxApp: App {
 
 struct MenuContent: View {
   let monitor: AudioMonitor
+  let updater: SPUUpdater
   @Environment(\.dismiss) private var dismiss
   @Environment(\.openSettings) private var openSettings
 
@@ -110,6 +114,10 @@ struct MenuContent: View {
       let url = monitor.saveDirectory
       try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
       NSWorkspace.shared.open(url)
+    }
+
+    Button("Check for Updates...") {
+      updater.checkForUpdates()
     }
 
     Button("Settings...") {
