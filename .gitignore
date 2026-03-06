@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Build
+build/
+.build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment and credentials
+.env
+
+# Claude Code
+**/.claude/settings.local.json
