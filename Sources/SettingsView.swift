@@ -167,6 +167,8 @@ struct SettingsView: View {
   }
 }
 
-let defaultTargetBundleIDsJSON = #"["com.google.Chrome","us.zoom.xos"]"#
-let defaultMeetingPatternsJSON = #"["Meet -","meet.google.com","Zoom Meeting","Zoom"]"#
+let defaultTargetBundleIDsJSON =
+  #"["com.google.Chrome","us.zoom.xos","ru.keepcoder.Telegram","org.telegram.desktop"]"#
+let defaultMeetingPatternsJSON =
+  #"["Meet -","meet.google.com","Zoom Meeting","Zoom","Voice Chat","Video Chat"]"#
 let defaultSaveDirectoryPath = NSHomeDirectory() + "/Documents/Blackbox"

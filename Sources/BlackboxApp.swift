@@ -14,11 +14,11 @@ struct BlackboxApp: App {
       MenuContent(monitor: monitor)
     } label: {
       if monitor.isRecording {
-        Image(systemName: "record.circle.fill")
+        Image(systemName: "waveform.circle.fill")
           .symbolRenderingMode(.palette)
           .foregroundStyle(.red, .primary)
       } else {
-        Image(systemName: "record.circle")
+        Image(systemName: "waveform")
           .foregroundStyle(.secondary)
       }
     }
@@ -52,6 +52,7 @@ struct BlackboxApp: App {
 struct MenuContent: View {
   let monitor: AudioMonitor
   @Environment(\.dismiss) private var dismiss
+  @Environment(\.openSettings) private var openSettings
 
   var body: some View {
     Color.clear.frame(width: 0, height: 0)
@@ -111,9 +112,11 @@ struct MenuContent: View {
       NSWorkspace.shared.open(url)
     }
 
-    SettingsLink {
-      Text("Settings...")
+    Button("Settings...") {
+      openSettings()
+      NSApplication.shared.activate(ignoringOtherApps: true)
     }
+    .keyboardShortcut(",", modifiers: .command)
 
     Divider()
 

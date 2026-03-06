@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
+import UserNotifications
 
 @Observable
 final class AudioMonitor {
@@ -35,6 +36,9 @@ final class AudioMonitor {
     if !CGPreflightScreenCaptureAccess() {
       permissionNeeded = true
     }
+
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    UNUserNotificationCenter.current().delegate = notificationDelegate
 
     let ws = NSWorkspace.shared.notificationCenter
     notificationTokens.append(
@@ -139,10 +143,12 @@ final class AudioMonitor {
 
   func stopManualRecording() {
     guard let recorder = manualRecorder else { return }
+    let appName = currentAppName ?? recorder.appName
     manualRecorder = nil
     isManualRecording = false
     Task {
-      await recorder.stop()
+      let url = await recorder.stop()
+      if let url { postRecordingSavedNotification(appName: appName, fileURL: url) }
       updateState()
     }
   }
@@ -150,7 +156,6 @@ final class AudioMonitor {
   // MARK: - Meeting Window Detection
 
   private func pollMeetingWindows() {
-    // Re-check permission each cycle
     if !CGPreflightScreenCaptureAccess() {
       permissionNeeded = true
       return
@@ -243,7 +248,8 @@ final class AudioMonitor {
   private func stopSession(bundleID: String) {
     guard let session = sessions.removeValue(forKey: bundleID) else { return }
     Task {
-      await session.recorder.stop()
+      let url = await session.recorder.stop()
+      if let url { postRecordingSavedNotification(appName: session.appName, fileURL: url) }
       updateState()
     }
   }
@@ -280,6 +286,44 @@ final class AudioMonitor {
     micEnabled = defaults.object(forKey: "micEnabled") as? Bool ?? true
     let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
     saveDirectory = URL(fileURLWithPath: path)
+  }
+}
+
+// MARK: - Notifications
+
+private let notificationDelegate = NotificationDelegate()
+
+private func postRecordingSavedNotification(appName: String, fileURL: URL) {
+  let content = UNMutableNotificationContent()
+  content.title = "Recording Saved"
+  content.body = "\(appName) - \(fileURL.lastPathComponent)"
+  content.sound = .default
+  content.userInfo = ["filePath": fileURL.path]
+
+  let request = UNNotificationRequest(
+    identifier: UUID().uuidString, content: content, trigger: nil)
+  UNUserNotificationCenter.current().add(request)
+}
+
+private final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate,
+  @unchecked Sendable
+{
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse
+  ) async {
+    guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+      let path = response.notification.request.content.userInfo["filePath"] as? String
+    else { return }
+    let url = URL(fileURLWithPath: path)
+    NSWorkspace.shared.activateFileViewerSelecting([url])
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification
+  ) async -> UNNotificationPresentationOptions {
+    [.banner, .sound]
   }
 }
 

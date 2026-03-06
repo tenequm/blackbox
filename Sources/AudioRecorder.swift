@@ -98,7 +98,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   /// Stops capture and finalizes the recording file.
   /// Serializes writer teardown on audioQueue to prevent races with callbacks.
-  func stop() async {
+  /// Returns the saved file URL, or nil if no audio was captured or write failed.
+  @discardableResult
+  func stop() async -> URL? {
     if let stream {
       try? await stream.stopCapture()
     }
@@ -112,6 +114,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
 
     // finishWriting is async and safe to call from MainActor after markAsFinished
+    var savedURL: URL?
     if let writer {
       if !sessionStarted {
         // No audio was ever received - cancel and delete empty file
@@ -122,6 +125,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         if writer.status == .failed {
           print("Blackbox: writer failed: \(writer.error?.localizedDescription ?? "unknown")")
           if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+        } else {
+          savedURL = fileURL
         }
       }
     }
@@ -136,6 +141,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       ProcessInfo.processInfo.endActivity(activity)
       self.activity = nil
     }
+
+    return savedURL
   }
 
   // MARK: - Writer Setup
