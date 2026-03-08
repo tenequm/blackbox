@@ -9,6 +9,8 @@ struct BlackboxApp: App {
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
   init() {
+    LogFile.rotateIfNeeded()
+    Log.info(Log.app, "app", "launched")
     monitor.startMonitoring()
   }
 
@@ -37,12 +39,17 @@ struct BlackboxApp: App {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       if !CGPreflightScreenCaptureAccess() {
+        Log.info(Log.app, "app", "requesting screen recording permission")
         CGRequestScreenCaptureAccess()
       }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-      guard let monitor else { return .terminateNow }
+      guard let monitor else {
+        Log.info(Log.app, "app", "terminating (no monitor)")
+        return .terminateNow
+      }
+      Log.info(Log.app, "app", "terminating, cleaning up recordings")
       Task {
         await monitor.stopMonitoring()
         NSApplication.shared.reply(toApplicationShouldTerminate: true)

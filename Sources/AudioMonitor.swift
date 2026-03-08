@@ -34,6 +34,7 @@ final class AudioMonitor {
 
     // Check screen recording permission
     if !CGPreflightScreenCaptureAccess() {
+      Log.info(Log.monitor, "monitor", "screen recording permission not granted")
       permissionNeeded = true
     }
 
@@ -116,7 +117,7 @@ final class AudioMonitor {
 
     recorder.onError = { [weak self] error in
       Task { @MainActor [weak self] in
-        print("Blackbox: manual recording error: \(error)")
+        Log.error(Log.monitor, "monitor", "manual recording error: \(error)")
         self?.manualRecorder = nil
         self?.isManualRecording = false
         self?.updateState()
@@ -133,7 +134,7 @@ final class AudioMonitor {
       do {
         try await recorder.start()
       } catch {
-        print("Blackbox: failed to start manual recording: \(error)")
+        Log.error(Log.monitor, "monitor", "failed to start manual recording: \(error)")
         manualRecorder = nil
         isManualRecording = false
         updateState()
@@ -216,6 +217,7 @@ final class AudioMonitor {
       saveDirectory: saveDirectory
     )
 
+    Log.info(Log.monitor, "monitor", "starting session for \(appName) (\(bundleID))")
     sessions[bundleID] = RecordingSession(
       bundleID: bundleID,
       appName: appName,
@@ -225,7 +227,7 @@ final class AudioMonitor {
 
     recorder.onError = { [weak self] error in
       Task { @MainActor [weak self] in
-        print("Blackbox: stream error for \(appName): \(error)")
+        Log.error(Log.monitor, "monitor", "stream error for \(appName): \(error)")
         self?.stopSession(bundleID: bundleID)
       }
     }
@@ -235,7 +237,7 @@ final class AudioMonitor {
         try await recorder.start()
         updateState()
       } catch {
-        print("Blackbox: failed to start recording \(appName): \(error)")
+        Log.error(Log.monitor, "monitor", "failed to start recording \(appName): \(error)")
         if let scError = error as? SCStreamError, scError.code == .userDeclined {
           permissionNeeded = true
         }
@@ -247,6 +249,7 @@ final class AudioMonitor {
 
   private func stopSession(bundleID: String) {
     guard let session = sessions.removeValue(forKey: bundleID) else { return }
+    Log.info(Log.monitor, "monitor", "stopping session for \(session.appName) (\(bundleID))")
     Task {
       let url = await session.recorder.stop()
       if let url { postRecordingSavedNotification(appName: session.appName, fileURL: url) }

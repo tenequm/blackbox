@@ -38,12 +38,16 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   /// Starts capturing audio and writing to file immediately.
   func start() async throws {
+    Log.recorder.info(
+      "start() for \(self.appName, privacy: .public) (\(self.bundleID, privacy: .public))")
     let content = try await SCShareableContent.excludingDesktopWindows(
       false, onScreenWindowsOnly: false)
     guard let display = content.displays.first else {
+      Log.error(Log.recorder, "recorder", "no display found for \(appName)")
       throw RecorderError.noDisplay
     }
     guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
+      Log.error(Log.recorder, "recorder", "app not found: \(bundleID)")
       throw RecorderError.appNotFound
     }
 
@@ -81,7 +85,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     do {
       try await stream.startCapture()
+      Log.recorder.info("stream started for \(self.appName, privacy: .public)")
     } catch {
+      Log.error(Log.recorder, "recorder", "stream failed to start for \(appName): \(error)")
       // Clean up writer and activity if stream fails to start
       writer?.cancelWriting()
       if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
@@ -101,6 +107,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   /// Returns the saved file URL, or nil if no audio was captured or write failed.
   @discardableResult
   func stop() async -> URL? {
+    Log.recorder.info("stop() for \(self.appName, privacy: .public)")
     if let stream {
       try? await stream.stopCapture()
     }
@@ -123,7 +130,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       } else {
         await writer.finishWriting()
         if writer.status == .failed {
-          print("Blackbox: writer failed: \(writer.error?.localizedDescription ?? "unknown")")
+          Log.error(
+            Log.recorder, "recorder",
+            "writer failed: \(writer.error?.localizedDescription ?? "unknown")")
           if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
         } else {
           savedURL = fileURL
@@ -155,6 +164,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     let filename = "\(formatter.string(from: Date()))_\(appName).m4a"
     let url = saveDirectory.appendingPathComponent(filename)
     fileURL = url
+    Log.recorder.info("writing to \(url.lastPathComponent, privacy: .public)")
 
     let audioSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -179,6 +189,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     guard writer.startWriting() else {
       let err = writer.error
+      Log.error(
+        Log.recorder, "recorder",
+        "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
       throw err ?? RecorderError.writerFailed
     }
     self.writer = writer
@@ -207,6 +220,7 @@ extension AudioRecorder: SCStreamOutput {
       if !sessionStarted {
         writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
         sessionStarted = true
+        Log.recorder.debug("first audio buffer received for \(self.appName, privacy: .public)")
       }
       if let input = systemAudioInput, input.isReadyForMoreMediaData {
         input.append(sampleBuffer)
@@ -215,6 +229,7 @@ extension AudioRecorder: SCStreamOutput {
       if !sessionStarted {
         writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
         sessionStarted = true
+        Log.recorder.debug("first mic buffer received for \(self.appName, privacy: .public)")
       }
       if let input = micAudioInput, input.isReadyForMoreMediaData {
         input.append(sampleBuffer)

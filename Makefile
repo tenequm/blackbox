@@ -15,6 +15,7 @@ bundle: build
 	mkdir -p "$(APP_BUNDLE)/Contents/Frameworks"
 	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
 	cp .build/release/$(APP_NAME) "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
+	install_name_tool -add_rpath @executable_path/../Frameworks "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Assets/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
 	cp -R "$(SPARKLE_PATH)" "$(APP_BUNDLE)/Contents/Frameworks/"

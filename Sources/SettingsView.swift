@@ -77,6 +77,23 @@ struct SettingsView: View {
         }
       }
 
+      Section("Debug") {
+        HStack {
+          Button("Open Log File") {
+            let fm = FileManager.default
+            try? fm.createDirectory(at: LogFile.directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(LogFile.directory)
+          }
+          Button("Copy Debug Log") {
+            let url = LogFile.export()
+            if let contents = try? String(contentsOf: url, encoding: .utf8) {
+              NSPasteboard.general.clearContents()
+              NSPasteboard.general.setString(contents, forType: .string)
+            }
+          }
+        }
+      }
+
       Section("Recordings") {
         HStack {
           Text(saveDirectoryPath)
