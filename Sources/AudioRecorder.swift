@@ -8,19 +8,19 @@ import ScreenCaptureKit
 /// All mutable recording state is accessed exclusively from `audioQueue` (a serial dispatch queue).
 /// `stop()` dispatches teardown onto `audioQueue` to serialize with callbacks, then awaits the writer.
 final class AudioRecorder: NSObject, @unchecked Sendable {
-  nonisolated let bundleID: String
+  nonisolated let bundleID: String?
   nonisolated let appName: String
   nonisolated let micEnabled: Bool
   nonisolated let saveDirectory: URL
 
-  nonisolated(unsafe) var onError: (@Sendable (any Error) -> Void)?
+  nonisolated let onError: (@Sendable (any Error) -> Void)?
 
   private let audioQueue = DispatchQueue(label: "com.tenequm.blackbox.audio")
 
   // Stream - set/cleared on MainActor (before start / after stopCapture)
   nonisolated(unsafe) private var stream: SCStream?
 
-  // All writer state accessed exclusively from audioQueue
+  // All writer state published to audioQueue via sync in setupWriter/stop
   nonisolated(unsafe) private var writer: AVAssetWriter?
   nonisolated(unsafe) private var systemAudioInput: AVAssetWriterInput?
   nonisolated(unsafe) private var micAudioInput: AVAssetWriterInput?
@@ -29,32 +29,44 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var fileURL: URL?
   nonisolated(unsafe) private var activity: NSObjectProtocol?
 
-  init(bundleID: String, appName: String, micEnabled: Bool, saveDirectory: URL) {
+  init(
+    bundleID: String? = nil, appName: String, micEnabled: Bool, saveDirectory: URL,
+    onError: (@Sendable (any Error) -> Void)? = nil
+  ) {
     self.bundleID = bundleID
     self.appName = appName
     self.micEnabled = micEnabled
     self.saveDirectory = saveDirectory
+    self.onError = onError
   }
 
   /// Starts capturing audio and writing to file immediately.
   func start() async throws {
     Log.recorder.info(
-      "start() for \(self.appName, privacy: .public) (\(self.bundleID, privacy: .public))")
+      "start() for \(self.appName, privacy: .public) (\(self.bundleID ?? "all", privacy: .public))")
     let content = try await SCShareableContent.excludingDesktopWindows(
       false, onScreenWindowsOnly: false)
     guard let display = content.displays.first else {
       Log.error(Log.recorder, "recorder", "no display found for \(appName)")
       throw RecorderError.noDisplay
     }
-    guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
-      Log.error(Log.recorder, "recorder", "app not found: \(bundleID)")
-      throw RecorderError.appNotFound
+
+    let filter: SCContentFilter
+    if let bundleID {
+      // App-specific capture
+      guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
+        Log.error(Log.recorder, "recorder", "app not found: \(bundleID)")
+        throw RecorderError.appNotFound
+      }
+      filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+    } else {
+      // Display-wide capture (all system audio)
+      filter = SCContentFilter(
+        display: display, excludingApplications: [], exceptingWindows: [])
     }
 
     // Set up file writer before starting stream
     try setupWriter()
-
-    let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
 
     let config = SCStreamConfiguration()
     config.width = 2
@@ -113,8 +125,10 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
     stream = nil
 
-    // Mark stopped and finalize writer on audioQueue to serialize with any in-flight callbacks
+    // Mark stopped and capture state on audioQueue to serialize with any in-flight callbacks
+    var wasStarted = false
     audioQueue.sync {
+      wasStarted = sessionStarted
       stopped = true
       systemAudioInput?.markAsFinished()
       micAudioInput?.markAsFinished()
@@ -123,7 +137,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     // finishWriting is async and safe to call from MainActor after markAsFinished
     var savedURL: URL?
     if let writer {
-      if !sessionStarted {
+      if !wasStarted {
         // No audio was ever received - cancel and delete empty file
         writer.cancelWriting()
         if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
@@ -163,7 +177,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
     let filename = "\(formatter.string(from: Date()))_\(appName).m4a"
     let url = saveDirectory.appendingPathComponent(filename)
-    fileURL = url
     Log.recorder.info("writing to \(url.lastPathComponent, privacy: .public)")
 
     let audioSettings: [String: Any] = [
@@ -173,29 +186,37 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       AVEncoderBitRateKey: 128_000,
     ]
 
-    let writer = try AVAssetWriter(url: url, fileType: .m4a)
+    let newWriter = try AVAssetWriter(url: url, fileType: .m4a)
 
     let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
     systemInput.expectsMediaDataInRealTime = true
-    writer.add(systemInput)
-    systemAudioInput = systemInput
+    newWriter.add(systemInput)
 
+    var micInput: AVAssetWriterInput?
     if micEnabled {
-      let micInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-      micInput.expectsMediaDataInRealTime = true
-      writer.add(micInput)
-      micAudioInput = micInput
+      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+      input.expectsMediaDataInRealTime = true
+      newWriter.add(input)
+      micInput = input
     }
 
-    guard writer.startWriting() else {
-      let err = writer.error
+    guard newWriter.startWriting() else {
+      let err = newWriter.error
       Log.error(
         Log.recorder, "recorder",
         "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
       throw err ?? RecorderError.writerFailed
     }
-    self.writer = writer
-    stopped = false
+
+    // Publish mutable state to audioQueue with memory barrier so callbacks see it
+    audioQueue.sync {
+      self.writer = newWriter
+      self.systemAudioInput = systemInput
+      self.micAudioInput = micInput
+      self.fileURL = url
+      self.sessionStarted = false
+      self.stopped = false
+    }
   }
 }
 

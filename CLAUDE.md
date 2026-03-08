@@ -11,6 +11,9 @@ Sources/
   AudioMonitor.swift       - @Observable: process/window monitoring, recording lifecycle
   AudioRecorder.swift      - SCStream + AVAssetWriter, dual-track M4A
   SettingsView.swift       - Settings UI, defaults constants
+  OnboardingView.swift     - First-launch onboarding: permissions walkthrough
+  RecordingHUD.swift       - Floating NSPanel toast on recording start
+  Log.swift                - OSLog + file logging, debug export
 Info.plist                 - LSUIElement, NSMicrophoneUsageDescription
 Makefile                   - build, bundle, install, run, format, clean
 ```

@@ -1,5 +1,4 @@
 import AppKit
-import CoreGraphics
 import Foundation
 import ScreenCaptureKit
 import UserNotifications
@@ -11,6 +10,11 @@ final class AudioMonitor {
   private(set) var recordingStartTime: Date?
   private(set) var permissionNeeded = false
   private(set) var isManualRecording = false
+  private(set) var errorMessage: String?
+  private(set) var isPaused = false
+  private(set) var graceCountdown: TimeInterval?
+  private(set) var isSaving = false
+  private var savingCount = 0
 
   private var sessions: [String: RecordingSession] = [:]
   private var monitoringTask: Task<Void, Never>?
@@ -22,11 +26,19 @@ final class AudioMonitor {
   // Manual recording state
   private var manualRecorder: AudioRecorder?
 
+  // Recording start HUD
+  private let hud = RecordingHUD()
+
   var targetBundleIDs: Set<String> = []
   var meetingPatterns: [String] = []
   var gracePeriod: TimeInterval = 30
   var micEnabled: Bool = true
   var saveDirectory: URL = URL(fileURLWithPath: defaultSaveDirectoryPath)
+
+  // Notification preferences
+  var notifyOnStart: Bool = true
+  var notifyOnSaved: Bool = true
+  var notifyOnError: Bool = true
 
   func startMonitoring() {
     guard monitoringTask == nil else { return }
@@ -38,8 +50,23 @@ final class AudioMonitor {
       permissionNeeded = true
     }
 
-    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     UNUserNotificationCenter.current().delegate = notificationDelegate
+
+    // Request notification authorization if not yet determined
+    Task {
+      let settings = await UNUserNotificationCenter.current().notificationSettings()
+      if settings.authorizationStatus == .notDetermined {
+        let _ = try? await UNUserNotificationCenter.current().requestAuthorization(
+          options: [.alert, .sound])
+      }
+    }
+
+    // Register actionable notification category
+    let revealAction = UNNotificationAction(identifier: "reveal", title: "Reveal in Finder")
+    let playAction = UNNotificationAction(identifier: "play", title: "Play")
+    let category = UNNotificationCategory(
+      identifier: "recordingSaved", actions: [revealAction, playAction], intentIdentifiers: [])
+    UNUserNotificationCenter.current().setNotificationCategories([category])
 
     let ws = NSWorkspace.shared.notificationCenter
     notificationTokens.append(
@@ -98,43 +125,56 @@ final class AudioMonitor {
     updateState()
   }
 
+  // MARK: - Pause & Error
+
+  func togglePause() {
+    isPaused.toggle()
+    if isPaused { graceCountdown = nil }
+  }
+
+  func clearError() { errorMessage = nil }
+
+  private func setError(_ message: String) {
+    Log.error(Log.monitor, "monitor", message)
+    errorMessage = message
+    if notifyOnError { postErrorNotification(message: message) }
+    Task {
+      try? await Task.sleep(for: .seconds(10))
+      if errorMessage == message { errorMessage = nil }
+    }
+  }
+
   // MARK: - Manual Recording
 
-  func startManualRecording(bundleID: String) {
+  func startManualRecording() {
     guard manualRecorder == nil else { return }
 
-    let runningApps = NSWorkspace.shared.runningApplications
-    let appName =
-      runningApps.first(where: { $0.bundleIdentifier == bundleID })?
-      .localizedName ?? bundleID.components(separatedBy: ".").last ?? bundleID
-
     let recorder = AudioRecorder(
-      bundleID: bundleID,
-      appName: appName,
+      appName: "Manual recording",
       micEnabled: micEnabled,
-      saveDirectory: saveDirectory
-    )
-
-    recorder.onError = { [weak self] error in
-      Task { @MainActor [weak self] in
-        Log.error(Log.monitor, "monitor", "manual recording error: \(error)")
-        self?.manualRecorder = nil
-        self?.isManualRecording = false
-        self?.updateState()
+      saveDirectory: saveDirectory,
+      onError: { [weak self] error in
+        Task { @MainActor [weak self] in
+          self?.setError("Manual recording interrupted: \(error.localizedDescription)")
+          self?.manualRecorder = nil
+          self?.isManualRecording = false
+          self?.updateState()
+        }
       }
-    }
+    )
 
     manualRecorder = recorder
     isManualRecording = true
-    recordingStartTime = Date()
-    currentAppName = appName
-    isRecording = true
 
     Task {
       do {
         try await recorder.start()
+        recordingStartTime = Date()
+        currentAppName = "Manual recording"
+        isRecording = true
+        hud.show(appName: "Manual recording", bundleID: nil)
       } catch {
-        Log.error(Log.monitor, "monitor", "failed to start manual recording: \(error)")
+        setError("Failed to start recording: \(error.localizedDescription)")
         manualRecorder = nil
         isManualRecording = false
         updateState()
@@ -147,9 +187,15 @@ final class AudioMonitor {
     let appName = currentAppName ?? recorder.appName
     manualRecorder = nil
     isManualRecording = false
+    savingCount += 1
+    isSaving = true
     Task {
       let url = await recorder.stop()
-      if let url { postRecordingSavedNotification(appName: appName, fileURL: url) }
+      savingCount -= 1
+      isSaving = savingCount > 0
+      if let url, notifyOnSaved {
+        postRecordingSavedNotification(appName: appName, fileURL: url)
+      }
       updateState()
     }
   }
@@ -162,6 +208,7 @@ final class AudioMonitor {
       return
     }
     permissionNeeded = false
+    guard !isPaused else { return }
 
     let runningApps = NSWorkspace.shared.runningApplications
     let windowList =
@@ -172,6 +219,8 @@ final class AudioMonitor {
     for bundleID in sessions.keys where !targetBundleIDs.contains(bundleID) {
       stopSession(bundleID: bundleID)
     }
+
+    var anyGraceActive = false
 
     for bundleID in targetBundleIDs {
       guard let app = runningApps.first(where: { $0.bundleIdentifier == bundleID }) else {
@@ -199,12 +248,18 @@ final class AudioMonitor {
         }
       } else if sessions[bundleID] != nil {
         let lastSeen = meetingLastSeen[bundleID] ?? Date.distantPast
-        if Date().timeIntervalSince(lastSeen) >= gracePeriod {
+        let elapsed = Date().timeIntervalSince(lastSeen)
+        if elapsed >= gracePeriod {
           stopSession(bundleID: bundleID)
           meetingLastSeen.removeValue(forKey: bundleID)
+        } else {
+          anyGraceActive = true
+          graceCountdown = gracePeriod - elapsed
         }
       }
     }
+
+    if !anyGraceActive { graceCountdown = nil }
   }
 
   // MARK: - Session Management
@@ -214,7 +269,13 @@ final class AudioMonitor {
       bundleID: bundleID,
       appName: appName,
       micEnabled: micEnabled,
-      saveDirectory: saveDirectory
+      saveDirectory: saveDirectory,
+      onError: { [weak self] error in
+        Task { @MainActor [weak self] in
+          self?.setError("Recording of \(appName) was interrupted")
+          self?.stopSession(bundleID: bundleID)
+        }
+      }
     )
 
     Log.info(Log.monitor, "monitor", "starting session for \(appName) (\(bundleID))")
@@ -225,19 +286,14 @@ final class AudioMonitor {
       startTime: Date()
     )
 
-    recorder.onError = { [weak self] error in
-      Task { @MainActor [weak self] in
-        Log.error(Log.monitor, "monitor", "stream error for \(appName): \(error)")
-        self?.stopSession(bundleID: bundleID)
-      }
-    }
-
     Task {
       do {
         try await recorder.start()
+        hud.show(appName: appName, bundleID: bundleID)
+        if notifyOnStart { postRecordingStartedNotification(appName: appName) }
         updateState()
       } catch {
-        Log.error(Log.monitor, "monitor", "failed to start recording \(appName): \(error)")
+        setError("Failed to record \(appName): \(error.localizedDescription)")
         if let scError = error as? SCStreamError, scError.code == .userDeclined {
           permissionNeeded = true
         }
@@ -250,22 +306,36 @@ final class AudioMonitor {
   private func stopSession(bundleID: String) {
     guard let session = sessions.removeValue(forKey: bundleID) else { return }
     Log.info(Log.monitor, "monitor", "stopping session for \(session.appName) (\(bundleID))")
+    savingCount += 1
+    isSaving = true
     Task {
       let url = await session.recorder.stop()
-      if let url { postRecordingSavedNotification(appName: session.appName, fileURL: url) }
+      savingCount -= 1
+      isSaving = savingCount > 0
+      if let url, notifyOnSaved {
+        postRecordingSavedNotification(appName: session.appName, fileURL: url)
+      }
       updateState()
     }
   }
 
   private func updateState() {
     guard !isManualRecording else { return }
-    // Pick the earliest-started session for display (deterministic)
-    let active = sessions.values.min(by: { $0.startTime < $1.startTime })
-    isRecording = active != nil
-    currentAppName = active.map {
-      sessions.count > 1 ? "\($0.appName) +\(sessions.count - 1)" : $0.appName
+    let active = sessions.values.sorted { $0.startTime < $1.startTime }
+    isRecording = !active.isEmpty
+    if let first = active.first {
+      if active.count == 1 {
+        currentAppName = first.appName
+      } else if active.count == 2 {
+        currentAppName = "\(active[0].appName), \(active[1].appName)"
+      } else {
+        currentAppName = "\(active.count) apps"
+      }
+      recordingStartTime = first.startTime
+    } else {
+      currentAppName = nil
+      recordingStartTime = nil
     }
-    recordingStartTime = active?.startTime
   }
 
   private func loadSettings() {
@@ -289,6 +359,9 @@ final class AudioMonitor {
     micEnabled = defaults.object(forKey: "micEnabled") as? Bool ?? true
     let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
     saveDirectory = URL(fileURLWithPath: path)
+    notifyOnStart = defaults.object(forKey: "notifyOnStart") as? Bool ?? true
+    notifyOnSaved = defaults.object(forKey: "notifyOnSaved") as? Bool ?? true
+    notifyOnError = defaults.object(forKey: "notifyOnError") as? Bool ?? true
   }
 }
 
@@ -302,7 +375,27 @@ private func postRecordingSavedNotification(appName: String, fileURL: URL) {
   content.body = "\(appName) - \(fileURL.lastPathComponent)"
   content.sound = .default
   content.userInfo = ["filePath": fileURL.path]
+  content.categoryIdentifier = "recordingSaved"
 
+  let request = UNNotificationRequest(
+    identifier: UUID().uuidString, content: content, trigger: nil)
+  UNUserNotificationCenter.current().add(request)
+}
+
+private func postRecordingStartedNotification(appName: String) {
+  let content = UNMutableNotificationContent()
+  content.title = "Recording Started"
+  content.body = appName
+  let request = UNNotificationRequest(
+    identifier: UUID().uuidString, content: content, trigger: nil)
+  UNUserNotificationCenter.current().add(request)
+}
+
+private func postErrorNotification(message: String) {
+  let content = UNMutableNotificationContent()
+  content.title = "Blackbox Error"
+  content.body = message
+  content.sound = .default
   let request = UNNotificationRequest(
     identifier: UUID().uuidString, content: content, trigger: nil)
   UNUserNotificationCenter.current().add(request)
@@ -315,11 +408,17 @@ private final class NotificationDelegate: NSObject, UNUserNotificationCenterDele
     _ center: UNUserNotificationCenter,
     didReceive response: UNNotificationResponse
   ) async {
-    guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-      let path = response.notification.request.content.userInfo["filePath"] as? String
+    guard let path = response.notification.request.content.userInfo["filePath"] as? String
     else { return }
     let url = URL(fileURLWithPath: path)
-    NSWorkspace.shared.activateFileViewerSelecting([url])
+    await MainActor.run {
+      switch response.actionIdentifier {
+      case "play":
+        NSWorkspace.shared.open(url)
+      default:
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+      }
+    }
   }
 
   func userNotificationCenter(

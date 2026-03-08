@@ -1,5 +1,7 @@
+import AVFoundation
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 struct SettingsView: View {
   @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -8,113 +10,258 @@ struct SettingsView: View {
   @AppStorage("targetBundleIDs") private var targetBundleIDsData = defaultTargetBundleIDsJSON
   @AppStorage("meetingPatterns") private var meetingPatternsData = defaultMeetingPatternsJSON
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
+  @AppStorage("notifyOnStart") private var notifyOnStart = true
+  @AppStorage("notifyOnSaved") private var notifyOnSaved = true
+  @AppStorage("notifyOnError") private var notifyOnError = true
 
   @State private var newBundleID = ""
   @State private var newPattern = ""
+  @State private var showBundleIDField = false
+  @State private var micPermissionGranted = false
+  @State private var notificationPermissionGranted = false
+  @State private var storageStats: (count: Int, sizeFormatted: String)?
 
   var body: some View {
     Form {
-      Section("General") {
-        Toggle("Launch at Login", isOn: $launchAtLogin)
-          .onChange(of: launchAtLogin) { _, enabled in
-            do {
-              if enabled {
-                try SMAppService.mainApp.register()
-              } else {
-                try SMAppService.mainApp.unregister()
-              }
-            } catch {
-              launchAtLogin = SMAppService.mainApp.status == .enabled
-            }
-          }
-
-        Toggle("Record Microphone", isOn: $micEnabled)
-      }
-
-      Section("Target Applications") {
-        ForEach(targetBundleIDs, id: \.self) { bundleID in
-          HStack {
-            Text(bundleID).font(.body.monospaced())
-            Spacer()
-            Button(role: .destructive) {
-              removeBundleID(bundleID)
-            } label: {
-              Image(systemName: "trash")
-            }.buttonStyle(.borderless)
-          }
-        }
-        HStack {
-          TextField("com.example.app", text: $newBundleID)
-            .textFieldStyle(.roundedBorder)
-            .onSubmit { addBundleID() }
-          Button("Add") { addBundleID() }
-            .disabled(newBundleID.isEmpty)
-        }
-      }
-
-      Section("Meeting Detection") {
-        Text("Recording starts when a target app has a window title matching any pattern below.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-
-        ForEach(currentMeetingPatterns, id: \.self) { pattern in
-          HStack {
-            Text(pattern)
-            Spacer()
-            Button(role: .destructive) {
-              removePattern(pattern)
-            } label: {
-              Image(systemName: "trash")
-            }.buttonStyle(.borderless)
-          }
-        }
-        HStack {
-          TextField("e.g. Google Meet", text: $newPattern)
-            .textFieldStyle(.roundedBorder)
-            .onSubmit { addPattern() }
-          Button("Add") { addPattern() }
-            .disabled(newPattern.isEmpty)
-        }
-      }
-
-      Section("Debug") {
-        HStack {
-          Button("Open Log File") {
-            let fm = FileManager.default
-            try? fm.createDirectory(at: LogFile.directory, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(LogFile.directory)
-          }
-          Button("Copy Debug Log") {
-            let url = LogFile.export()
-            if let contents = try? String(contentsOf: url, encoding: .utf8) {
-              NSPasteboard.general.clearContents()
-              NSPasteboard.general.setString(contents, forType: .string)
-            }
-          }
-        }
-      }
-
-      Section("Recordings") {
-        HStack {
-          Text(saveDirectoryPath)
-            .lineLimit(1)
-            .truncationMode(.head)
-          Spacer()
-          Button("Choose...") { pickFolder() }
-        }
-
-        HStack {
-          Text("Grace period after meeting ends: \(Int(gracePeriod))s")
-          Spacer()
-          Slider(value: $gracePeriod, in: 5...60, step: 5)
-            .frame(width: 200)
-        }
-      }
+      generalSection
+      permissionsSection
+      targetAppsSection
+      meetingDetectionSection
+      recordingsSection
+      notificationsSection
+      debugSection
     }
     .formStyle(.grouped)
     .frame(width: 480)
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
+      micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+      computeStorageStats()
+    }
+    .task {
+      let settings = await UNUserNotificationCenter.current().notificationSettings()
+      notificationPermissionGranted = settings.authorizationStatus == .authorized
+    }
+  }
+
+  // MARK: - General
+
+  private var generalSection: some View {
+    Section("General") {
+      Toggle("Launch at Login", isOn: $launchAtLogin)
+        .onChange(of: launchAtLogin) { _, enabled in
+          do {
+            if enabled {
+              try SMAppService.mainApp.register()
+            } else {
+              try SMAppService.mainApp.unregister()
+            }
+          } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+          }
+        }
+
+      Toggle("Record Microphone", isOn: $micEnabled)
+      Text("Captures your microphone as a separate audio track alongside app audio")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+  }
+
+  // MARK: - Permissions
+
+  private var permissionsSection: some View {
+    Section("Permissions") {
+      permissionRow(
+        "Screen Recording",
+        granted: CGPreflightScreenCaptureAccess(),
+        settingsURL:
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+      )
+      permissionRow(
+        "Microphone",
+        granted: micPermissionGranted,
+        settingsURL:
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+      )
+      permissionRow(
+        "Notifications",
+        granted: notificationPermissionGranted,
+        settingsURL:
+          "x-apple.systempreferences:com.apple.preference.notifications"
+      )
+    }
+  }
+
+  private func permissionRow(_ name: String, granted: Bool, settingsURL: String) -> some View {
+    HStack {
+      Image(systemName: granted ? "checkmark.circle.fill" : "xmark.circle.fill")
+        .foregroundStyle(granted ? .green : .red)
+      Text(name)
+      Spacer()
+      if !granted {
+        Button("Fix") {
+          NSWorkspace.shared.open(URL(string: settingsURL)!)
+        }
+        .font(.caption)
+      }
+    }
+  }
+
+  // MARK: - Target Applications
+
+  private var targetAppsSection: some View {
+    Section("Target Applications") {
+      Text("Blackbox monitors these apps and records when meetings are detected.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+      ForEach(targetBundleIDs, id: \.self) { bundleID in
+        HStack(spacing: 8) {
+          if let icon = appIcon(for: bundleID) {
+            Image(nsImage: icon)
+              .resizable()
+              .frame(width: 16, height: 16)
+          }
+          Text(appDisplayName(for: bundleID))
+          Text(bundleID)
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+          Spacer()
+          Button(role: .destructive) {
+            removeBundleID(bundleID)
+          } label: {
+            Image(systemName: "trash")
+          }.buttonStyle(.borderless)
+        }
+      }
+
+      Menu("Add Application...") {
+        ForEach(availableApps, id: \.processIdentifier) { app in
+          Button(app.localizedName ?? "Unknown") {
+            if let bid = app.bundleIdentifier { addBundleIDDirect(bid) }
+          }
+        }
+        Divider()
+        Button("Add by Bundle ID...") { showBundleIDField = true }
+      }
+
+      if showBundleIDField {
+        HStack {
+          TextField("com.example.app", text: $newBundleID)
+            .textFieldStyle(.roundedBorder)
+            .onSubmit {
+              addBundleID()
+              showBundleIDField = false
+            }
+          Button("Add") {
+            addBundleID()
+            showBundleIDField = false
+          }
+          .disabled(newBundleID.isEmpty)
+        }
+      }
+
+      Button("Reset to Defaults") {
+        targetBundleIDsData = defaultTargetBundleIDsJSON
+      }
+      .font(.caption)
+    }
+  }
+
+  // MARK: - Meeting Detection
+
+  private var meetingDetectionSection: some View {
+    Section("Meeting Detection") {
+      Text("Recording starts when a target app has a window title matching any pattern below.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+      ForEach(currentMeetingPatterns, id: \.self) { pattern in
+        HStack {
+          Text(pattern)
+          Spacer()
+          Button(role: .destructive) {
+            removePattern(pattern)
+          } label: {
+            Image(systemName: "trash")
+          }.buttonStyle(.borderless)
+        }
+      }
+      HStack {
+        TextField("e.g. Google Meet", text: $newPattern)
+          .textFieldStyle(.roundedBorder)
+          .onSubmit { addPattern() }
+        Button("Add") { addPattern() }
+          .disabled(newPattern.isEmpty)
+      }
+
+      Button("Reset to Defaults") {
+        meetingPatternsData = defaultMeetingPatternsJSON
+      }
+      .font(.caption)
+
+      HStack {
+        Text("Grace period: \(Int(gracePeriod))s")
+        Spacer()
+        Slider(value: $gracePeriod, in: 5...60, step: 5)
+          .frame(width: 200)
+      }
+      Text(
+        "Keeps recording briefly after the meeting window closes, in case it reappears (e.g., switching tabs)"
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+    }
+  }
+
+  // MARK: - Recordings
+
+  private var recordingsSection: some View {
+    Section("Recordings") {
+      HStack {
+        Text(saveDirectoryPath)
+          .lineLimit(1)
+          .truncationMode(.head)
+        Spacer()
+        Button("Choose...") { pickFolder() }
+      }
+      if let stats = storageStats {
+        Text("\(stats.count) recordings, \(stats.sizeFormatted)")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  // MARK: - Notifications
+
+  private var notificationsSection: some View {
+    Section("Notifications") {
+      Toggle("Recording started", isOn: $notifyOnStart)
+      Toggle("Recording saved", isOn: $notifyOnSaved)
+      Toggle("Errors", isOn: $notifyOnError)
+    }
+  }
+
+  // MARK: - Debug
+
+  private var debugSection: some View {
+    Section("Debug") {
+      HStack {
+        Button("Open Log File") {
+          let fm = FileManager.default
+          try? fm.createDirectory(at: LogFile.directory, withIntermediateDirectories: true)
+          NSWorkspace.shared.open(LogFile.directory)
+        }
+        Button("Copy Debug Log") {
+          let url = LogFile.export()
+          if let contents = try? String(contentsOf: url, encoding: .utf8) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(contents, forType: .string)
+          }
+        }
+      }
     }
   }
 
@@ -122,6 +269,31 @@ struct SettingsView: View {
 
   private var targetBundleIDs: [String] {
     (try? JSONDecoder().decode([String].self, from: Data(targetBundleIDsData.utf8))) ?? []
+  }
+
+  private var availableApps: [NSRunningApplication] {
+    NSWorkspace.shared.runningApplications
+      .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+      .filter { app in app.bundleIdentifier.map { !targetBundleIDs.contains($0) } ?? false }
+      .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+  }
+
+  private func appIcon(for bundleID: String) -> NSImage? {
+    NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+      .map { NSWorkspace.shared.icon(forFile: $0.path) }
+  }
+
+  private func appDisplayName(for bundleID: String) -> String {
+    NSWorkspace.shared.runningApplications
+      .first { $0.bundleIdentifier == bundleID }?
+      .localizedName ?? bundleID.components(separatedBy: ".").last ?? bundleID
+  }
+
+  private func addBundleIDDirect(_ id: String) {
+    var ids = targetBundleIDs
+    guard !ids.contains(id) else { return }
+    ids.append(id)
+    targetBundleIDsData = (try? String(data: JSONEncoder().encode(ids), encoding: .utf8)) ?? "[]"
   }
 
   private func removeBundleID(_ id: String) {
@@ -170,6 +342,28 @@ struct SettingsView: View {
     newPattern = ""
   }
 
+  // MARK: - Storage Stats
+
+  private func computeStorageStats() {
+    let url = URL(fileURLWithPath: saveDirectoryPath)
+    guard
+      let files = try? FileManager.default.contentsOfDirectory(
+        at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
+    else {
+      storageStats = nil
+      return
+    }
+    let m4as = files.filter { $0.pathExtension == "m4a" }
+    let totalBytes = m4as.compactMap {
+      try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+    }.reduce(0, +)
+    storageStats = (
+      count: m4as.count,
+      sizeFormatted: ByteCountFormatter.string(
+        fromByteCount: Int64(totalBytes), countStyle: .file)
+    )
+  }
+
   // MARK: - Folder Picker
 
   private func pickFolder() {
@@ -187,5 +381,5 @@ struct SettingsView: View {
 let defaultTargetBundleIDsJSON =
   #"["com.google.Chrome","us.zoom.xos","ru.keepcoder.Telegram","org.telegram.desktop"]"#
 let defaultMeetingPatternsJSON =
-  #"["Meet -","meet.google.com","Zoom Meeting","Zoom","Voice Chat","Video Chat"]"#
+  #"["Meet -","meet.google.com","Zoom Meeting","Voice Chat","Video Chat"]"#
 let defaultSaveDirectoryPath = NSHomeDirectory() + "/Documents/Blackbox"

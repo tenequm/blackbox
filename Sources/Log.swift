@@ -60,10 +60,10 @@ nonisolated enum LogFile {
   nonisolated static func write(_ level: String, _ category: String, _ message: String) {
     let dir = directory
     let file = filePath
+    let timestamp = Date().formatted(.iso8601)
     queue.async {
       let fm = FileManager.default
       try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-      let timestamp = ISO8601DateFormatter().string(from: Date())
       let line = "\(timestamp) [\(level)] [\(category)] \(message)\n"
       guard let data = line.data(using: .utf8) else { return }
       if let handle = try? FileHandle(forWritingTo: file) {
