@@ -79,33 +79,37 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     config.excludesCurrentProcessAudio = true
     if micEnabled {
       config.captureMicrophone = true
+      config.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
     }
 
     let stream = SCStream(filter: filter, configuration: config, delegate: self)
-    try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: audioQueue)
-    try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-    if micEnabled {
-      try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: audioQueue)
-    }
-
-    activity = ProcessInfo.processInfo.beginActivity(
-      options: .userInitiatedAllowingIdleSystemSleep,
-      reason: "Recording call audio"
-    )
-
-    self.stream = stream
-
     do {
+      try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: audioQueue)
+      try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+      if micEnabled {
+        try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: audioQueue)
+      }
+
+      activity = ProcessInfo.processInfo.beginActivity(
+        options: .userInitiatedAllowingIdleSystemSleep,
+        reason: "Recording call audio"
+      )
+
+      self.stream = stream
       try await stream.startCapture()
       Log.recorder.info("stream started for \(self.appName, privacy: .public)")
     } catch {
       Log.error(Log.recorder, "recorder", "stream failed to start for \(appName): \(error)")
-      // Clean up writer and activity if stream fails to start
-      writer?.cancelWriting()
-      if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
-      writer = nil
-      systemAudioInput = nil
-      micAudioInput = nil
+      // Clean up writer, stream, and activity if any step fails
+      audioQueue.sync {
+        writer?.cancelWriting()
+        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+        writer = nil
+        systemAudioInput = nil
+        micAudioInput = nil
+        fileURL = nil
+      }
+      self.stream = nil
       if let activity {
         ProcessInfo.processInfo.endActivity(activity)
         self.activity = nil

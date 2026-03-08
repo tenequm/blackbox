@@ -17,6 +17,7 @@ struct SettingsView: View {
   @State private var newBundleID = ""
   @State private var newPattern = ""
   @State private var showBundleIDField = false
+  @State private var screenRecordingGranted = false
   @State private var micPermissionGranted = false
   @State private var notificationPermissionGranted = false
   @State private var storageStats: (count: Int, sizeFormatted: String)?
@@ -35,14 +36,15 @@ struct SettingsView: View {
     .frame(width: 480)
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
-      micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+      refreshPermissions()
+    }
+    .onReceive(
+      NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+    ) { _ in
+      refreshPermissions()
     }
     .task {
       await computeStorageStats()
-    }
-    .task {
-      let settings = await UNUserNotificationCenter.current().notificationSettings()
-      notificationPermissionGranted = settings.authorizationStatus == .authorized
     }
   }
 
@@ -76,36 +78,63 @@ struct SettingsView: View {
     Section("Permissions") {
       permissionRow(
         "Screen Recording",
-        granted: CGPreflightScreenCaptureAccess(),
-        settingsURL:
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-      )
+        granted: screenRecordingGranted
+      ) {
+        NSWorkspace.shared.open(
+          URL(
+            string:
+              "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+      }
       permissionRow(
         "Microphone",
-        granted: micPermissionGranted,
-        settingsURL:
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-      )
+        granted: micPermissionGranted
+      ) {
+        // If never asked, trigger system prompt. If denied, open Settings.
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        if status == .notDetermined {
+          Task {
+            await AVCaptureDevice.requestAccess(for: .audio)
+            refreshPermissions()
+          }
+        } else {
+          NSWorkspace.shared.open(
+            URL(
+              string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+        }
+      }
       permissionRow(
         "Notifications",
-        granted: notificationPermissionGranted,
-        settingsURL:
-          "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
-      )
+        granted: notificationPermissionGranted
+      ) {
+        let settings = UNUserNotificationCenter.current()
+        Task {
+          let status = await settings.notificationSettings()
+          if status.authorizationStatus == .notDetermined {
+            let _ = try? await settings.requestAuthorization(options: [.alert, .sound])
+            refreshPermissions()
+          } else {
+            NSWorkspace.shared.open(
+              URL(
+                string:
+                  "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+          }
+        }
+      }
     }
   }
 
-  private func permissionRow(_ name: String, granted: Bool, settingsURL: String) -> some View {
+  private func permissionRow(
+    _ name: String, granted: Bool, fixAction: @escaping () -> Void
+  ) -> some View {
     HStack {
       Image(systemName: granted ? "checkmark.circle.fill" : "xmark.circle.fill")
         .foregroundStyle(granted ? .green : .red)
       Text(name)
       Spacer()
       if !granted {
-        Button("Fix") {
-          NSWorkspace.shared.open(URL(string: settingsURL)!)
-        }
-        .font(.caption)
+        Button("Fix", action: fixAction)
+          .font(.caption)
       }
     }
   }
@@ -342,6 +371,17 @@ struct SettingsView: View {
     meetingPatternsData =
       (try? String(data: JSONEncoder().encode(patterns), encoding: .utf8)) ?? "[]"
     newPattern = ""
+  }
+
+  // MARK: - Permissions Refresh
+
+  private func refreshPermissions() {
+    screenRecordingGranted = CGPreflightScreenCaptureAccess()
+    micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    Task {
+      let settings = await UNUserNotificationCenter.current().notificationSettings()
+      notificationPermissionGranted = settings.authorizationStatus == .authorized
+    }
   }
 
   // MARK: - Storage Stats

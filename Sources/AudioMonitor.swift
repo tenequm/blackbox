@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Foundation
 import ScreenCaptureKit
@@ -40,7 +41,7 @@ final class AudioMonitor {
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
 
-  func startMonitoring() {
+  func startMonitoring(skipPermissionRequests: Bool = false) {
     guard monitoringTask == nil else { return }
     loadSettings()
 
@@ -52,12 +53,19 @@ final class AudioMonitor {
 
     UNUserNotificationCenter.current().delegate = notificationDelegate
 
-    // Request notification authorization if not yet determined (fallback for users who skip onboarding)
-    Task {
-      let settings = await UNUserNotificationCenter.current().notificationSettings()
-      if settings.authorizationStatus == .notDetermined {
-        let _ = try? await UNUserNotificationCenter.current().requestAuthorization(
-          options: [.alert, .sound])
+    // Request permissions if not yet determined (fallback for upgrade path
+    // and users who close onboarding early). Skipped when onboarding will
+    // handle permissions to avoid system prompts racing with the wizard.
+    if !skipPermissionRequests {
+      Task {
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+          await AVCaptureDevice.requestAccess(for: .audio)
+        }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+          let _ = try? await UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound])
+        }
       }
     }
 

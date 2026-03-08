@@ -20,7 +20,10 @@ struct BlackboxApp: App {
     MenuBarExtra {
       MenuContent(monitor: monitor, updater: updaterController.updater)
     } label: {
-      if monitor.errorMessage != nil {
+      if monitor.permissionNeeded {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundStyle(.yellow)
+      } else if monitor.errorMessage != nil {
         Image(systemName: "exclamationmark.triangle.fill")
           .foregroundStyle(.yellow)
       } else if monitor.isPaused {
@@ -52,14 +55,18 @@ struct BlackboxApp: App {
     private var onboardingWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-      monitor?.startMonitoring()
-
       // Existing users who already granted screen recording don't need onboarding
       if CGPreflightScreenCaptureAccess() {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
       }
 
-      if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
+      let willOnboard = !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+
+      // Start monitoring AFTER the onboarding decision so the fallback
+      // permission requests don't race with the onboarding UI.
+      monitor?.startMonitoring(skipPermissionRequests: willOnboard)
+
+      if willOnboard {
         showOnboarding()
       }
     }
@@ -103,6 +110,7 @@ struct BlackboxApp: App {
       Log.info(Log.app, "app", "terminating, cleaning up recordings")
       let timeoutTask = Task {
         try? await Task.sleep(for: .seconds(5))
+        guard !Task.isCancelled else { return }
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       Task {
@@ -137,9 +145,6 @@ struct MenuContent: View {
         )
       }
       Button("Restart Blackbox") { restartApp() }
-    } else if monitor.isSaving {
-      Text("Saving recording...")
-        .foregroundStyle(.secondary)
     } else if let errorMsg = monitor.errorMessage {
       Text(errorMsg)
         .foregroundStyle(.red)
@@ -155,6 +160,9 @@ struct MenuContent: View {
           Text("Recording \(appName) - \(formatElapsed(elapsed))")
         }
       }
+    } else if monitor.isSaving {
+      Text("Saving recording...")
+        .foregroundStyle(.secondary)
     } else {
       Text(idleStatusText)
         .foregroundStyle(.secondary)
@@ -168,7 +176,7 @@ struct MenuContent: View {
         monitor.stopManualRecording()
       }
     } else if !monitor.isRecording {
-      Button("Record Now") {
+      Button("Record System Audio") {
         monitor.startManualRecording()
       }
     }
