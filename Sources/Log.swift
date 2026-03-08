@@ -109,18 +109,19 @@ nonisolated enum LogFile {
       output += "(unable to read OSLogStore)\n"
     }
 
-    // File log contents
-    output += "\n=== File Log ===\n"
-    if let contents = try? String(contentsOf: filePath, encoding: .utf8) {
-      output += contents
-    } else {
-      output += "(no file log)\n"
-    }
+    // File log contents - read under queue to serialize with writes
+    queue.sync {
+      output += "\n=== File Log ===\n"
+      if let contents = try? String(contentsOf: filePath, encoding: .utf8) {
+        output += contents
+      } else {
+        output += "(no file log)\n"
+      }
 
-    // Previous log if exists
-    if let prev = try? String(contentsOf: prevPath, encoding: .utf8) {
-      output += "\n=== Previous File Log ===\n"
-      output += prev
+      if let prev = try? String(contentsOf: prevPath, encoding: .utf8) {
+        output += "\n=== Previous File Log ===\n"
+        output += prev
+      }
     }
 
     try? output.write(to: tempURL, atomically: true, encoding: .utf8)

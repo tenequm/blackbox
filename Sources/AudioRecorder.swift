@@ -125,40 +125,44 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
     stream = nil
 
-    // Mark stopped and capture state on audioQueue to serialize with any in-flight callbacks
+    // Capture and nil all writer state inside audioQueue.sync to serialize with callbacks.
+    // After this block, no callback can access writer/inputs (they see nil/stopped).
+    var capturedWriter: AVAssetWriter?
+    var capturedFileURL: URL?
     var wasStarted = false
     audioQueue.sync {
       wasStarted = sessionStarted
+      capturedWriter = writer
+      capturedFileURL = fileURL
       stopped = true
       systemAudioInput?.markAsFinished()
       micAudioInput?.markAsFinished()
+      // Nil out so any in-flight callback that passed the stopped guard sees nil
+      systemAudioInput = nil
+      micAudioInput = nil
+      writer = nil
+      sessionStarted = false
+      fileURL = nil
     }
 
-    // finishWriting is async and safe to call from MainActor after markAsFinished
+    // finishWriting uses captured locals - safe from MainActor after audioQueue.sync
     var savedURL: URL?
-    if let writer {
+    if let capturedWriter {
       if !wasStarted {
-        // No audio was ever received - cancel and delete empty file
-        writer.cancelWriting()
-        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+        capturedWriter.cancelWriting()
+        if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
       } else {
-        await writer.finishWriting()
-        if writer.status == .failed {
+        await capturedWriter.finishWriting()
+        if capturedWriter.status == .failed {
           Log.error(
             Log.recorder, "recorder",
-            "writer failed: \(writer.error?.localizedDescription ?? "unknown")")
-          if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+            "writer failed: \(capturedWriter.error?.localizedDescription ?? "unknown")")
+          if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
         } else {
-          savedURL = fileURL
+          savedURL = capturedFileURL
         }
       }
     }
-
-    writer = nil
-    systemAudioInput = nil
-    micAudioInput = nil
-    sessionStarted = false
-    fileURL = nil
 
     if let activity {
       ProcessInfo.processInfo.endActivity(activity)

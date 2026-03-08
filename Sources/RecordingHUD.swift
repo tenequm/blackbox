@@ -64,7 +64,7 @@ final class RecordingHUD {
       ctx.duration = 0.25
       panel.animator().alphaValue = 0
     } completionHandler: {
-      MainActor.assumeIsolated {
+      Task { @MainActor in
         panel.close()
       }
     }

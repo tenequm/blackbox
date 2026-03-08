@@ -36,7 +36,9 @@ struct SettingsView: View {
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
       micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-      computeStorageStats()
+    }
+    .task {
+      await computeStorageStats()
     }
     .task {
       let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -88,7 +90,7 @@ struct SettingsView: View {
         "Notifications",
         granted: notificationPermissionGranted,
         settingsURL:
-          "x-apple.systempreferences:com.apple.preference.notifications"
+          "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
       )
     }
   }
@@ -344,24 +346,25 @@ struct SettingsView: View {
 
   // MARK: - Storage Stats
 
-  private func computeStorageStats() {
-    let url = URL(fileURLWithPath: saveDirectoryPath)
-    guard
-      let files = try? FileManager.default.contentsOfDirectory(
-        at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
-    else {
-      storageStats = nil
-      return
-    }
-    let m4as = files.filter { $0.pathExtension == "m4a" }
-    let totalBytes = m4as.compactMap {
-      try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
-    }.reduce(0, +)
-    storageStats = (
-      count: m4as.count,
-      sizeFormatted: ByteCountFormatter.string(
-        fromByteCount: Int64(totalBytes), countStyle: .file)
-    )
+  private func computeStorageStats() async {
+    let path = saveDirectoryPath
+    let result: (count: Int, sizeFormatted: String)? = await Task.detached {
+      let url = URL(fileURLWithPath: path)
+      guard
+        let files = try? FileManager.default.contentsOfDirectory(
+          at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
+      else { return nil }
+      let m4as = files.filter { $0.pathExtension == "m4a" }
+      let totalBytes = m4as.compactMap {
+        try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+      }.reduce(0, +)
+      return (
+        count: m4as.count,
+        sizeFormatted: ByteCountFormatter.string(
+          fromByteCount: Int64(totalBytes), countStyle: .file)
+      )
+    }.value
+    storageStats = result
   }
 
   // MARK: - Folder Picker
@@ -382,4 +385,5 @@ let defaultTargetBundleIDsJSON =
   #"["com.google.Chrome","us.zoom.xos","ru.keepcoder.Telegram","org.telegram.desktop"]"#
 let defaultMeetingPatternsJSON =
   #"["Meet -","meet.google.com","Zoom Meeting","Voice Chat","Video Chat"]"#
-let defaultSaveDirectoryPath = NSHomeDirectory() + "/Documents/Blackbox"
+let defaultSaveDirectoryPath =
+  NSHomeDirectory() + "/Library/Application Support/Blackbox/Recordings"

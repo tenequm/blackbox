@@ -52,7 +52,7 @@ final class AudioMonitor {
 
     UNUserNotificationCenter.current().delegate = notificationDelegate
 
-    // Request notification authorization if not yet determined
+    // Request notification authorization if not yet determined (fallback for users who skip onboarding)
     Task {
       let settings = await UNUserNotificationCenter.current().notificationSettings()
       if settings.authorizationStatus == .notDetermined {
@@ -134,13 +134,17 @@ final class AudioMonitor {
 
   func clearError() { errorMessage = nil }
 
+  private var errorGeneration = 0
+
   private func setError(_ message: String) {
     Log.error(Log.monitor, "monitor", message)
     errorMessage = message
     if notifyOnError { postErrorNotification(message: message) }
+    errorGeneration += 1
+    let gen = errorGeneration
     Task {
       try? await Task.sleep(for: .seconds(10))
-      if errorMessage == message { errorMessage = nil }
+      if errorGeneration == gen { errorMessage = nil }
     }
   }
 
@@ -220,7 +224,7 @@ final class AudioMonitor {
       stopSession(bundleID: bundleID)
     }
 
-    var anyGraceActive = false
+    var minGraceRemaining: TimeInterval = .infinity
 
     for bundleID in targetBundleIDs {
       guard let app = runningApps.first(where: { $0.bundleIdentifier == bundleID }) else {
@@ -253,13 +257,12 @@ final class AudioMonitor {
           stopSession(bundleID: bundleID)
           meetingLastSeen.removeValue(forKey: bundleID)
         } else {
-          anyGraceActive = true
-          graceCountdown = gracePeriod - elapsed
+          minGraceRemaining = min(minGraceRemaining, gracePeriod - elapsed)
         }
       }
     }
 
-    if !anyGraceActive { graceCountdown = nil }
+    graceCountdown = minGraceRemaining.isFinite ? minGraceRemaining : nil
   }
 
   // MARK: - Session Management
@@ -297,7 +300,11 @@ final class AudioMonitor {
         if let scError = error as? SCStreamError, scError.code == .userDeclined {
           permissionNeeded = true
         }
-        sessions.removeValue(forKey: bundleID)
+        // Only remove if this session's recorder is still the current one
+        // (stopSession may have already removed and replaced it)
+        if sessions[bundleID]?.recorder === recorder {
+          sessions.removeValue(forKey: bundleID)
+        }
         updateState()
       }
     }

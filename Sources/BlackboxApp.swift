@@ -47,7 +47,7 @@ struct BlackboxApp: App {
 
   }
 
-  final class AppDelegate: NSObject, NSApplicationDelegate {
+  final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var monitor: AudioMonitor?
     private var onboardingWindow: NSWindow?
 
@@ -66,8 +66,9 @@ struct BlackboxApp: App {
 
     private func showOnboarding() {
       let onboarding = OnboardingView(onComplete: { [weak self] in
-        self?.onboardingWindow?.close()
-        self?.onboardingWindow = nil
+        let window = self?.onboardingWindow
+        self?.onboardingWindow = nil  // Clear first so windowWillClose guard fails
+        window?.close()
       })
       let hosting = NSHostingView(rootView: onboarding)
       let window = NSWindow(
@@ -76,6 +77,7 @@ struct BlackboxApp: App {
         backing: .buffered, defer: false
       )
       window.isReleasedWhenClosed = false
+      window.delegate = self
       window.title = "Welcome to Blackbox"
       window.contentView = hosting
       window.center()
@@ -84,19 +86,28 @@ struct BlackboxApp: App {
       onboardingWindow = window
     }
 
+    func windowWillClose(_ notification: Notification) {
+      guard let window = notification.object as? NSWindow, window === onboardingWindow else {
+        return
+      }
+      // User closed onboarding via X button - mark complete so it doesn't nag
+      UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+      onboardingWindow = nil
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
         return .terminateNow
       }
       Log.info(Log.app, "app", "terminating, cleaning up recordings")
-      // Safety timeout: force reply after 5 seconds if cleanup hangs
-      Task {
+      let timeoutTask = Task {
         try? await Task.sleep(for: .seconds(5))
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       Task {
         await monitor.stopMonitoring()
+        timeoutTask.cancel()
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       return .terminateLater
@@ -116,7 +127,9 @@ struct MenuContent: View {
   var body: some View {
     // Status
     if monitor.permissionNeeded {
-      Button("Grant Screen Recording Permission (restart required)") {
+      Text("Screen Recording permission required")
+        .foregroundStyle(.red)
+      Button("Open System Settings") {
         NSWorkspace.shared.open(
           URL(
             string:
@@ -282,11 +295,11 @@ private func formatElapsed(_ interval: TimeInterval) -> String {
 
 private func restartApp() {
   let url = Bundle.main.bundleURL
-  let config = NSWorkspace.OpenConfiguration()
-  config.createsNewApplicationInstance = true
-  NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in
-    Task { @MainActor in
-      NSApplication.shared.terminate(nil)
-    }
-  }
+  // Terminate first, then relaunch. Without createsNewApplicationInstance,
+  // open -a waits for the old process to exit before launching the new one.
+  let task = Process()
+  task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+  task.arguments = [url.path]
+  try? task.run()
+  NSApplication.shared.terminate(nil)
 }

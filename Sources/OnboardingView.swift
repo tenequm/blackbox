@@ -11,10 +11,9 @@ struct OnboardingView: View {
       Group {
         switch step {
         case 0: welcomeStep
-        case 1: screenRecordingStep
-        case 2: microphoneStep
-        case 3: notificationsStep
-        case 4: doneStep
+        case 1: microphoneStep
+        case 2: notificationsStep
+        case 3: screenRecordingStep
         default: EmptyView()
         }
       }
@@ -24,16 +23,23 @@ struct OnboardingView: View {
       Divider()
 
       HStack {
-        if step > 0 && step < 4 {
+        if step > 0 && step < 3 {
           Button("Skip") { step += 1 }
         }
         Spacer()
-        if step < 4 {
+        if step < 3 {
           Button("Continue") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         } else {
-          Button("Get Started") { complete() }
-            .keyboardShortcut(.defaultAction)
+          // Screen Recording step: two options
+          VStack(alignment: .trailing, spacing: 6) {
+            Button("Open System Settings") { grantScreenRecording() }
+              .keyboardShortcut(.defaultAction)
+            Button("I'll do this later") { complete() }
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .buttonStyle(.plain)
+          }
         }
       }
       .padding(16)
@@ -56,35 +62,6 @@ struct OnboardingView: View {
       .multilineTextAlignment(.center)
       .foregroundStyle(.secondary)
       .frame(maxWidth: 360)
-    }
-  }
-
-  private var screenRecordingStep: some View {
-    VStack(spacing: 16) {
-      Image(systemName: "rectangle.dashed.badge.record")
-        .font(.system(size: 48))
-        .foregroundStyle(.blue)
-      Text("Screen Recording")
-        .font(.title2.bold())
-      Text(
-        "Blackbox uses Screen Recording to capture app audio via ScreenCaptureKit. It never records your screen - only audio."
-      )
-      .multilineTextAlignment(.center)
-      .foregroundStyle(.secondary)
-      .frame(maxWidth: 360)
-      HStack(spacing: 8) {
-        Image(
-          systemName: CGPreflightScreenCaptureAccess()
-            ? "checkmark.circle.fill" : "xmark.circle.fill"
-        )
-        .foregroundStyle(CGPreflightScreenCaptureAccess() ? .green : .red)
-        Text(
-          CGPreflightScreenCaptureAccess()
-            ? "Permission granted" : "Permission required"
-        )
-        .foregroundStyle(.secondary)
-      }
-      .font(.caption)
     }
   }
 
@@ -120,23 +97,37 @@ struct OnboardingView: View {
     }
   }
 
-  private var doneStep: some View {
+  private var screenRecordingStep: some View {
     VStack(spacing: 16) {
-      Image(systemName: "checkmark.circle.fill")
+      Image(systemName: "rectangle.dashed.badge.record")
         .font(.system(size: 48))
-        .foregroundStyle(.green)
-      Text("You're All Set")
+        .foregroundStyle(.blue)
+      Text("Screen Recording")
         .font(.title2.bold())
       Text(
-        "Blackbox is running in your menu bar. Look for the waveform icon - it turns red when recording."
+        "Blackbox uses Screen Recording to capture app audio via ScreenCaptureKit. It never records your screen - only audio."
       )
       .multilineTextAlignment(.center)
       .foregroundStyle(.secondary)
       .frame(maxWidth: 360)
-      Text("Tip: Enable \"Launch at Login\" in Settings so you never miss a recording.")
+
+      if CGPreflightScreenCaptureAccess() {
+        HStack(spacing: 8) {
+          Image(systemName: "checkmark.circle.fill")
+            .foregroundStyle(.green)
+          Text("Permission granted")
+            .foregroundStyle(.secondary)
+        }
         .font(.caption)
+      } else {
+        Text(
+          "After you enable Screen Recording, macOS will ask to restart Blackbox. Go ahead - that completes setup and you're ready to go!"
+        )
+        .font(.caption)
+        .multilineTextAlignment(.center)
         .foregroundStyle(.tertiary)
         .frame(maxWidth: 360)
+      }
     }
   }
 
@@ -145,14 +136,11 @@ struct OnboardingView: View {
   private func advanceStep() {
     switch step {
     case 1:
-      CGRequestScreenCaptureAccess()
-      step += 1
-    case 2:
       Task {
         await AVCaptureDevice.requestAccess(for: .audio)
         step += 1
       }
-    case 3:
+    case 2:
       Task {
         let _ = try? await UNUserNotificationCenter.current().requestAuthorization(
           options: [.alert, .sound])
@@ -160,6 +148,22 @@ struct OnboardingView: View {
       }
     default:
       step += 1
+    }
+  }
+
+  private func grantScreenRecording() {
+    // Mark onboarding complete before the restart. Mic and notifications
+    // are already granted from earlier steps. After the user enables Screen
+    // Recording in System Settings, macOS will offer "Quit & Reopen" which
+    // restarts the app with everything configured.
+    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+
+    if CGPreflightScreenCaptureAccess() {
+      // Already granted (e.g. existing user) - just close
+      onComplete?()
+    } else {
+      CGRequestScreenCaptureAccess()
+      onComplete?()
     }
   }
 
