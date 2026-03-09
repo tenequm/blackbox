@@ -30,14 +30,14 @@ struct BlackboxApp: App {
           HStack(spacing: 4) {
             Image(systemName: "waveform.circle")
             Text(String(format: "0:%02d", Int(ceil(grace))))
-              .font(.system(.body, design: .monospaced))
+              .monospacedDigit()
           }
         } else {
           HStack(spacing: 4) {
             Image(systemName: "waveform.circle.fill")
             if let elapsed = monitor.formattedElapsed {
               Text(elapsed)
-                .font(.system(.body, design: .monospaced))
+                .monospacedDigit()
             }
           }
         }

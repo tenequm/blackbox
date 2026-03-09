@@ -94,7 +94,7 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 ## Key Architecture Decisions
 
-- **Mic activity detection** drives recording lifecycle. CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere` listener on the default input device fires when any app starts/stops using the microphone. A 3-second polling fallback catches cases where the listener doesn't fire (some audio pipelines). Auto-recordings capture system audio only (no mic) so detection stays clean - `DeviceIsRunningSomewhere` accurately reflects other apps' mic usage.
+- **Per-process mic detection** drives recording lifecycle. CoreAudio per-process APIs (`kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`) enumerate which specific processes have active mic input, filtering out Blackbox's own PID and ScreenCaptureKit XPC helpers (`com.apple.screencapturekit*`, `com.apple.replayd`). This allows auto-recordings to capture both system audio AND mic without a detection feedback loop. A 3-second polling fallback catches cases where listeners don't fire. Requires macOS 14.2+.
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks run on a background dispatch queue (`audioQueue`). Thread safety: `stop()` dispatches `markAsFinished()` on `audioQueue.sync` to serialize with callbacks.
 - **Dual-track M4A**: system audio + mic as separate AVAssetWriterInputs. Most players mix both tracks on playback. Note: some players only play the first track.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter) before process exit.

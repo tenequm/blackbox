@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -18,7 +19,7 @@ struct MainWindowView: View {
         .tabItem { Label("Settings", systemImage: "gearshape") }
         .tag(MainTab.settings)
     }
-    .frame(minWidth: 600, minHeight: 400)
+    .frame(minWidth: 700, minHeight: 450)
   }
 }
 
@@ -27,60 +28,29 @@ struct MainWindowView: View {
 struct RecordingsView: View {
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
-  @State private var selectedIDs: Set<String> = []
+  @State private var selectedRecordingID: String?
   @State private var exportError: String?
 
   var body: some View {
-    VStack(spacing: 0) {
-      if recordings.isEmpty {
-        ContentUnavailableView(
-          "No Recordings",
-          systemImage: "waveform",
-          description: Text("Recordings will appear here when Blackbox captures audio.")
+    NavigationSplitView {
+      recordingsList
+    } detail: {
+      if let id = selectedRecordingID,
+        let recording = recordings.first(where: { $0.id == id })
+      {
+        RecordingDetailView(
+          recording: recording,
+          onDelete: { deleteRecordings(Set([id])) },
+          onTranscriptChanged: { Task { await loadRecordings() } }
         )
+        .id(id)
       } else {
-        Table(recordings, selection: $selectedIDs) {
-          TableColumn("Name") { recording in
-            Label(recording.name, systemImage: "waveform.circle.fill")
-          }
-          .width(min: 150, ideal: 250)
-
-          TableColumn("Date") { recording in
-            Text(recording.date, format: .dateTime.month().day().hour().minute())
-          }
-          .width(min: 120, ideal: 160)
-
-          TableColumn("Size") { recording in
-            Text(recording.sizeFormatted)
-          }
-          .width(min: 60, ideal: 80)
-        }
-        .contextMenu(forSelectionType: RecordingFile.ID.self) { ids in
-          if !ids.isEmpty {
-            Button("Reveal in Finder") { revealInFinder(ids) }
-            Button("Export...") { exportRecordings(ids) }
-            Divider()
-            Button("Delete", role: .destructive) { deleteRecordings(ids) }
-          }
-        } primaryAction: { ids in
-          revealInFinder(ids)
-        }
+        ContentUnavailableView(
+          "Select a Recording",
+          systemImage: "waveform",
+          description: Text("Choose a recording to play or transcribe.")
+        )
       }
-
-      Divider()
-
-      HStack {
-        Text("\(recordings.count) recordings, \(totalSizeFormatted)")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        Spacer()
-        Button("Reveal in Finder") { revealInFinder(selectedIDs) }
-          .disabled(selectedIDs.isEmpty)
-        Button("Export...") { exportRecordings(selectedIDs) }
-          .disabled(selectedIDs.isEmpty)
-      }
-      .padding(.horizontal, 12)
-      .padding(.vertical, 8)
     }
     .task { await loadRecordings() }
     .onReceive(
@@ -98,6 +68,41 @@ struct RecordingsView: View {
       Button("OK") { exportError = nil }
     } message: {
       Text(exportError ?? "")
+    }
+  }
+
+  // MARK: - Sidebar List
+
+  private var recordingsList: some View {
+    Group {
+      if recordings.isEmpty {
+        ContentUnavailableView(
+          "No Recordings",
+          systemImage: "waveform",
+          description: Text("Recordings will appear here when Blackbox captures audio.")
+        )
+      } else {
+        List(recordings, selection: $selectedRecordingID) { recording in
+          RecordingRow(recording: recording)
+            .contextMenu {
+              Button("Reveal in Finder") { revealInFinder(Set([recording.id])) }
+              Button("Export...") { exportRecordings(Set([recording.id])) }
+              Divider()
+              Button("Delete", role: .destructive) {
+                deleteRecordings(Set([recording.id]))
+              }
+            }
+        }
+      }
+    }
+    .frame(minWidth: 220)
+    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+    .toolbar {
+      ToolbarItem(placement: .automatic) {
+        Text("\(recordings.count) recordings, \(totalSizeFormatted)")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
     }
   }
 
@@ -125,11 +130,13 @@ struct RecordingsView: View {
         .compactMap { url -> RecordingFile? in
           let values = try? url.resourceValues(
             forKeys: [.contentModificationDateKey, .fileSizeKey])
+          let sidecar = TranscriptDocument.sidecarURL(for: url)
           return RecordingFile(
             url: url,
             name: url.deletingPathExtension().lastPathComponent,
             date: values?.contentModificationDate ?? .distantPast,
-            size: values?.fileSize ?? 0
+            size: values?.fileSize ?? 0,
+            hasTranscript: FileManager.default.fileExists(atPath: sidecar.path)
           )
         }
         .sorted { $0.date > $1.date }
@@ -185,9 +192,503 @@ struct RecordingsView: View {
   private func deleteRecordings(_ ids: Set<String>) {
     for recording in recordings where ids.contains(recording.id) {
       try? FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
+      let sidecar = TranscriptDocument.sidecarURL(for: recording.url)
+      if FileManager.default.fileExists(atPath: sidecar.path) {
+        try? FileManager.default.trashItem(at: sidecar, resultingItemURL: nil)
+      }
     }
-    selectedIDs.subtract(ids)
+    if let selectedRecordingID, ids.contains(selectedRecordingID) {
+      self.selectedRecordingID = nil
+    }
     Task { await loadRecordings() }
+  }
+}
+
+// MARK: - Recording Row
+
+private struct RecordingRow: View {
+  let recording: RecordingFile
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Text(recording.name)
+          .lineLimit(1)
+          .truncationMode(.middle)
+        if recording.hasTranscript {
+          Image(systemName: "text.quote")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+      }
+      HStack {
+        Text(recording.date, format: .dateTime.month().day().hour().minute())
+        Spacer()
+        Text(recording.sizeFormatted)
+      }
+      .font(.caption)
+      .foregroundStyle(.secondary)
+    }
+    .padding(.vertical, 2)
+  }
+}
+
+// MARK: - Recording Detail View
+
+struct RecordingDetailView: View {
+  let recording: RecordingFile
+  var onDelete: () -> Void
+  var onTranscriptChanged: () -> Void
+
+  @AppStorage("sonioxAPIKey") private var sonioxAPIKey = ""
+
+  // Playback
+  @State private var player: AVPlayer?
+  @State private var isPlaying = false
+  @State private var duration: TimeInterval = 0
+  @State private var currentTime: TimeInterval = 0
+  @State private var timeObserver: Any?
+  @State private var isDragging = false
+  @State private var playerError: String?
+
+  // UI
+  @State private var showDeleteConfirmation = false
+
+  // Transcription
+  @State private var transcript: TranscriptDocument?
+  @State private var transcriptionStatus: TranscriptionStatus = .idle
+  @State private var transcriptionTask: Task<Void, Never>?
+
+  var body: some View {
+    VStack(spacing: 0) {
+      metadataHeader
+      Divider()
+      if let playerError {
+        VStack(spacing: 8) {
+          Image(systemName: "exclamationmark.triangle")
+            .font(.title)
+            .foregroundStyle(.secondary)
+          Text("Could not load audio: \(playerError)")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        playbackControls
+        Divider()
+        transcriptArea
+      }
+    }
+    .onAppear {
+      setupPlayer()
+      loadTranscript()
+    }
+    .onDisappear {
+      teardownPlayer()
+      cancelTranscription()
+    }
+  }
+
+  // MARK: - Header
+
+  private var metadataHeader: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 4) {
+        Text(recording.name)
+          .font(.headline)
+        HStack(spacing: 8) {
+          Text(recording.date.formatted(.dateTime.year().month().day().hour().minute()))
+          Text(recording.sizeFormatted)
+          if duration > 0 {
+            Text(formatTime(duration))
+          }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+      Spacer()
+      HStack(spacing: 8) {
+        Button {
+          NSWorkspace.shared.activateFileViewerSelecting([recording.url])
+        } label: {
+          Image(systemName: "folder")
+        }
+        .help("Reveal in Finder")
+
+        Button(role: .destructive) {
+          showDeleteConfirmation = true
+        } label: {
+          Image(systemName: "trash")
+        }
+        .help("Delete")
+      }
+    }
+    .padding()
+    .alert("Delete Recording?", isPresented: $showDeleteConfirmation) {
+      Button("Delete", role: .destructive, action: onDelete)
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("This will move \"\(recording.name)\" to the Trash.")
+    }
+  }
+
+  // MARK: - Playback
+
+  private var playbackControls: some View {
+    VStack(spacing: 8) {
+      Slider(
+        value: $currentTime,
+        in: 0...max(duration, 0.01)
+      ) { editing in
+        isDragging = editing
+        if !editing {
+          seekTo(currentTime)
+        }
+      }
+
+      HStack {
+        Text(formatTime(currentTime))
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+        Spacer()
+        Text("-\(formatTime(max(0, duration - currentTime)))")
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+      }
+
+      HStack(spacing: 20) {
+        Button {
+          skip(by: -15)
+        } label: {
+          Image(systemName: "gobackward.15")
+            .font(.title3)
+        }
+        .buttonStyle(.plain)
+
+        Button {
+          togglePlayback()
+        } label: {
+          Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+            .font(.largeTitle)
+        }
+        .buttonStyle(.plain)
+
+        Button {
+          skip(by: 15)
+        } label: {
+          Image(systemName: "goforward.15")
+            .font(.title3)
+        }
+        .buttonStyle(.plain)
+      }
+    }
+    .padding()
+  }
+
+  private func setupPlayer() {
+    let asset = AVURLAsset(url: recording.url)
+    let item = AVPlayerItem(asset: asset)
+    let p = AVPlayer(playerItem: item)
+    player = p
+    playerError = nil
+    currentTime = 0
+
+    // Get duration once asset is loaded
+    Task {
+      do {
+        let dur = try await asset.load(.duration)
+        duration = dur.seconds.isFinite ? dur.seconds : 0
+      } catch {
+        playerError = error.localizedDescription
+        Log.error(
+          Log.app, "playback",
+          "failed to load asset: \(error.localizedDescription)")
+      }
+    }
+
+    // Periodic time observer (10x/sec)
+    let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+    timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+      Task { @MainActor in
+        if !isDragging {
+          currentTime = time.seconds
+        }
+      }
+    }
+
+    // End-of-track notification
+    endObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { _ in
+      Task { @MainActor in
+        isPlaying = false
+        currentTime = 0
+        p.seek(to: .zero)
+      }
+    }
+  }
+
+  @State private var endObserver: (any NSObjectProtocol)?
+
+  private func teardownPlayer() {
+    if let observer = timeObserver {
+      player?.removeTimeObserver(observer)
+      timeObserver = nil
+    }
+    if let observer = endObserver {
+      NotificationCenter.default.removeObserver(observer)
+      endObserver = nil
+    }
+    player?.pause()
+    player = nil
+    isPlaying = false
+    currentTime = 0
+  }
+
+  private func togglePlayback() {
+    guard let player else { return }
+    if isPlaying {
+      player.pause()
+    } else {
+      player.play()
+    }
+    isPlaying = !isPlaying
+  }
+
+  private func seekTo(_ time: TimeInterval) {
+    let cmTime = CMTime(seconds: time, preferredTimescale: 600)
+    player?.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+    currentTime = time
+  }
+
+  private func skip(by seconds: TimeInterval) {
+    let newTime = max(0, min(duration, currentTime + seconds))
+    seekTo(newTime)
+  }
+
+  // MARK: - Transcript
+
+  private var transcriptArea: some View {
+    Group {
+      if let transcript, !transcript.segments.isEmpty {
+        transcriptView(transcript)
+      } else if case .error(let msg) = transcriptionStatus {
+        VStack(spacing: 12) {
+          Image(systemName: "exclamationmark.triangle")
+            .font(.title)
+            .foregroundStyle(.secondary)
+          Text(msg)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+          Button("Retry") { startTranscription() }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if transcriptionStatus != .idle {
+        VStack(spacing: 12) {
+          ProgressView()
+          Text(transcriptionStatusText)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Button("Cancel") { cancelTranscription() }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        VStack(spacing: 12) {
+          if sonioxAPIKey.isEmpty {
+            Text("Add your Soniox API key in Settings to enable transcription")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .multilineTextAlignment(.center)
+          } else {
+            Button("Transcribe") { startTranscription() }
+              .buttonStyle(.borderedProminent)
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+    }
+  }
+
+  private var transcriptionStatusText: String {
+    switch transcriptionStatus {
+    case .uploading: "Uploading audio..."
+    case .queued: "Queued for transcription..."
+    case .transcribing: "Transcribing..."
+    default: ""
+    }
+  }
+
+  private func transcriptView(_ doc: TranscriptDocument) -> some View {
+    ScrollView {
+      LazyVStack(alignment: .leading, spacing: 12) {
+        ForEach(doc.segments) { segment in
+          TranscriptSegmentView(
+            segment: segment,
+            isActive: isSegmentActive(segment, in: doc),
+            onTap: { jumpTo(time: segment.time) }
+          )
+        }
+      }
+      .padding()
+    }
+  }
+
+  private func isSegmentActive(
+    _ segment: TranscriptSegment, in doc: TranscriptDocument
+  ) -> Bool {
+    guard isPlaying else { return false }
+    guard let idx = doc.segments.firstIndex(where: { $0.id == segment.id }) else {
+      return false
+    }
+    let nextTime: Double =
+      if idx + 1 < doc.segments.count {
+        doc.segments[idx + 1].time
+      } else {
+        duration
+      }
+    return currentTime >= segment.time && currentTime < nextTime
+  }
+
+  private func jumpTo(time: Double) {
+    seekTo(time)
+    if !isPlaying { togglePlayback() }
+  }
+
+  // MARK: - Transcription Lifecycle
+
+  private func loadTranscript() {
+    transcript = TranscriptDocument.load(for: recording.url)
+    transcriptionStatus = .idle
+  }
+
+  private func startTranscription() {
+    guard !sonioxAPIKey.isEmpty else { return }
+
+    transcriptionTask = Task {
+      let service = TranscriptionService(apiKey: sonioxAPIKey)
+      transcriptionStatus = .uploading
+
+      do {
+        let doc = try await service.transcribe(
+          fileURL: recording.url,
+          onStatus: { status in
+            transcriptionStatus = status
+          }
+        )
+        // Show transcript immediately, then persist
+        transcript = doc
+        transcriptionStatus = .completed
+        onTranscriptChanged()
+        do {
+          try doc.save(for: recording.url)
+        } catch {
+          Log.error(
+            Log.transcription, "transcription",
+            "failed to save transcript: \(error.localizedDescription)")
+        }
+      } catch is CancellationError {
+        transcriptionStatus = .idle
+      } catch let error as URLError where error.code == .cancelled {
+        // URLSession throws URLError.cancelled when Task is cancelled
+        if Task.isCancelled {
+          transcriptionStatus = .idle
+        } else {
+          transcriptionStatus = .error(error.localizedDescription)
+        }
+      } catch {
+        if Task.isCancelled {
+          transcriptionStatus = .idle
+        } else {
+          transcriptionStatus = .error(error.localizedDescription)
+          Log.error(
+            Log.transcription, "transcription",
+            "failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func cancelTranscription() {
+    transcriptionTask?.cancel()
+    transcriptionTask = nil
+    if case .error = transcriptionStatus { return }
+    transcriptionStatus = .idle
+  }
+
+  // MARK: - Formatting
+
+  private func formatTime(_ time: TimeInterval) -> String {
+    let total = max(0, Int(time))
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    return h > 0
+      ? String(format: "%d:%02d:%02d", h, m, s)
+      : String(format: "%d:%02d", m, s)
+  }
+}
+
+// MARK: - Transcript Segment View
+
+private struct TranscriptSegmentView: View {
+  let segment: TranscriptSegment
+  let isActive: Bool
+  let onTap: () -> Void
+
+  private static let speakerColors: [Color] = [
+    .blue, .green, .orange, .purple, .pink, .teal,
+  ]
+
+  private var isLocalUser: Bool { segment.speaker == -1 }
+
+  private var speakerColor: Color {
+    if isLocalUser { return .accentColor }
+    return Self.speakerColors[segment.speaker % Self.speakerColors.count]
+  }
+
+  private var speakerLabel: String {
+    isLocalUser ? "You" : "S\(segment.speaker + 1)"
+  }
+
+  var body: some View {
+    Button(action: onTap) {
+      HStack(alignment: .top, spacing: 10) {
+        VStack(alignment: .trailing, spacing: 2) {
+          Text(speakerLabel)
+            .font(.caption.bold())
+            .foregroundStyle(speakerColor)
+          Text(formatTimestamp(segment.time))
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.tertiary)
+        }
+        .frame(width: 50, alignment: .trailing)
+
+        Text(segment.text)
+          .font(.body)
+          .foregroundStyle(isActive ? .primary : .secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      .padding(.vertical, 4)
+      .padding(.horizontal, 8)
+      .background(
+        isActive ? speakerColor.opacity(0.08) : Color.clear,
+        in: RoundedRectangle(cornerRadius: 6)
+      )
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func formatTimestamp(_ time: Double) -> String {
+    let total = Int(time)
+    let m = total / 60
+    let s = total % 60
+    return String(format: "%d:%02d", m, s)
   }
 }
 
@@ -199,6 +700,7 @@ struct RecordingFile: Identifiable {
   let name: String
   let date: Date
   let size: Int
+  let hasTranscript: Bool
 
   var sizeFormatted: String {
     ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)

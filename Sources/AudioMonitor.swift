@@ -21,6 +21,7 @@ final class AudioMonitor: @unchecked Sendable {
 
   // Auto-recording triggered by mic detection
   private var autoRecorder: AudioRecorder?
+  private var autoRecordingAppName: String?
   // Manual recording triggered by user
   private var manualRecorder: AudioRecorder?
 
@@ -28,14 +29,16 @@ final class AudioMonitor: @unchecked Sendable {
   private var elapsedTimer: Timer?
   private var graceTask: Task<Void, Never>?
 
-  // CoreAudio mic detection - monitors ALL input devices.
-  // @ObservationIgnored: these are internal CoreAudio bookkeeping, not UI state.
+  // Per-process mic detection (macOS 14.2+) - monitors which processes have active mic input.
+  // @ObservationIgnored: internal CoreAudio bookkeeping, not UI state.
   // nonisolated(unsafe): deinit (nonisolated in Swift 6) must read these to remove
   // CoreAudio listeners and prevent dangling pointer callbacks. Thread safety: only
   // mutated on MainActor during normal operation; deinit is the final access point
   // where no other references exist. Class is @unchecked Sendable.
-  @ObservationIgnored nonisolated(unsafe) private var monitoredDeviceIDs: Set<AudioObjectID> = []
-  @ObservationIgnored nonisolated(unsafe) private var deviceListListenerRegistered = false
+  @ObservationIgnored nonisolated(unsafe) private var monitoredProcessObjectIDs:
+    Set<AudioObjectID> =
+      []
+  @ObservationIgnored nonisolated(unsafe) private var processListListenerRegistered = false
   private var micPollingTask: Task<Void, Never>?
   private var lastKnownMicRunning = false
 
@@ -43,29 +46,30 @@ final class AudioMonitor: @unchecked Sendable {
 
   // Safety net: CoreAudio listeners hold an Unmanaged.passUnretained(self) pointer.
   // If this object is deallocated with listeners still registered, the callback fires
-  // into a dangling pointer → crash. stopMonitoring() handles the normal path;
+  // into a dangling pointer - crash. stopMonitoring() handles the normal path;
   // deinit catches unexpected teardown (e.g. future refactors that break the lifecycle).
   //
   // deinit is nonisolated in Swift 6, so we inline the CoreAudio C calls directly
   // rather than calling the MainActor-isolated helper methods.
   deinit {
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-    var runAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+    var inputAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunningInput,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    for id in monitoredDeviceIDs {
-      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
+    for id in monitoredProcessObjectIDs {
+      AudioObjectRemovePropertyListener(id, &inputAddr, Self.processInputChangedProc, selfPtr)
     }
-    if deviceListListenerRegistered {
-      var devAddr = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDevices,
+    if processListListenerRegistered {
+      var procListAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
       )
       AudioObjectRemovePropertyListener(
-        AudioObjectID(kAudioObjectSystemObject), &devAddr, Self.deviceListChangedProc, selfPtr)
+        AudioObjectID(kAudioObjectSystemObject), &procListAddr, Self.processListChangedProc,
+        selfPtr)
     }
   }
 
@@ -138,8 +142,8 @@ final class AudioMonitor: @unchecked Sendable {
     settingsTask = nil
     micPollingTask?.cancel()
     micPollingTask = nil
-    removeAllMicActivityListeners()
-    removeDeviceListListener()
+    removeAllProcessInputListeners()
+    removeProcessListListener()
     stopElapsedTimer()
     cancelGracePeriod()
 
@@ -309,238 +313,278 @@ final class AudioMonitor: @unchecked Sendable {
     }
   }
 
-  // MARK: - Mic Activity Detection
+  // MARK: - Per-Process Mic Detection (macOS 14.2+)
 
   private func setupMicMonitoring() {
-    addDeviceListListener()
-    updateMicActivityListeners()
+    addProcessListListener()
+    updateProcessInputListeners()
 
-    let running = isAnyInputDeviceRunning()
-    lastKnownMicRunning = running
+    let micUsers = Self.externalMicUsers()
+    lastKnownMicRunning = !micUsers.isEmpty
     Log.info(
       Log.monitor, "monitor",
-      "mic monitoring started: \(monitoredDeviceIDs.count) input devices, running=\(running)"
+      "mic monitoring started: \(monitoredProcessObjectIDs.count) audio processes, externalMicUsers=\(micUsers.count)"
     )
 
     // Check current state in case app starts mid-call
-    if running { handleMicBecameActive() }
+    if let first = micUsers.first {
+      handleMicBecameActive(appBundleID: first.bundleID)
+    }
 
     // Polling fallback: CoreAudio listener may not fire for all audio pipelines
     micPollingTask = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(3))
         guard let self else { return }
-        let running = self.isAnyInputDeviceRunning()
-        if running != self.lastKnownMicRunning {
-          Log.info(Log.monitor, "monitor", "mic poll detected change: running=\(running)")
-          self.lastKnownMicRunning = running
-          if running {
-            self.handleMicBecameActive()
-          } else {
-            self.handleMicBecameInactive()
-          }
-        }
+        self.evaluateMicState()
       }
     }
   }
 
-  // MARK: - Device List Listener (hot-plug)
+  // MARK: - Process List Listener
 
-  private func addDeviceListListener() {
-    guard !deviceListListenerRegistered else { return }
+  private func addProcessListListener() {
+    guard !processListListenerRegistered else { return }
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
     var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
+      mSelector: kAudioHardwarePropertyProcessObjectList,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
     let status = AudioObjectAddPropertyListener(
       AudioObjectID(kAudioObjectSystemObject),
       &address,
-      Self.deviceListChangedProc,
+      Self.processListChangedProc,
       selfPtr
     )
     if status == noErr {
-      deviceListListenerRegistered = true
+      processListListenerRegistered = true
     } else {
-      Log.error(Log.monitor, "monitor", "failed to register device list listener: \(status)")
+      Log.error(Log.monitor, "monitor", "failed to register process list listener: \(status)")
     }
   }
 
-  private func removeDeviceListListener() {
-    guard deviceListListenerRegistered else { return }
+  private func removeProcessListListener() {
+    guard processListListenerRegistered else { return }
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
     var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
+      mSelector: kAudioHardwarePropertyProcessObjectList,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
     AudioObjectRemovePropertyListener(
       AudioObjectID(kAudioObjectSystemObject),
       &address,
-      Self.deviceListChangedProc,
+      Self.processListChangedProc,
       selfPtr
     )
-    deviceListListenerRegistered = false
+    processListListenerRegistered = false
   }
 
-  // MARK: - Per-Device Activity Listeners
+  // MARK: - Per-Process Input Listeners
 
-  private func updateMicActivityListeners() {
-    let inputDevices = Self.allInputDeviceIDs()
-    let current = monitoredDeviceIDs
-    let toAdd = inputDevices.subtracting(current)
-    let toRemove = current.subtracting(inputDevices)
+  private func updateProcessInputListeners() {
+    let allProcesses = Set(Self.allAudioProcessObjects())
+    let current = monitoredProcessObjectIDs
+    let toAdd = allProcesses.subtracting(current)
+    let toRemove = current.subtracting(allProcesses)
 
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-    var runAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+    var inputAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunningInput,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
 
     for id in toRemove {
-      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
-      monitoredDeviceIDs.remove(id)
+      AudioObjectRemovePropertyListener(id, &inputAddr, Self.processInputChangedProc, selfPtr)
+      monitoredProcessObjectIDs.remove(id)
     }
 
     for id in toAdd {
       let status = AudioObjectAddPropertyListener(
-        id, &runAddr, Self.micActivityChangedProc, selfPtr)
+        id, &inputAddr, Self.processInputChangedProc, selfPtr)
       if status == noErr {
-        monitoredDeviceIDs.insert(id)
+        monitoredProcessObjectIDs.insert(id)
       }
     }
 
     if !toAdd.isEmpty || !toRemove.isEmpty {
       Log.info(
         Log.monitor, "monitor",
-        "mic listeners updated: monitoring \(monitoredDeviceIDs.count) devices (added \(toAdd.count), removed \(toRemove.count))"
+        "process listeners updated: monitoring \(monitoredProcessObjectIDs.count) processes (added \(toAdd.count), removed \(toRemove.count))"
       )
     }
   }
 
-  private func removeAllMicActivityListeners() {
+  private func removeAllProcessInputListeners() {
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-    var runAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+    var inputAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunningInput,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    for id in monitoredDeviceIDs {
-      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
+    for id in monitoredProcessObjectIDs {
+      AudioObjectRemovePropertyListener(id, &inputAddr, Self.processInputChangedProc, selfPtr)
     }
-    monitoredDeviceIDs.removeAll()
+    monitoredProcessObjectIDs.removeAll()
   }
 
-  /// Returns true if ANY input device has its audio engine running.
-  private func isAnyInputDeviceRunning() -> Bool {
-    var runAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    for id in monitoredDeviceIDs {
-      var isRunning: UInt32 = 0
-      var size = UInt32(MemoryLayout<UInt32>.size)
-      AudioObjectGetPropertyData(id, &runAddr, 0, nil, &size, &isRunning)
-      if isRunning != 0 { return true }
-    }
-    return false
-  }
+  // MARK: - Process Query Functions
 
-  /// Enumerate all physical audio devices that have input channels.
-  /// Excludes virtual and aggregate devices to avoid false positives.
-  nonisolated private static func allInputDeviceIDs() -> Set<AudioObjectID> {
+  /// Enumerate all audio process objects registered with CoreAudio.
+  nonisolated private static func allAudioProcessObjects() -> [AudioObjectID] {
     var propSize: UInt32 = 0
-    var devAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyProcessObjectList,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
     guard
       AudioObjectGetPropertyDataSize(
-        AudioObjectID(kAudioObjectSystemObject), &devAddr, 0, nil, &propSize) == noErr,
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize) == noErr,
       propSize > 0
     else { return [] }
 
     let count = Int(propSize) / MemoryLayout<AudioObjectID>.size
-    var devices = [AudioObjectID](repeating: 0, count: count)
+    var objects = [AudioObjectID](repeating: 0, count: count)
     guard
       AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &devAddr, 0, nil, &propSize, &devices) == noErr
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize, &objects) == noErr
     else { return [] }
+    return objects
+  }
 
-    var inputAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyStreamConfiguration,
-      mScope: kAudioObjectPropertyScopeInput,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var transportAddr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyTransportType,
+  /// Get the PID for an AudioProcess object.
+  nonisolated private static func processPID(for objectID: AudioObjectID) -> pid_t? {
+    var pid: pid_t = 0
+    var size = UInt32(MemoryLayout<pid_t>.size)
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyPID,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
+    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &pid) == noErr else {
+      return nil
+    }
+    return pid
+  }
 
-    var result: Set<AudioObjectID> = []
-    for id in devices {
-      // Skip virtual and aggregate devices
-      var transport: UInt32 = 0
-      var transportSize = UInt32(MemoryLayout<UInt32>.size)
-      AudioObjectGetPropertyData(id, &transportAddr, 0, nil, &transportSize, &transport)
-      if transport == kAudioDeviceTransportTypeVirtual
-        || transport == kAudioDeviceTransportTypeAggregate
+  /// Get the bundle ID for an AudioProcess object.
+  nonisolated private static func processBundleID(for objectID: AudioObjectID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyBundleID,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    // CFString is a reference type - can't form UnsafeMutableRawPointer to it directly.
+    // Allocate a raw buffer for the CFStringRef pointer instead.
+    let buf = UnsafeMutablePointer<UnsafeRawPointer?>.allocate(capacity: 1)
+    defer { buf.deallocate() }
+    buf.initialize(to: nil)
+    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
+    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, buf) == noErr,
+      let raw = buf.pointee
+    else {
+      return nil
+    }
+    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+  }
+
+  /// Check if an AudioProcess object has active microphone input.
+  nonisolated private static func isProcessUsingMicInput(_ objectID: AudioObjectID) -> Bool {
+    var isRunning: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunningInput,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &isRunning)
+    return isRunning != 0
+  }
+
+  /// Returns all external processes (not us, not SCK helpers) that have active mic input.
+  /// This is the core detection function - filters out our own PID and ScreenCaptureKit
+  /// XPC service processes so we only see OTHER apps' mic usage.
+  nonisolated private static func externalMicUsers()
+    -> [(processObjectID: AudioObjectID, pid: pid_t, bundleID: String?)]
+  {
+    let myPID = ProcessInfo.processInfo.processIdentifier
+    var result: [(processObjectID: AudioObjectID, pid: pid_t, bundleID: String?)] = []
+
+    for objectID in allAudioProcessObjects() {
+      guard isProcessUsingMicInput(objectID) else { continue }
+      guard let pid = processPID(for: objectID) else { continue }
+
+      // Filter out our own process
+      if pid == myPID { continue }
+
+      // Filter out ScreenCaptureKit XPC helpers (they open the mic on our behalf)
+      let bundleID = processBundleID(for: objectID)
+      if let bid = bundleID,
+        bid.hasPrefix("com.apple.screencapturekit")
+          || bid.hasPrefix("com.apple.ScreenCaptureKit")
+          || bid.hasPrefix("com.apple.replayd")
       {
         continue
       }
 
-      // Check for input channels.
-      // IMPORTANT: AudioBufferList is a variable-length C struct - mBuffers is a
-      // flexible array member. Allocating `UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)`
-      // only reserves space for ONE AudioBuffer. Multi-channel pro interfaces may have
-      // multiple buffers, causing AudioObjectGetPropertyData to write past the allocation
-      // (heap overflow / UB). Always allocate exactly `bufSize` bytes from GetPropertyDataSize.
-      var bufSize: UInt32 = 0
-      guard AudioObjectGetPropertyDataSize(id, &inputAddr, 0, nil, &bufSize) == noErr,
-        bufSize > 0
-      else { continue }
-      let rawBuf = UnsafeMutableRawPointer.allocate(
-        byteCount: Int(bufSize), alignment: MemoryLayout<AudioBufferList>.alignment)
-      defer { rawBuf.deallocate() }
-      let bufferList = rawBuf.bindMemory(to: AudioBufferList.self, capacity: 1)
-      guard AudioObjectGetPropertyData(id, &inputAddr, 0, nil, &bufSize, bufferList) == noErr
-      else { continue }
-      if bufferList.pointee.mNumberBuffers > 0
-        && bufferList.pointee.mBuffers.mNumberChannels > 0
-      {
-        result.insert(id)
-      }
+      result.append((processObjectID: objectID, pid: pid, bundleID: bundleID))
     }
     return result
   }
 
-  func handleMicActivityChange() {
-    let running = isAnyInputDeviceRunning()
-    Log.info(Log.monitor, "monitor", "CoreAudio listener fired: running=\(running)")
-    lastKnownMicRunning = running
-    if running {
-      handleMicBecameActive()
-    } else {
-      handleMicBecameInactive()
+  // MARK: - Mic State Evaluation
+
+  /// Re-evaluate mic state by checking which external processes have active mic input.
+  /// Called from listeners and polling fallback.
+  private func evaluateMicState() {
+    let micUsers = Self.externalMicUsers()
+    let running = !micUsers.isEmpty
+
+    if running != lastKnownMicRunning {
+      Log.info(
+        Log.monitor, "monitor",
+        "mic state changed: externalMicUsers=\(micUsers.count), running=\(running)")
+      lastKnownMicRunning = running
+      if running {
+        handleMicBecameActive(appBundleID: micUsers.first?.bundleID)
+      } else {
+        handleMicBecameInactive()
+      }
     }
   }
 
-  func handleDeviceListChanged() {
-    Log.info(Log.monitor, "monitor", "audio device list changed")
-    updateMicActivityListeners()
-    if isAnyInputDeviceRunning() {
-      handleMicBecameActive()
+  func handleProcessListChanged() {
+    Log.info(Log.monitor, "monitor", "audio process list changed")
+    updateProcessInputListeners()
+    evaluateMicState()
+  }
+
+  func handleProcessInputChange() {
+    evaluateMicState()
+  }
+
+  /// Resolve a bundle ID to a human-readable app name.
+  private static func resolveAppName(bundleID: String?) -> String {
+    guard let bundleID else { return "Call" }
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+      let name = app.localizedName
+    {
+      return name
     }
+    // Fallback: extract last component of bundle ID (e.g. "com.zoom.us" -> "zoom")
+    let components = bundleID.split(separator: ".")
+    if let last = components.last, last != "app" {
+      return String(last)
+    }
+    return "Call"
   }
 
   // MARK: - Auto Recording
 
-  private func handleMicBecameActive() {
+  private func handleMicBecameActive(appBundleID: String? = nil) {
     cancelGracePeriod()
 
     guard autoRecord, !isRecording, !isManualRecording else {
@@ -560,6 +604,7 @@ final class AudioMonitor: @unchecked Sendable {
     }
     permissionNeeded = false
 
+    autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
     loadSettings()
     startAutoRecording()
   }
@@ -579,9 +624,10 @@ final class AudioMonitor: @unchecked Sendable {
       return
     }
 
+    let appName = autoRecordingAppName ?? "Call"
     let recorder = AudioRecorder(
-      appName: "Call",
-      micEnabled: false,  // System audio only - keeps mic detection clean
+      appName: appName,
+      micEnabled: micEnabled,  // Per-process detection filters our own mic usage
       saveDirectory: saveDirectory,
       onFailure: { [weak self] failure in
         Task { @MainActor [weak self] in
@@ -591,17 +637,18 @@ final class AudioMonitor: @unchecked Sendable {
     )
 
     autoRecorder = recorder
-    Log.info(Log.monitor, "monitor", "starting auto-recording (mic activity detected)")
+    Log.info(
+      Log.monitor, "monitor", "starting auto-recording (mic activity detected, app=\(appName))")
 
     Task {
       do {
         try await recorder.start()
         isRecording = true
-        currentAppName = "Call"
+        currentAppName = appName
         recordingStartTime = Date()
         startElapsedTimer()
-        hud.showRecordingStarted(appName: "Call", bundleID: nil)
-        if notifyOnStart { postRecordingStartedNotification(appName: "Call") }
+        hud.showRecordingStarted(appName: appName, bundleID: nil)
+        if notifyOnStart { postRecordingStartedNotification(appName: appName) }
       } catch {
         setError("Failed to start recording: \(error.localizedDescription)")
         if (error as NSError).domain == "com.apple.ScreenCaptureKit.SCStreamError",
@@ -617,8 +664,10 @@ final class AudioMonitor: @unchecked Sendable {
 
   private func stopAutoRecording() {
     guard let recorder = autoRecorder else { return }
+    let appName = autoRecordingAppName ?? "Call"
     autoRecorder = nil
-    Log.info(Log.monitor, "monitor", "stopping auto-recording")
+    autoRecordingAppName = nil
+    Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
     savingCount += 1
     isSaving = true
     Task {
@@ -626,9 +675,9 @@ final class AudioMonitor: @unchecked Sendable {
       savingCount -= 1
       isSaving = savingCount > 0
       if let url {
-        hud.showRecordingSaved(appName: "Call", fileName: url.lastPathComponent, fileURL: url)
+        hud.showRecordingSaved(appName: appName, fileName: url.lastPathComponent, fileURL: url)
         if notifyOnSaved {
-          postRecordingSavedNotification(appName: "Call", fileURL: url)
+          postRecordingSavedNotification(appName: appName, fileURL: url)
         }
       }
       updateAutoState()
@@ -640,6 +689,7 @@ final class AudioMonitor: @unchecked Sendable {
       Log.info(Log.monitor, "monitor", "handleAutoRecorderFailure skipped: recorder already nil")
       return
     }
+    let appName = autoRecordingAppName ?? "Call"
     autoRecorder = nil
     stopElapsedTimer()
     cancelGracePeriod()
@@ -651,19 +701,21 @@ final class AudioMonitor: @unchecked Sendable {
       savingCount -= 1
       isSaving = savingCount > 0
       if let url, notifyOnSaved {
-        postRecordingSavedNotification(appName: "Call", fileURL: url)
+        postRecordingSavedNotification(appName: appName, fileURL: url)
       }
     }
 
     switch failure {
     case .permissionDenied:
       permissionNeeded = true
+      autoRecordingAppName = nil
       updateAutoState()
     case .systemStopped, .deviceChangeFailed:
       Log.info(Log.monitor, "monitor", "auto-recording interrupted, restarting")
       startAutoRecording()
     case .micFailed, .other:
       setError("Recording interrupted")
+      autoRecordingAppName = nil
       updateAutoState()
     }
   }
@@ -727,22 +779,22 @@ final class AudioMonitor: @unchecked Sendable {
 // MARK: - CoreAudio Callbacks
 
 extension AudioMonitor {
-  nonisolated static let micActivityChangedProc: AudioObjectPropertyListenerProc = {
+  nonisolated static let processListChangedProc: AudioObjectPropertyListenerProc = {
     _, _, _, clientData in
     guard let clientData else { return noErr }
     let monitor = Unmanaged<AudioMonitor>.fromOpaque(clientData).takeUnretainedValue()
     Task { @MainActor in
-      monitor.handleMicActivityChange()
+      monitor.handleProcessListChanged()
     }
     return noErr
   }
 
-  nonisolated static let deviceListChangedProc: AudioObjectPropertyListenerProc = {
+  nonisolated static let processInputChangedProc: AudioObjectPropertyListenerProc = {
     _, _, _, clientData in
     guard let clientData else { return noErr }
     let monitor = Unmanaged<AudioMonitor>.fromOpaque(clientData).takeUnretainedValue()
     Task { @MainActor in
-      monitor.handleDeviceListChanged()
+      monitor.handleProcessInputChange()
     }
     return noErr
   }

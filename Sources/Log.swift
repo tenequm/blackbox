@@ -7,6 +7,8 @@ nonisolated enum Log {
   nonisolated static let app = Logger(subsystem: "com.tenequm.Blackbox", category: "app")
   nonisolated static let monitor = Logger(subsystem: "com.tenequm.Blackbox", category: "monitor")
   nonisolated static let recorder = Logger(subsystem: "com.tenequm.Blackbox", category: "recorder")
+  nonisolated static let transcription = Logger(
+    subsystem: "com.tenequm.Blackbox", category: "transcription")
 
   /// Log info to both os.Logger and file (for key lifecycle events).
   nonisolated static func info(_ logger: Logger, _ category: String, _ message: String) {

@@ -39,6 +39,7 @@ install: bundle
 	xattr -rc "/Applications/$(APP_NAME).app"
 
 run: bundle
+	-killall $(APP_NAME) 2>/dev/null; true
 	open "$(APP_BUNDLE)"
 
 dmg: bundle

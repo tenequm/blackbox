@@ -12,6 +12,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
+  @AppStorage("sonioxAPIKey") private var sonioxAPIKey = ""
 
   @State private var screenRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -23,6 +24,7 @@ struct SettingsView: View {
       generalSection
       permissionsSection
       recordingsSection
+      transcriptionSection
       notificationsSection
       debugSection
     }
@@ -59,12 +61,12 @@ struct SettingsView: View {
         }
 
       Toggle("Automatic Recording", isOn: $autoRecord)
-      Text("Records system audio when your microphone becomes active, e.g. during calls")
+      Text("Automatically records when your microphone becomes active, e.g. during calls")
         .font(.caption)
         .foregroundStyle(.secondary)
 
       Toggle("Record Microphone", isOn: $micEnabled)
-      Text("Include your microphone in manual recordings")
+      Text("Include your microphone in recordings")
         .font(.caption)
         .foregroundStyle(.secondary)
 
@@ -162,6 +164,19 @@ struct SettingsView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
       }
+    }
+  }
+
+  // MARK: - Transcription
+
+  private var transcriptionSection: some View {
+    Section("Transcription") {
+      SecureField("Soniox API Key", text: $sonioxAPIKey)
+      Text(
+        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
