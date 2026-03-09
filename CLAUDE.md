@@ -52,10 +52,10 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 4. **Test install**: `make install && open /Applications/Blackbox.app`
 5. **Verify permissions**: First launch should prompt for Screen Recording (as "Blackbox", not terminal)
 6. **Test auto-recording**: Open Chrome, navigate to Google Meet - recording should start when meeting window detected
-7. **Test manual recording**: Menu > Record Now > pick app - should record and stop cleanly
+7. **Test manual recording**: Menu > Record System Audio - should record and stop cleanly
 8. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
 9. **Test settings**: All settings persist across restart, changes take effect within 3 seconds
-10. **Check output files**: M4A files in ~/Documents/Blackbox/, named with timestamp + app name, playable in QuickTime
+10. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
 
 ## Key Architecture Decisions
 
@@ -63,6 +63,9 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks run on a background dispatch queue (`audioQueue`). Thread safety: `stop()` dispatches `markAsFinished()` on `audioQueue.sync` to serialize with callbacks.
 - **Dual-track M4A**: system audio + mic as separate AVAssetWriterInputs. Most players mix both tracks on playback. Note: some players only play the first track.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter) before process exit.
+- **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (mic failed, system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures. Manual recordings also auto-restart.
+- **Device following**: CoreAudio `AudioObjectAddPropertyListener` monitors default input device changes. `updateConfiguration()` switches mic seamlessly on running stream; falls back to stream restart on failure.
+- **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
 
 ## Concurrency Model
 
