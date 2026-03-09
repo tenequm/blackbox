@@ -52,6 +52,7 @@ dmg: bundle
 	@echo "DMG created: $(BUILD_DIR)/$(DMG_NAME)"
 
 release: dmg
+	@if [ -z "$(SIGN_ID)" ]; then echo "ERROR: No Developer ID found. Cannot notarize an ad-hoc signed build."; exit 1; fi
 	xcrun notarytool submit "$(BUILD_DIR)/$(DMG_NAME)" --keychain-profile "blackbox" --wait
 	xcrun stapler staple "$(BUILD_DIR)/$(DMG_NAME)"
 	@echo "Notarized: $(BUILD_DIR)/$(DMG_NAME)"

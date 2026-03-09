@@ -21,26 +21,20 @@ struct BlackboxApp: App {
     MenuBarExtra {
       MenuContent(monitor: monitor, updater: updaterController.updater, selectedTab: $selectedTab)
     } label: {
-      if monitor.permissionNeeded {
+      // Menu bar images are rendered as template images by macOS - foregroundStyle
+      // and symbolRenderingMode have no effect. State is conveyed via distinct SF Symbols.
+      if monitor.permissionNeeded || monitor.errorMessage != nil {
         Image(systemName: "exclamationmark.triangle.fill")
-          .foregroundStyle(.yellow)
-      } else if monitor.errorMessage != nil {
-        Image(systemName: "exclamationmark.triangle.fill")
-          .foregroundStyle(.yellow)
       } else if monitor.isRecording {
         if let grace = monitor.graceCountdown {
           HStack(spacing: 4) {
             Image(systemName: "waveform.circle")
-              .foregroundStyle(.secondary)
             Text(String(format: "0:%02d", Int(ceil(grace))))
               .font(.system(.body, design: .monospaced))
-              .foregroundStyle(.secondary)
           }
         } else {
           HStack(spacing: 4) {
             Image(systemName: "waveform.circle.fill")
-              .symbolRenderingMode(.palette)
-              .foregroundStyle(.red, .primary)
             if let elapsed = monitor.formattedElapsed {
               Text(elapsed)
                 .font(.system(.body, design: .monospaced))

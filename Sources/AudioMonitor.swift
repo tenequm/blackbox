@@ -28,14 +28,46 @@ final class AudioMonitor: @unchecked Sendable {
   private var elapsedTimer: Timer?
   private var graceTask: Task<Void, Never>?
 
-  // CoreAudio mic detection
-  private var currentInputDeviceID: AudioObjectID = kAudioObjectUnknown
-  private var micListenerRegistered = false
-  private var defaultDeviceListenerRegistered = false
+  // CoreAudio mic detection - monitors ALL input devices.
+  // @ObservationIgnored: these are internal CoreAudio bookkeeping, not UI state.
+  // nonisolated(unsafe): deinit (nonisolated in Swift 6) must read these to remove
+  // CoreAudio listeners and prevent dangling pointer callbacks. Thread safety: only
+  // mutated on MainActor during normal operation; deinit is the final access point
+  // where no other references exist. Class is @unchecked Sendable.
+  @ObservationIgnored nonisolated(unsafe) private var monitoredDeviceIDs: Set<AudioObjectID> = []
+  @ObservationIgnored nonisolated(unsafe) private var deviceListListenerRegistered = false
   private var micPollingTask: Task<Void, Never>?
   private var lastKnownMicRunning = false
 
   private let hud = RecordingHUD()
+
+  // Safety net: CoreAudio listeners hold an Unmanaged.passUnretained(self) pointer.
+  // If this object is deallocated with listeners still registered, the callback fires
+  // into a dangling pointer → crash. stopMonitoring() handles the normal path;
+  // deinit catches unexpected teardown (e.g. future refactors that break the lifecycle).
+  //
+  // deinit is nonisolated in Swift 6, so we inline the CoreAudio C calls directly
+  // rather than calling the MainActor-isolated helper methods.
+  deinit {
+    let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+    var runAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    for id in monitoredDeviceIDs {
+      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
+    }
+    if deviceListListenerRegistered {
+      var devAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      AudioObjectRemovePropertyListener(
+        AudioObjectID(kAudioObjectSystemObject), &devAddr, Self.deviceListChangedProc, selfPtr)
+    }
+  }
 
   // Settings
   var autoRecord: Bool = true
@@ -51,8 +83,16 @@ final class AudioMonitor: @unchecked Sendable {
   // MARK: - Monitoring Lifecycle
 
   func startMonitoring(skipPermissionRequests: Bool = false) {
-    guard settingsTask == nil else { return }
+    guard settingsTask == nil else {
+      Log.info(Log.monitor, "monitor", "startMonitoring skipped: already running")
+      return
+    }
+    Log.info(Log.monitor, "monitor", "startMonitoring called (skip=\(skipPermissionRequests))")
     loadSettings()
+    Log.info(
+      Log.monitor, "monitor",
+      "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
+    )
 
     if !CGPreflightScreenCaptureAccess() {
       Log.info(Log.monitor, "monitor", "screen recording permission not granted")
@@ -98,8 +138,8 @@ final class AudioMonitor: @unchecked Sendable {
     settingsTask = nil
     micPollingTask?.cancel()
     micPollingTask = nil
-    removeMicActivityListener()
-    removeDefaultDeviceListener()
+    removeAllMicActivityListeners()
+    removeDeviceListListener()
     stopElapsedTimer()
     cancelGracePeriod()
 
@@ -175,7 +215,10 @@ final class AudioMonitor: @unchecked Sendable {
   }
 
   private func startManualRecordingInternal(micOverride: Bool? = nil) {
-    guard manualRecorder == nil else { return }
+    guard manualRecorder == nil else {
+      Log.info(Log.monitor, "monitor", "startManualRecording skipped: already recording")
+      return
+    }
 
     let useMic = micOverride ?? micEnabled
     let recorder = AudioRecorder(
@@ -210,7 +253,10 @@ final class AudioMonitor: @unchecked Sendable {
   }
 
   private func handleManualRecorderFailure(_ failure: RecorderFailure) {
-    guard let failedRecorder = manualRecorder else { return }
+    guard let failedRecorder = manualRecorder else {
+      Log.info(Log.monitor, "monitor", "handleManualRecorderFailure skipped: recorder already nil")
+      return
+    }
     let appName = currentAppName ?? failedRecorder.appName
 
     manualRecorder = nil
@@ -266,14 +312,14 @@ final class AudioMonitor: @unchecked Sendable {
   // MARK: - Mic Activity Detection
 
   private func setupMicMonitoring() {
-    addDefaultDeviceListener()
-    updateMicActivityListener()
+    addDeviceListListener()
+    updateMicActivityListeners()
 
-    let running = isMicRunning()
+    let running = isAnyInputDeviceRunning()
     lastKnownMicRunning = running
     Log.info(
       Log.monitor, "monitor",
-      "mic monitoring started: device=\(currentInputDeviceID), running=\(running), listener=\(micListenerRegistered)"
+      "mic monitoring started: \(monitoredDeviceIDs.count) input devices, running=\(running)"
     )
 
     // Check current state in case app starts mid-call
@@ -284,10 +330,9 @@ final class AudioMonitor: @unchecked Sendable {
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(3))
         guard let self else { return }
-        let running = self.isMicRunning()
+        let running = self.isAnyInputDeviceRunning()
         if running != self.lastKnownMicRunning {
-          Log.info(
-            Log.monitor, "monitor", "mic poll detected change: running=\(running)")
+          Log.info(Log.monitor, "monitor", "mic poll detected change: running=\(running)")
           self.lastKnownMicRunning = running
           if running {
             self.handleMicBecameActive()
@@ -299,125 +344,183 @@ final class AudioMonitor: @unchecked Sendable {
     }
   }
 
-  private func addDefaultDeviceListener() {
-    guard !defaultDeviceListenerRegistered else { return }
+  // MARK: - Device List Listener (hot-plug)
+
+  private func addDeviceListListener() {
+    guard !deviceListListenerRegistered else { return }
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
     var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
+      mSelector: kAudioHardwarePropertyDevices,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
     let status = AudioObjectAddPropertyListener(
       AudioObjectID(kAudioObjectSystemObject),
       &address,
-      Self.defaultDeviceChangedProc,
+      Self.deviceListChangedProc,
       selfPtr
     )
     if status == noErr {
-      defaultDeviceListenerRegistered = true
-      Log.info(Log.monitor, "monitor", "default device listener registered")
+      deviceListListenerRegistered = true
     } else {
-      Log.error(Log.monitor, "monitor", "failed to register default device listener: \(status)")
+      Log.error(Log.monitor, "monitor", "failed to register device list listener: \(status)")
     }
   }
 
-  private func removeDefaultDeviceListener() {
-    guard defaultDeviceListenerRegistered else { return }
+  private func removeDeviceListListener() {
+    guard deviceListListenerRegistered else { return }
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
     var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
+      mSelector: kAudioHardwarePropertyDevices,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
     AudioObjectRemovePropertyListener(
       AudioObjectID(kAudioObjectSystemObject),
       &address,
-      Self.defaultDeviceChangedProc,
+      Self.deviceListChangedProc,
       selfPtr
     )
-    defaultDeviceListenerRegistered = false
+    deviceListListenerRegistered = false
   }
 
-  private func updateMicActivityListener() {
-    removeMicActivityListener()
+  // MARK: - Per-Device Activity Listeners
 
-    var deviceID = AudioObjectID(kAudioObjectUnknown)
-    var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(
-      AudioObjectID(kAudioObjectSystemObject),
-      &address, 0, nil, &size, &deviceID
-    )
+  private func updateMicActivityListeners() {
+    let inputDevices = Self.allInputDeviceIDs()
+    let current = monitoredDeviceIDs
+    let toAdd = inputDevices.subtracting(current)
+    let toRemove = current.subtracting(inputDevices)
 
-    guard deviceID != kAudioObjectUnknown else {
-      Log.info(Log.monitor, "monitor", "no default input device found")
-      currentInputDeviceID = kAudioObjectUnknown
-      return
-    }
-
-    currentInputDeviceID = deviceID
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-    var runningAddress = AudioObjectPropertyAddress(
+    var runAddr = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    let status = AudioObjectAddPropertyListener(
-      deviceID, &runningAddress,
-      Self.micActivityChangedProc,
-      selfPtr
-    )
-    if status == noErr {
-      micListenerRegistered = true
-      Log.info(Log.monitor, "monitor", "mic activity listener registered on device \(deviceID)")
-    } else {
-      Log.error(Log.monitor, "monitor", "failed to register mic activity listener: \(status)")
+
+    for id in toRemove {
+      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
+      monitoredDeviceIDs.remove(id)
+    }
+
+    for id in toAdd {
+      let status = AudioObjectAddPropertyListener(
+        id, &runAddr, Self.micActivityChangedProc, selfPtr)
+      if status == noErr {
+        monitoredDeviceIDs.insert(id)
+      }
+    }
+
+    if !toAdd.isEmpty || !toRemove.isEmpty {
+      Log.info(
+        Log.monitor, "monitor",
+        "mic listeners updated: monitoring \(monitoredDeviceIDs.count) devices (added \(toAdd.count), removed \(toRemove.count))"
+      )
     }
   }
 
-  private func removeMicActivityListener() {
-    guard micListenerRegistered, currentInputDeviceID != kAudioObjectUnknown else { return }
+  private func removeAllMicActivityListeners() {
     let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-    var address = AudioObjectPropertyAddress(
+    var runAddr = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    AudioObjectRemovePropertyListener(
-      currentInputDeviceID, &address,
-      Self.micActivityChangedProc,
-      selfPtr
-    )
-    micListenerRegistered = false
-  }
-
-  private func isMicRunning() -> Bool {
-    guard currentInputDeviceID != kAudioObjectUnknown else { return false }
-    var isRunning: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(
-      currentInputDeviceID, &address, 0, nil, &size, &isRunning
-    )
-    return isRunning != 0
-  }
-
-  private func checkMicState() {
-    if isMicRunning() {
-      handleMicBecameActive()
+    for id in monitoredDeviceIDs {
+      AudioObjectRemovePropertyListener(id, &runAddr, Self.micActivityChangedProc, selfPtr)
     }
+    monitoredDeviceIDs.removeAll()
+  }
+
+  /// Returns true if ANY input device has its audio engine running.
+  private func isAnyInputDeviceRunning() -> Bool {
+    var runAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    for id in monitoredDeviceIDs {
+      var isRunning: UInt32 = 0
+      var size = UInt32(MemoryLayout<UInt32>.size)
+      AudioObjectGetPropertyData(id, &runAddr, 0, nil, &size, &isRunning)
+      if isRunning != 0 { return true }
+    }
+    return false
+  }
+
+  /// Enumerate all physical audio devices that have input channels.
+  /// Excludes virtual and aggregate devices to avoid false positives.
+  nonisolated private static func allInputDeviceIDs() -> Set<AudioObjectID> {
+    var propSize: UInt32 = 0
+    var devAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    guard
+      AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject), &devAddr, 0, nil, &propSize) == noErr,
+      propSize > 0
+    else { return [] }
+
+    let count = Int(propSize) / MemoryLayout<AudioObjectID>.size
+    var devices = [AudioObjectID](repeating: 0, count: count)
+    guard
+      AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &devAddr, 0, nil, &propSize, &devices) == noErr
+    else { return [] }
+
+    var inputAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreamConfiguration,
+      mScope: kAudioObjectPropertyScopeInput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var transportAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyTransportType,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+
+    var result: Set<AudioObjectID> = []
+    for id in devices {
+      // Skip virtual and aggregate devices
+      var transport: UInt32 = 0
+      var transportSize = UInt32(MemoryLayout<UInt32>.size)
+      AudioObjectGetPropertyData(id, &transportAddr, 0, nil, &transportSize, &transport)
+      if transport == kAudioDeviceTransportTypeVirtual
+        || transport == kAudioDeviceTransportTypeAggregate
+      {
+        continue
+      }
+
+      // Check for input channels.
+      // IMPORTANT: AudioBufferList is a variable-length C struct - mBuffers is a
+      // flexible array member. Allocating `UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)`
+      // only reserves space for ONE AudioBuffer. Multi-channel pro interfaces may have
+      // multiple buffers, causing AudioObjectGetPropertyData to write past the allocation
+      // (heap overflow / UB). Always allocate exactly `bufSize` bytes from GetPropertyDataSize.
+      var bufSize: UInt32 = 0
+      guard AudioObjectGetPropertyDataSize(id, &inputAddr, 0, nil, &bufSize) == noErr,
+        bufSize > 0
+      else { continue }
+      let rawBuf = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(bufSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+      defer { rawBuf.deallocate() }
+      let bufferList = rawBuf.bindMemory(to: AudioBufferList.self, capacity: 1)
+      guard AudioObjectGetPropertyData(id, &inputAddr, 0, nil, &bufSize, bufferList) == noErr
+      else { continue }
+      if bufferList.pointee.mNumberBuffers > 0
+        && bufferList.pointee.mBuffers.mNumberChannels > 0
+      {
+        result.insert(id)
+      }
+    }
+    return result
   }
 
   func handleMicActivityChange() {
-    let running = isMicRunning()
+    let running = isAnyInputDeviceRunning()
     Log.info(Log.monitor, "monitor", "CoreAudio listener fired: running=\(running)")
     lastKnownMicRunning = running
     if running {
@@ -427,10 +530,12 @@ final class AudioMonitor: @unchecked Sendable {
     }
   }
 
-  func handleDefaultDeviceChanged() {
-    Log.info(Log.monitor, "monitor", "default input device changed")
-    updateMicActivityListener()
-    checkMicState()
+  func handleDeviceListChanged() {
+    Log.info(Log.monitor, "monitor", "audio device list changed")
+    updateMicActivityListeners()
+    if isAnyInputDeviceRunning() {
+      handleMicBecameActive()
+    }
   }
 
   // MARK: - Auto Recording
@@ -438,10 +543,18 @@ final class AudioMonitor: @unchecked Sendable {
   private func handleMicBecameActive() {
     cancelGracePeriod()
 
-    guard autoRecord, !isRecording, !isManualRecording else { return }
+    guard autoRecord, !isRecording, !isManualRecording else {
+      Log.info(
+        Log.monitor, "monitor",
+        "handleMicBecameActive skipped: autoRecord=\(autoRecord), isRecording=\(isRecording), isManualRecording=\(isManualRecording)"
+      )
+      return
+    }
 
     // Check screen recording permission
     if !CGPreflightScreenCaptureAccess() {
+      Log.info(
+        Log.monitor, "monitor", "handleMicBecameActive blocked: screen recording permission denied")
       permissionNeeded = true
       return
     }
@@ -452,13 +565,19 @@ final class AudioMonitor: @unchecked Sendable {
   }
 
   private func handleMicBecameInactive() {
-    guard autoRecorder != nil else { return }
+    guard autoRecorder != nil else {
+      Log.info(Log.monitor, "monitor", "handleMicBecameInactive skipped: no active auto-recording")
+      return
+    }
     Log.info(Log.monitor, "monitor", "mic inactive, starting grace period")
     startGracePeriod()
   }
 
   private func startAutoRecording() {
-    guard autoRecorder == nil else { return }
+    guard autoRecorder == nil else {
+      Log.info(Log.monitor, "monitor", "startAutoRecording skipped: already recording")
+      return
+    }
 
     let recorder = AudioRecorder(
       appName: "Call",
@@ -517,7 +636,10 @@ final class AudioMonitor: @unchecked Sendable {
   }
 
   private func handleAutoRecorderFailure(_ failure: RecorderFailure) {
-    guard let failedRecorder = autoRecorder else { return }
+    guard let failedRecorder = autoRecorder else {
+      Log.info(Log.monitor, "monitor", "handleAutoRecorderFailure skipped: recorder already nil")
+      return
+    }
     autoRecorder = nil
     stopElapsedTimer()
     cancelGracePeriod()
@@ -615,12 +737,12 @@ extension AudioMonitor {
     return noErr
   }
 
-  nonisolated static let defaultDeviceChangedProc: AudioObjectPropertyListenerProc = {
+  nonisolated static let deviceListChangedProc: AudioObjectPropertyListenerProc = {
     _, _, _, clientData in
     guard let clientData else { return noErr }
     let monitor = Unmanaged<AudioMonitor>.fromOpaque(clientData).takeUnretainedValue()
     Task { @MainActor in
-      monitor.handleDefaultDeviceChanged()
+      monitor.handleDeviceListChanged()
     }
     return noErr
   }

@@ -28,6 +28,7 @@ struct RecordingsView: View {
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
   @State private var selectedIDs: Set<String> = []
+  @State private var exportError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -81,11 +82,22 @@ struct RecordingsView: View {
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
     }
-    .task { loadRecordings() }
+    .task { await loadRecordings() }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
     ) { _ in
-      loadRecordings()
+      Task { await loadRecordings() }
+    }
+    .alert(
+      "Export Failed",
+      isPresented: Binding(
+        get: { exportError != nil },
+        set: { if !$0 { exportError = nil } }
+      )
+    ) {
+      Button("OK") { exportError = nil }
+    } message: {
+      Text(exportError ?? "")
     }
   }
 
@@ -96,31 +108,33 @@ struct RecordingsView: View {
     return ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file)
   }
 
-  private func loadRecordings() {
+  // Directory enumeration + resourceValues is synchronous I/O that blocks MainActor.
+  // With hundreds of recordings this freezes the UI on every window activation.
+  private func loadRecordings() async {
     let dir = URL(fileURLWithPath: saveDirectoryPath)
-    guard
-      let files = try? FileManager.default.contentsOfDirectory(
-        at: dir,
-        includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-        options: .skipsHiddenFiles)
-    else {
-      recordings = []
+    let loaded: [RecordingFile] = await Task.detached {
+      guard
+        let files = try? FileManager.default.contentsOfDirectory(
+          at: dir,
+          includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+          options: .skipsHiddenFiles)
+      else { return [] }
       return
-    }
-    recordings =
-      files
-      .filter { $0.pathExtension == "m4a" }
-      .compactMap { url -> RecordingFile? in
-        let values = try? url.resourceValues(
-          forKeys: [.contentModificationDateKey, .fileSizeKey])
-        return RecordingFile(
-          url: url,
-          name: url.deletingPathExtension().lastPathComponent,
-          date: values?.contentModificationDate ?? .distantPast,
-          size: values?.fileSize ?? 0
-        )
-      }
-      .sorted { $0.date > $1.date }
+        files
+        .filter { $0.pathExtension == "m4a" }
+        .compactMap { url -> RecordingFile? in
+          let values = try? url.resourceValues(
+            forKeys: [.contentModificationDateKey, .fileSizeKey])
+          return RecordingFile(
+            url: url,
+            name: url.deletingPathExtension().lastPathComponent,
+            date: values?.contentModificationDate ?? .distantPast,
+            size: values?.fileSize ?? 0
+          )
+        }
+        .sorted { $0.date > $1.date }
+    }.value
+    recordings = loaded
   }
 
   // MARK: - Actions
@@ -140,7 +154,11 @@ struct RecordingsView: View {
       panel.nameFieldStringValue = source.lastPathComponent
       panel.allowedContentTypes = [.mpeg4Audio]
       guard panel.runModal() == .OK, let dest = panel.url else { return }
-      try? FileManager.default.copyItem(at: source, to: dest)
+      do {
+        try FileManager.default.copyItem(at: source, to: dest)
+      } catch {
+        exportError = error.localizedDescription
+      }
     } else {
       let panel = NSOpenPanel()
       panel.canChooseFiles = false
@@ -149,9 +167,17 @@ struct RecordingsView: View {
       panel.prompt = "Export"
       panel.message = "Choose a folder to export \(urls.count) recordings"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
+      var failed = 0
       for source in urls {
         let target = dest.appendingPathComponent(source.lastPathComponent)
-        try? FileManager.default.copyItem(at: source, to: target)
+        do {
+          try FileManager.default.copyItem(at: source, to: target)
+        } catch {
+          failed += 1
+        }
+      }
+      if failed > 0 {
+        exportError = "Failed to export \(failed) of \(urls.count) recordings"
       }
     }
   }
@@ -161,7 +187,7 @@ struct RecordingsView: View {
       try? FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
     }
     selectedIDs.subtract(ids)
-    loadRecordings()
+    Task { await loadRecordings() }
   }
 }
 

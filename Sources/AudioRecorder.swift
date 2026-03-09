@@ -48,6 +48,25 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     self.onFailure = onFailure
   }
 
+  // Safety net: CoreAudio device listener holds an Unmanaged.passUnretained(self) pointer.
+  // stop() handles the normal path; deinit catches leaks if stop() is never called.
+  //
+  // deinit is nonisolated in Swift 6, so we inline the CoreAudio C call directly
+  // rather than calling the MainActor-isolated removeDeviceListener().
+  deinit {
+    if deviceListenerRegistered {
+      let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      AudioObjectRemovePropertyListener(
+        AudioObjectID(kAudioObjectSystemObject), &address, Self.deviceChangeListenerProc, selfPtr)
+    }
+    if let activity { ProcessInfo.processInfo.endActivity(activity) }
+  }
+
   /// Starts capturing audio and writing to file immediately.
   func start() async throws {
     Log.recorder.info(
@@ -147,19 +166,36 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       fileURL = nil
     }
 
-    // finishWriting uses captured locals - safe from MainActor after audioQueue.sync
+    // finishWriting uses captured locals - safe from MainActor after audioQueue.sync.
+    // Timeout guards against AVAssetWriter hanging indefinitely (rare but documented).
+    // applicationShouldTerminate has its own 5s timeout for quit, but manual "Stop Recording"
+    // would hang forever without this.
     var savedURL: URL?
     if let capturedWriter {
       if !wasStarted {
         capturedWriter.cancelWriting()
         if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
       } else {
+        // Timeout guard: if finishWriting hangs (rare but documented), cancelWriting
+        // terminates it so stop() doesn't block forever. applicationShouldTerminate has
+        // its own 5s timeout for quit, but manual "Stop Recording" needs this.
+        // We stay on MainActor (no TaskGroup/sending dance) - the timeout Task captures
+        // capturedWriter from the same actor context.
+        let timeoutTask = Task {
+          try await Task.sleep(for: .seconds(5))
+          Log.error(Log.recorder, "recorder", "finishWriting timed out after 5s, cancelling")
+          capturedWriter.cancelWriting()
+        }
         await capturedWriter.finishWriting()
+        timeoutTask.cancel()
+
         if capturedWriter.status == .failed {
           Log.error(
             Log.recorder, "recorder",
             "writer failed: \(capturedWriter.error?.localizedDescription ?? "unknown")")
-          if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
+          // Don't delete - the file may contain recoverable audio up to the last
+          // movieFragmentInterval boundary. Preserve it so the user can attempt recovery.
+          savedURL = capturedFileURL
         } else {
           savedURL = capturedFileURL
         }
@@ -265,7 +301,10 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-    let filename = "\(formatter.string(from: Date()))_\(appName).m4a"
+    // Append short UUID suffix to prevent collision when two recordings start
+    // within the same second (e.g. auto + manual simultaneously).
+    let suffix = UUID().uuidString.prefix(4)
+    let filename = "\(formatter.string(from: Date()))_\(appName)_\(suffix).m4a"
     let url = saveDirectory.appendingPathComponent(filename)
     Log.recorder.info("writing to \(url.lastPathComponent, privacy: .public)")
 
@@ -380,6 +419,7 @@ extension AudioRecorder: SCStreamDelegate {
     let failure: RecorderFailure
     switch code {
     case -3801: failure = .permissionDenied
+    case -3802: failure = .systemStopped  // content invalidated (e.g. display disconnected)
     case -3820: failure = .micFailed
     case -3821: failure = .systemStopped
     default: failure = .other(error.localizedDescription)
