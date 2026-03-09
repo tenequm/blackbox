@@ -34,7 +34,7 @@ struct BlackboxApp: App {
           }
         } else {
           HStack(spacing: 4) {
-            Image(systemName: "waveform.circle.fill")
+            Image(systemName: recordingWaveformIcon(level: monitor.audioLevel))
             if let elapsed = monitor.formattedElapsed {
               Text(elapsed)
                 .monospacedDigit()
@@ -42,7 +42,7 @@ struct BlackboxApp: App {
           }
         }
       } else {
-        Image(systemName: "waveform")
+        Image(systemName: "waveform.circle.fill")
       }
     }
     .menuBarExtraStyle(.menu)
@@ -250,6 +250,18 @@ private struct AboutView: View {
 }
 
 // MARK: - Helpers
+
+/// Maps audio RMS level to a waveform SF Symbol.
+/// Thresholds tuned for typical call audio captured via ScreenCaptureKit.
+private func recordingWaveformIcon(level: Float) -> String {
+  if level > 0.05 {
+    return "waveform"
+  } else if level > 0.01 {
+    return "waveform.mid"
+  } else {
+    return "waveform.low"
+  }
+}
 
 private func restartApp() {
   let url = Bundle.main.bundleURL

@@ -1,4 +1,5 @@
 import AVFoundation
+import Security
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -12,7 +13,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
-  @AppStorage("sonioxAPIKey") private var sonioxAPIKey = ""
+  @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
   @State private var screenRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -32,6 +33,10 @@ struct SettingsView: View {
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
       refreshPermissions()
+      migrateAPIKeyToKeychain()
+    }
+    .onChange(of: sonioxAPIKey) { _, newValue in
+      KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -232,12 +237,20 @@ struct SettingsView: View {
         let files = try? FileManager.default.contentsOfDirectory(
           at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
       else { return nil }
-      let m4as = files.filter { $0.pathExtension == "m4a" }
-      let totalBytes = m4as.compactMap {
-        try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
-      }.reduce(0, +)
+
+      var count = 0
+      var totalBytes = 0
+
+      for dir in files where dir.pathExtension == "blackbox" {
+        let audioURL = dir.appendingPathComponent("audio.m4a")
+        if let size = try? audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+          count += 1
+          totalBytes += size
+        }
+      }
+
       return (
-        count: m4as.count,
+        count: count,
         sizeFormatted: ByteCountFormatter.string(
           fromByteCount: Int64(totalBytes), countStyle: .file)
       )
@@ -255,6 +268,51 @@ struct SettingsView: View {
     panel.canCreateDirectories = true
     if panel.runModal() == .OK, let url = panel.url {
       saveDirectoryPath = url.path(percentEncoded: false)
+    }
+  }
+
+  // MARK: - Keychain Migration
+
+  private func migrateAPIKeyToKeychain() {
+    let defaults = UserDefaults.standard
+    if let legacyKey = defaults.string(forKey: "sonioxAPIKey"), !legacyKey.isEmpty {
+      KeychainHelper.setString(legacyKey, forKey: "sonioxAPIKey")
+      defaults.removeObject(forKey: "sonioxAPIKey")
+      sonioxAPIKey = legacyKey
+    }
+  }
+}
+
+// MARK: - Keychain Helper
+
+enum KeychainHelper {
+  private static let service = "com.tenequm.Blackbox"
+
+  static func string(forKey key: String) -> String? {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: key,
+      kSecReturnData as String: true,
+    ]
+    var result: AnyObject?
+    guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+      let data = result as? Data
+    else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  static func setString(_ value: String, forKey key: String) {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: key,
+    ]
+    SecItemDelete(query as CFDictionary)
+    if !value.isEmpty {
+      var attrs = query
+      attrs[kSecValueData as String] = Data(value.utf8)
+      SecItemAdd(attrs as CFDictionary, nil)
     }
   }
 }

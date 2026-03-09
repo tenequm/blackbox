@@ -3,13 +3,45 @@ import Foundation
 
 // MARK: - Data Models
 
+nonisolated struct RecordingMetadata: Codable, Sendable {
+  var title: String
+  var createdAt: Date
+  var appName: String
+  var speakers: [String: String]
+
+  static let fileName = "metadata.json"
+
+  static func load(in directory: URL) -> RecordingMetadata? {
+    let url = directory.appendingPathComponent(fileName)
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(RecordingMetadata.self, from: data)
+  }
+
+  func save(in directory: URL) throws {
+    let url = directory.appendingPathComponent(Self.fileName)
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(self)
+    try data.write(to: url, options: .atomic)
+  }
+}
+
+nonisolated struct ExportedSegment: Codable, Sendable {
+  var speaker: String
+  var time: String
+  var text: String
+}
+
 nonisolated struct TranscriptDocument: Codable, Sendable {
   var segments: [TranscriptSegment]
   var language: String?
   var createdAt: Date
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
-    recordingURL.deletingPathExtension().appendingPathExtension("transcript.json")
+    recordingURL.appendingPathComponent("transcript.json")
   }
 
   nonisolated static func load(for recordingURL: URL) -> TranscriptDocument? {
@@ -266,24 +298,56 @@ final class TranscriptionService {
 
   private func uploadFile(_ fileURL: URL) async throws -> String {
     let boundary = UUID().uuidString
-    var body = Data()
-    let fileData = try Data(contentsOf: fileURL)
     let filename = fileURL.lastPathComponent
 
-    body.append(Data("--\(boundary)\r\n".utf8))
-    body.append(
-      Data(
-        "Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8))
-    body.append(Data("Content-Type: audio/mp4\r\n\r\n".utf8))
-    body.append(fileData)
-    body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+    // Build multipart body as a temp file to avoid loading entire audio into memory
+    let tempURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString + ".multipart")
+    FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+    defer { try? FileManager.default.removeItem(at: tempURL) }
+
+    guard let output = OutputStream(url: tempURL, append: false) else {
+      throw TranscriptionError.uploadFailed("failed to create temp file for upload")
+    }
+    output.open()
+
+    let header = Data(
+      "--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\nContent-Type: audio/mp4\r\n\r\n"
+        .utf8)
+    header.withUnsafeBytes { buf in
+      _ = output.write(buf.bindMemory(to: UInt8.self).baseAddress!, maxLength: header.count)
+    }
+
+    // Stream file content in 64KB chunks
+    guard let input = InputStream(url: fileURL) else {
+      output.close()
+      throw TranscriptionError.uploadFailed("failed to open audio file for reading")
+    }
+    input.open()
+    let bufferSize = 65536
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+    defer { buffer.deallocate() }
+    while input.hasBytesAvailable {
+      let bytesRead = input.read(buffer, maxLength: bufferSize)
+      if bytesRead > 0 {
+        _ = output.write(buffer, maxLength: bytesRead)
+      } else {
+        break
+      }
+    }
+    input.close()
+
+    let footer = Data("\r\n--\(boundary)--\r\n".utf8)
+    footer.withUnsafeBytes { buf in
+      _ = output.write(buf.bindMemory(to: UInt8.self).baseAddress!, maxLength: footer.count)
+    }
+    output.close()
 
     var request = try makeRequest(.post, "/v1/files")
     request.setValue(
       "multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-    request.httpBody = body
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await URLSession.shared.upload(for: request, fromFile: tempURL)
     try checkHTTPResponse(response, data: data, context: "upload")
 
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]

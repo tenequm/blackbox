@@ -30,6 +30,7 @@ struct RecordingsView: View {
   @State private var recordings: [RecordingFile] = []
   @State private var selectedRecordingID: String?
   @State private var exportError: String?
+  @State private var reloadTask: Task<Void, Never>?
 
   var body: some View {
     NavigationSplitView {
@@ -41,7 +42,8 @@ struct RecordingsView: View {
         RecordingDetailView(
           recording: recording,
           onDelete: { deleteRecordings(Set([id])) },
-          onTranscriptChanged: { Task { await loadRecordings() } }
+          onTranscriptChanged: { Task { await loadRecordings() } },
+          onTitleChanged: { Task { await loadRecordings() } }
         )
         .id(id)
       } else {
@@ -56,7 +58,12 @@ struct RecordingsView: View {
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
     ) { _ in
-      Task { await loadRecordings() }
+      reloadTask?.cancel()
+      reloadTask = Task {
+        try? await Task.sleep(for: .milliseconds(500))
+        guard !Task.isCancelled else { return }
+        await loadRecordings()
+      }
     }
     .alert(
       "Export Failed",
@@ -83,15 +90,20 @@ struct RecordingsView: View {
         )
       } else {
         List(recordings, selection: $selectedRecordingID) { recording in
-          RecordingRow(recording: recording)
-            .contextMenu {
-              Button("Reveal in Finder") { revealInFinder(Set([recording.id])) }
-              Button("Export...") { exportRecordings(Set([recording.id])) }
-              Divider()
-              Button("Delete", role: .destructive) {
-                deleteRecordings(Set([recording.id]))
-              }
+          RecordingRow(
+            recording: recording,
+            onRename: { newTitle in
+              renameRecording(recording, to: newTitle)
             }
+          )
+          .contextMenu {
+            Button("Reveal in Finder") { revealInFinder(Set([recording.id])) }
+            Button("Export Audio...") { exportRecordings(Set([recording.id])) }
+            Divider()
+            Button("Delete", role: .destructive) {
+              deleteRecordings(Set([recording.id]))
+            }
+          }
         }
       }
     }
@@ -124,22 +136,30 @@ struct RecordingsView: View {
           includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
           options: .skipsHiddenFiles)
       else { return [] }
-      return
-        files
-        .filter { $0.pathExtension == "m4a" }
-        .compactMap { url -> RecordingFile? in
-          let values = try? url.resourceValues(
-            forKeys: [.contentModificationDateKey, .fileSizeKey])
-          let sidecar = TranscriptDocument.sidecarURL(for: url)
-          return RecordingFile(
+
+      var results: [RecordingFile] = []
+
+      for url in files where url.pathExtension == "blackbox" {
+        let audioURL = url.appendingPathComponent("audio.m4a")
+        guard FileManager.default.fileExists(atPath: audioURL.path) else { continue }
+        let metadata = RecordingMetadata.load(in: url)
+        let audioValues = try? audioURL.resourceValues(forKeys: [.fileSizeKey])
+        let sidecar = TranscriptDocument.sidecarURL(for: url)
+        results.append(
+          RecordingFile(
             url: url,
-            name: url.deletingPathExtension().lastPathComponent,
-            date: values?.contentModificationDate ?? .distantPast,
-            size: values?.fileSize ?? 0,
+            audioURL: audioURL,
+            title: metadata?.title ?? url.deletingPathExtension().lastPathComponent,
+            date: metadata?.createdAt
+              ?? (try? url.resourceValues(
+                forKeys: [.contentModificationDateKey]
+              ).contentModificationDate) ?? .distantPast,
+            size: audioValues?.fileSize ?? 0,
             hasTranscript: FileManager.default.fileExists(atPath: sidecar.path)
-          )
-        }
-        .sorted { $0.date > $1.date }
+          ))
+      }
+
+      return results.sorted { $0.date > $1.date }
     }.value
     recordings = loaded
   }
@@ -153,10 +173,10 @@ struct RecordingsView: View {
   }
 
   private func exportRecordings(_ ids: Set<String>) {
-    let urls = recordings.filter { ids.contains($0.id) }.map(\.url)
-    guard !urls.isEmpty else { return }
+    let sources = recordings.filter { ids.contains($0.id) }.map(\.audioURL)
+    guard !sources.isEmpty else { return }
 
-    if urls.count == 1, let source = urls.first {
+    if sources.count == 1, let source = sources.first {
       let panel = NSSavePanel()
       panel.nameFieldStringValue = source.lastPathComponent
       panel.allowedContentTypes = [.mpeg4Audio]
@@ -172,10 +192,10 @@ struct RecordingsView: View {
       panel.canChooseDirectories = true
       panel.canCreateDirectories = true
       panel.prompt = "Export"
-      panel.message = "Choose a folder to export \(urls.count) recordings"
+      panel.message = "Choose a folder to export \(sources.count) recordings"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
       var failed = 0
-      for source in urls {
+      for source in sources {
         let target = dest.appendingPathComponent(source.lastPathComponent)
         do {
           try FileManager.default.copyItem(at: source, to: target)
@@ -184,7 +204,7 @@ struct RecordingsView: View {
         }
       }
       if failed > 0 {
-        exportError = "Failed to export \(failed) of \(urls.count) recordings"
+        exportError = "Failed to export \(failed) of \(sources.count) recordings"
       }
     }
   }
@@ -192,14 +212,24 @@ struct RecordingsView: View {
   private func deleteRecordings(_ ids: Set<String>) {
     for recording in recordings where ids.contains(recording.id) {
       try? FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
-      let sidecar = TranscriptDocument.sidecarURL(for: recording.url)
-      if FileManager.default.fileExists(atPath: sidecar.path) {
-        try? FileManager.default.trashItem(at: sidecar, resultingItemURL: nil)
-      }
     }
     if let selectedRecordingID, ids.contains(selectedRecordingID) {
       self.selectedRecordingID = nil
     }
+    Task { await loadRecordings() }
+  }
+
+  private func renameRecording(_ recording: RecordingFile, to newTitle: String) {
+    var metadata =
+      RecordingMetadata.load(in: recording.url)
+      ?? RecordingMetadata(
+        title: recording.title,
+        createdAt: recording.date,
+        appName: recording.title,
+        speakers: [:]
+      )
+    metadata.title = newTitle
+    try? metadata.save(in: recording.url)
     Task { await loadRecordings() }
   }
 }
@@ -208,13 +238,37 @@ struct RecordingsView: View {
 
 private struct RecordingRow: View {
   let recording: RecordingFile
+  var onRename: (String) -> Void
+
+  @State private var isEditing = false
+  @State private var editedTitle = ""
 
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack {
-        Text(recording.name)
+        if isEditing {
+          TextField(
+            "Title", text: $editedTitle,
+            onCommit: {
+              let trimmed = editedTitle.trimmingCharacters(in: .whitespaces)
+              if !trimmed.isEmpty {
+                onRename(trimmed)
+              }
+              isEditing = false
+            }
+          )
+          .textFieldStyle(.plain)
           .lineLimit(1)
-          .truncationMode(.middle)
+          .onExitCommand { isEditing = false }
+        } else {
+          Text(recording.title)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .onTapGesture(count: 2) {
+              editedTitle = recording.title
+              isEditing = true
+            }
+        }
         if recording.hasTranscript {
           Image(systemName: "text.quote")
             .font(.caption2)
@@ -239,8 +293,9 @@ struct RecordingDetailView: View {
   let recording: RecordingFile
   var onDelete: () -> Void
   var onTranscriptChanged: () -> Void
+  var onTitleChanged: () -> Void
 
-  @AppStorage("sonioxAPIKey") private var sonioxAPIKey = ""
+  @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
   // Playback
   @State private var player: AVPlayer?
@@ -253,6 +308,11 @@ struct RecordingDetailView: View {
 
   // UI
   @State private var showDeleteConfirmation = false
+
+  // Metadata
+  @State private var metadata: RecordingMetadata?
+  @State private var isEditingTitle = false
+  @State private var editedTitle = ""
 
   // Transcription
   @State private var transcript: TranscriptDocument?
@@ -280,6 +340,8 @@ struct RecordingDetailView: View {
       }
     }
     .onAppear {
+      sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+      loadMetadata()
       setupPlayer()
       loadTranscript()
     }
@@ -294,8 +356,28 @@ struct RecordingDetailView: View {
   private var metadataHeader: some View {
     HStack {
       VStack(alignment: .leading, spacing: 4) {
-        Text(recording.name)
+        if isEditingTitle {
+          TextField(
+            "Title", text: $editedTitle,
+            onCommit: {
+              let trimmed = editedTitle.trimmingCharacters(in: .whitespaces)
+              if !trimmed.isEmpty {
+                saveTitle(trimmed)
+              }
+              isEditingTitle = false
+            }
+          )
           .font(.headline)
+          .textFieldStyle(.plain)
+          .onExitCommand { isEditingTitle = false }
+        } else {
+          Text(recording.title)
+            .font(.headline)
+            .onTapGesture(count: 2) {
+              editedTitle = recording.title
+              isEditingTitle = true
+            }
+        }
         HStack(spacing: 8) {
           Text(recording.date.formatted(.dateTime.year().month().day().hour().minute()))
           Text(recording.sizeFormatted)
@@ -308,6 +390,15 @@ struct RecordingDetailView: View {
       }
       Spacer()
       HStack(spacing: 8) {
+        if transcript != nil {
+          Button {
+            exportTranscript()
+          } label: {
+            Image(systemName: "doc.text")
+          }
+          .help("Export Transcript")
+        }
+
         Button {
           NSWorkspace.shared.activateFileViewerSelecting([recording.url])
         } label: {
@@ -328,7 +419,7 @@ struct RecordingDetailView: View {
       Button("Delete", role: .destructive, action: onDelete)
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This will move \"\(recording.name)\" to the Trash.")
+      Text("This will move \"\(recording.title)\" to the Trash.")
     }
   }
 
@@ -386,7 +477,7 @@ struct RecordingDetailView: View {
   }
 
   private func setupPlayer() {
-    let asset = AVURLAsset(url: recording.url)
+    let asset = AVURLAsset(url: recording.audioURL)
     let item = AVPlayerItem(asset: asset)
     let p = AVPlayer(playerItem: item)
     player = p
@@ -468,6 +559,48 @@ struct RecordingDetailView: View {
     seekTo(newTime)
   }
 
+  // MARK: - Metadata
+
+  private func loadMetadata() {
+    metadata = RecordingMetadata.load(in: recording.url)
+  }
+
+  private func saveTitle(_ newTitle: String) {
+    var meta =
+      metadata
+      ?? RecordingMetadata(
+        title: recording.title,
+        createdAt: recording.date,
+        appName: recording.title,
+        speakers: [:]
+      )
+    meta.title = newTitle
+    try? meta.save(in: recording.url)
+    metadata = meta
+    onTitleChanged()
+  }
+
+  private func speakerName(for speakerID: Int) -> String {
+    if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
+      return name
+    }
+    return speakerID == -1 ? "You" : "Speaker \(speakerID + 1)"
+  }
+
+  private func saveSpeakerName(_ name: String, for speakerID: Int) {
+    var meta =
+      metadata
+      ?? RecordingMetadata(
+        title: recording.title,
+        createdAt: recording.date,
+        appName: recording.title,
+        speakers: [:]
+      )
+    meta.speakers[String(speakerID)] = name
+    try? meta.save(in: recording.url)
+    metadata = meta
+  }
+
   // MARK: - Transcript
 
   private var transcriptArea: some View {
@@ -529,8 +662,12 @@ struct RecordingDetailView: View {
         ForEach(doc.segments) { segment in
           TranscriptSegmentView(
             segment: segment,
+            speakerName: speakerName(for: segment.speaker),
             isActive: isSegmentActive(segment, in: doc),
-            onTap: { jumpTo(time: segment.time) }
+            onTap: { jumpTo(time: segment.time) },
+            onRenameSpeaker: { newName in
+              saveSpeakerName(newName, for: segment.speaker)
+            }
           )
         }
       }
@@ -575,7 +712,7 @@ struct RecordingDetailView: View {
 
       do {
         let doc = try await service.transcribe(
-          fileURL: recording.url,
+          fileURL: recording.audioURL,
           onStatus: { status in
             transcriptionStatus = status
           }
@@ -620,6 +757,38 @@ struct RecordingDetailView: View {
     transcriptionStatus = .idle
   }
 
+  // MARK: - Transcript Export
+
+  private func exportTranscript() {
+    guard let transcript, !transcript.segments.isEmpty else { return }
+
+    let panel = NSSavePanel()
+    panel.nameFieldStringValue = "\(recording.title).json"
+    panel.allowedContentTypes = [.json]
+    guard panel.runModal() == .OK, let dest = panel.url else { return }
+
+    let segments = transcript.segments.map { segment in
+      let m = Int(segment.time) / 60
+      let s = Int(segment.time) % 60
+      return ExportedSegment(
+        speaker: speakerName(for: segment.speaker),
+        time: String(format: "%d:%02d", m, s),
+        text: segment.text
+      )
+    }
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    do {
+      let data = try encoder.encode(segments)
+      try data.write(to: dest, options: .atomic)
+    } catch {
+      Log.error(
+        Log.app, "export",
+        "failed to export transcript: \(error.localizedDescription)")
+    }
+  }
+
   // MARK: - Formatting
 
   private func formatTime(_ time: TimeInterval) -> String {
@@ -637,8 +806,13 @@ struct RecordingDetailView: View {
 
 private struct TranscriptSegmentView: View {
   let segment: TranscriptSegment
+  let speakerName: String
   let isActive: Bool
   let onTap: () -> Void
+  let onRenameSpeaker: (String) -> Void
+
+  @State private var showSpeakerPopover = false
+  @State private var editedSpeakerName = ""
 
   private static let speakerColors: [Color] = [
     .blue, .green, .orange, .purple, .pink, .teal,
@@ -651,22 +825,41 @@ private struct TranscriptSegmentView: View {
     return Self.speakerColors[segment.speaker % Self.speakerColors.count]
   }
 
-  private var speakerLabel: String {
-    isLocalUser ? "You" : "S\(segment.speaker + 1)"
-  }
-
   var body: some View {
     Button(action: onTap) {
       HStack(alignment: .top, spacing: 10) {
         VStack(alignment: .trailing, spacing: 2) {
-          Text(speakerLabel)
+          Text(speakerName)
             .font(.caption.bold())
             .foregroundStyle(speakerColor)
+            .onTapGesture {
+              editedSpeakerName = speakerName
+              showSpeakerPopover = true
+            }
+            .popover(isPresented: $showSpeakerPopover) {
+              VStack(spacing: 8) {
+                Text("Speaker Name")
+                  .font(.caption.bold())
+                TextField(
+                  "Name", text: $editedSpeakerName,
+                  onCommit: {
+                    let trimmed = editedSpeakerName.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty {
+                      onRenameSpeaker(trimmed)
+                    }
+                    showSpeakerPopover = false
+                  }
+                )
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 140)
+              }
+              .padding(12)
+            }
           Text(formatTimestamp(segment.time))
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
         }
-        .frame(width: 50, alignment: .trailing)
+        .frame(width: 70, alignment: .trailing)
 
         Text(segment.text)
           .font(.body)
@@ -696,9 +889,10 @@ private struct TranscriptSegmentView: View {
 
 struct RecordingFile: Identifiable {
   var id: String { url.path }
-  let url: URL
-  let name: String
-  let date: Date
+  let url: URL  // .blackbox directory
+  let audioURL: URL  // audio.m4a inside the directory
+  var title: String  // from metadata.title
+  let date: Date  // from metadata.createdAt
   let size: Int
   let hasTranscript: Bool
 

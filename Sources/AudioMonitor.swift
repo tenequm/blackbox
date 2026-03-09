@@ -3,7 +3,6 @@ import AppKit
 import CoreAudio
 import Foundation
 import ScreenCaptureKit
-import UserNotifications
 
 @Observable
 final class AudioMonitor: @unchecked Sendable {
@@ -17,6 +16,7 @@ final class AudioMonitor: @unchecked Sendable {
   private(set) var graceCountdown: TimeInterval?
   private(set) var isSaving = false
   private(set) var formattedElapsed: String?
+  private(set) var audioLevel: Float = 0
   private var savingCount = 0
 
   // Auto-recording triggered by mic detection
@@ -28,6 +28,12 @@ final class AudioMonitor: @unchecked Sendable {
   private var settingsTask: Task<Void, Never>?
   private var elapsedTimer: Timer?
   private var graceTask: Task<Void, Never>?
+
+  // Restart rate limiting: max 3 restarts within 30 seconds
+  private var autoRestartCount = 0
+  private var autoRestartWindowStart: Date?
+  private var manualRestartCount = 0
+  private var manualRestartWindowStart: Date?
 
   // Per-process mic detection (macOS 14.2+) - monitors which processes have active mic input.
   // @ObservationIgnored: internal CoreAudio bookkeeping, not UI state.
@@ -103,26 +109,13 @@ final class AudioMonitor: @unchecked Sendable {
       permissionNeeded = true
     }
 
-    UNUserNotificationCenter.current().delegate = notificationDelegate
-
     if !skipPermissionRequests {
       Task {
         if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
           await AVCaptureDevice.requestAccess(for: .audio)
         }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        if settings.authorizationStatus == .notDetermined {
-          let _ = try? await UNUserNotificationCenter.current().requestAuthorization(
-            options: [.alert, .sound])
-        }
       }
     }
-
-    let revealAction = UNNotificationAction(identifier: "reveal", title: "Reveal in Finder")
-    let playAction = UNNotificationAction(identifier: "play", title: "Play")
-    let category = UNNotificationCategory(
-      identifier: "recordingSaved", actions: [revealAction, playAction], intentIdentifiers: [])
-    UNUserNotificationCenter.current().setNotificationCategories([category])
 
     // Start mic activity monitoring
     setupMicMonitoring()
@@ -170,7 +163,7 @@ final class AudioMonitor: @unchecked Sendable {
   private func setError(_ message: String) {
     Log.error(Log.monitor, "monitor", message)
     errorMessage = message
-    if notifyOnError { postErrorNotification(message: message) }
+    notifyError(message: message)
     errorGeneration += 1
     let gen = errorGeneration
     Task {
@@ -233,6 +226,11 @@ final class AudioMonitor: @unchecked Sendable {
         Task { @MainActor [weak self] in
           self?.handleManualRecorderFailure(failure)
         }
+      },
+      onAudioLevel: { [weak self] level in
+        Task { @MainActor [weak self] in
+          self?.audioLevel = level
+        }
       }
     )
 
@@ -242,11 +240,13 @@ final class AudioMonitor: @unchecked Sendable {
     Task {
       do {
         try await recorder.start()
+        manualRestartCount = 0
+        manualRestartWindowStart = nil
         recordingStartTime = Date()
         currentAppName = "Manual recording"
         isRecording = true
         startElapsedTimer()
-        hud.showRecordingStarted(appName: "Manual recording", bundleID: nil)
+        notifyRecordingStarted(appName: "Manual recording")
       } catch {
         setError("Failed to start recording: \(error.localizedDescription)")
         manualRecorder = nil
@@ -261,8 +261,6 @@ final class AudioMonitor: @unchecked Sendable {
       Log.info(Log.monitor, "monitor", "handleManualRecorderFailure skipped: recorder already nil")
       return
     }
-    let appName = currentAppName ?? failedRecorder.appName
-
     manualRecorder = nil
     isManualRecording = false
     stopElapsedTimer()
@@ -270,12 +268,9 @@ final class AudioMonitor: @unchecked Sendable {
     savingCount += 1
     isSaving = true
     Task {
-      let url = await failedRecorder.stop()
+      _ = await failedRecorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url, notifyOnSaved {
-        postRecordingSavedNotification(appName: appName, fileURL: url)
-      }
     }
 
     switch failure {
@@ -286,8 +281,14 @@ final class AudioMonitor: @unchecked Sendable {
       setError("Microphone lost - recording continues without mic")
       startManualRecordingInternal(micOverride: false)
     case .systemStopped, .deviceChangeFailed, .other:
-      setError("Recording interrupted - restarting...")
-      startManualRecordingInternal()
+      if shouldAllowRestart(
+        count: &manualRestartCount, windowStart: &manualRestartWindowStart)
+      {
+        setError("Recording interrupted - restarting...")
+        startManualRecordingInternal()
+      } else {
+        setError("Recording failed repeatedly")
+      }
     }
   }
 
@@ -303,13 +304,13 @@ final class AudioMonitor: @unchecked Sendable {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
-        hud.showRecordingSaved(appName: appName, fileName: url.lastPathComponent, fileURL: url)
-        if notifyOnSaved {
-          postRecordingSavedNotification(appName: appName, fileURL: url)
-        }
+      if url != nil {
+        notifyRecordingSaved(appName: appName)
       }
       updateAutoState()
+      // Force re-evaluation so auto-recording starts if a call is still active
+      lastKnownMicRunning = false
+      evaluateMicState()
     }
   }
 
@@ -618,20 +619,26 @@ final class AudioMonitor: @unchecked Sendable {
     startGracePeriod()
   }
 
-  private func startAutoRecording() {
+  private func startAutoRecording(micOverride: Bool? = nil) {
     guard autoRecorder == nil else {
       Log.info(Log.monitor, "monitor", "startAutoRecording skipped: already recording")
       return
     }
 
+    let useMic = micOverride ?? micEnabled
     let appName = autoRecordingAppName ?? "Call"
     let recorder = AudioRecorder(
       appName: appName,
-      micEnabled: micEnabled,  // Per-process detection filters our own mic usage
+      micEnabled: useMic,
       saveDirectory: saveDirectory,
       onFailure: { [weak self] failure in
         Task { @MainActor [weak self] in
           self?.handleAutoRecorderFailure(failure)
+        }
+      },
+      onAudioLevel: { [weak self] level in
+        Task { @MainActor [weak self] in
+          self?.audioLevel = level
         }
       }
     )
@@ -643,12 +650,13 @@ final class AudioMonitor: @unchecked Sendable {
     Task {
       do {
         try await recorder.start()
+        autoRestartCount = 0
+        autoRestartWindowStart = nil
         isRecording = true
         currentAppName = appName
         recordingStartTime = Date()
         startElapsedTimer()
-        hud.showRecordingStarted(appName: appName, bundleID: nil)
-        if notifyOnStart { postRecordingStartedNotification(appName: appName) }
+        notifyRecordingStarted(appName: appName)
       } catch {
         setError("Failed to start recording: \(error.localizedDescription)")
         if (error as NSError).domain == "com.apple.ScreenCaptureKit.SCStreamError",
@@ -674,11 +682,8 @@ final class AudioMonitor: @unchecked Sendable {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
-        hud.showRecordingSaved(appName: appName, fileName: url.lastPathComponent, fileURL: url)
-        if notifyOnSaved {
-          postRecordingSavedNotification(appName: appName, fileURL: url)
-        }
+      if url != nil {
+        notifyRecordingSaved(appName: appName)
       }
       updateAutoState()
     }
@@ -689,7 +694,6 @@ final class AudioMonitor: @unchecked Sendable {
       Log.info(Log.monitor, "monitor", "handleAutoRecorderFailure skipped: recorder already nil")
       return
     }
-    let appName = autoRecordingAppName ?? "Call"
     autoRecorder = nil
     stopElapsedTimer()
     cancelGracePeriod()
@@ -697,12 +701,9 @@ final class AudioMonitor: @unchecked Sendable {
     savingCount += 1
     isSaving = true
     Task {
-      let url = await failedRecorder.stop()
+      _ = await failedRecorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url, notifyOnSaved {
-        postRecordingSavedNotification(appName: appName, fileURL: url)
-      }
     }
 
     switch failure {
@@ -711,9 +712,21 @@ final class AudioMonitor: @unchecked Sendable {
       autoRecordingAppName = nil
       updateAutoState()
     case .systemStopped, .deviceChangeFailed:
-      Log.info(Log.monitor, "monitor", "auto-recording interrupted, restarting")
-      startAutoRecording()
-    case .micFailed, .other:
+      if shouldAllowRestart(
+        count: &autoRestartCount, windowStart: &autoRestartWindowStart)
+      {
+        Log.info(Log.monitor, "monitor", "auto-recording interrupted, restarting")
+        startAutoRecording()
+      } else {
+        Log.error(Log.monitor, "monitor", "auto-recording restart limit exceeded")
+        setError("Recording failed repeatedly")
+        autoRecordingAppName = nil
+        updateAutoState()
+      }
+    case .micFailed:
+      Log.info(Log.monitor, "monitor", "auto-recording mic failed, restarting without mic")
+      startAutoRecording(micOverride: false)
+    case .other:
       setError("Recording interrupted")
       autoRecordingAppName = nil
       updateAutoState()
@@ -757,6 +770,7 @@ final class AudioMonitor: @unchecked Sendable {
       isRecording = false
       currentAppName = nil
       recordingStartTime = nil
+      audioLevel = 0
       stopElapsedTimer()
     }
   }
@@ -773,6 +787,38 @@ final class AudioMonitor: @unchecked Sendable {
     notifyOnError = defaults.object(forKey: "notifyOnError") as? Bool ?? true
     micPermissionNeeded =
       micEnabled && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized
+  }
+
+  // MARK: - Restart Rate Limiting
+
+  private func shouldAllowRestart(
+    count: inout Int, windowStart: inout Date?, max: Int = 3, window: TimeInterval = 30
+  ) -> Bool {
+    let now = Date()
+    if let start = windowStart, now.timeIntervalSince(start) > window {
+      count = 0
+      windowStart = nil
+    }
+    if windowStart == nil { windowStart = now }
+    count += 1
+    return count <= max
+  }
+
+  // MARK: - Notifications (HUD-based, switchable to system notifications later)
+
+  private func notifyRecordingStarted(appName: String) {
+    guard notifyOnStart else { return }
+    hud.showRecordingStarted(appName: appName, bundleID: nil)
+  }
+
+  private func notifyRecordingSaved(appName: String) {
+    guard notifyOnSaved else { return }
+    hud.showRecordingSaved(appName: appName)
+  }
+
+  private func notifyError(message: String) {
+    guard notifyOnError else { return }
+    hud.showError(message: message)
   }
 }
 
@@ -797,70 +843,6 @@ extension AudioMonitor {
       monitor.handleProcessInputChange()
     }
     return noErr
-  }
-}
-
-// MARK: - Notifications
-
-private let notificationDelegate = NotificationDelegate()
-
-private func postRecordingSavedNotification(appName: String, fileURL: URL) {
-  let content = UNMutableNotificationContent()
-  content.title = "Recording Saved"
-  content.body = "\(appName) - \(fileURL.lastPathComponent)"
-  content.sound = .default
-  content.userInfo = ["filePath": fileURL.path]
-  content.categoryIdentifier = "recordingSaved"
-
-  let request = UNNotificationRequest(
-    identifier: UUID().uuidString, content: content, trigger: nil)
-  UNUserNotificationCenter.current().add(request)
-}
-
-private func postRecordingStartedNotification(appName: String) {
-  let content = UNMutableNotificationContent()
-  content.title = "Recording Started"
-  content.body = appName
-  let request = UNNotificationRequest(
-    identifier: UUID().uuidString, content: content, trigger: nil)
-  UNUserNotificationCenter.current().add(request)
-}
-
-private func postErrorNotification(message: String) {
-  let content = UNMutableNotificationContent()
-  content.title = "Blackbox Error"
-  content.body = message
-  content.sound = .default
-  let request = UNNotificationRequest(
-    identifier: UUID().uuidString, content: content, trigger: nil)
-  UNUserNotificationCenter.current().add(request)
-}
-
-private final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate,
-  @unchecked Sendable
-{
-  func userNotificationCenter(
-    _ center: UNUserNotificationCenter,
-    didReceive response: UNNotificationResponse
-  ) async {
-    guard let path = response.notification.request.content.userInfo["filePath"] as? String
-    else { return }
-    let url = URL(fileURLWithPath: path)
-    await MainActor.run {
-      switch response.actionIdentifier {
-      case "play":
-        NSWorkspace.shared.open(url)
-      default:
-        NSWorkspace.shared.activateFileViewerSelecting([url])
-      }
-    }
-  }
-
-  func userNotificationCenter(
-    _ center: UNUserNotificationCenter,
-    willPresent notification: UNNotification
-  ) async -> UNNotificationPresentationOptions {
-    [.banner, .sound]
   }
 }
 

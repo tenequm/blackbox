@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recordings detail view with built-in audio player and transcription UI
 - NavigationSplitView layout for recordings (sidebar + detail pane)
 - Soniox API key field in Settings
+- `.blackbox` directory bundle format for recordings (audio.m4a + metadata.json + transcript.json per recording)
+- UTI declaration for `.blackbox` recording package type (`com.tenequm.blackbox.recording`)
+- One-time migration from flat `.m4a` files to `.blackbox` directory format
+- Real-time audio level metering with animated waveform icon in menu bar
+- HUD-based error notifications with configurable duration
+- Disk space pre-check (50 MB minimum) before starting a recording
+- Restart rate limiting for auto-recovery (max 3 restarts per 30-second window)
 
 ### Changed
 
@@ -23,10 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recordings UI redesigned from flat table to split view with playback and transcription
 - "Record Microphone" setting now applies to all recordings, not just manual ones
 - `make run` now kills the previous Blackbox process before launching
+- Notifications switched from system banners (UNUserNotification) to in-app HUD toasts
+- "Recording Saved" HUD click now opens the main window instead of Finder
+- Soniox API key stored in macOS Keychain instead of UserDefaults (with one-time migration)
+- Transcription file upload uses streaming (64 KB chunks) instead of loading entire file into memory
+- Auto-recording now degrades gracefully on mic failure (continues without mic instead of stopping)
 
 ### Fixed
 
 - Menu bar countdown/elapsed timer font changed to `.monospacedDigit()` for stable width
+- Auto-recording now starts after manual recording stops during an active call
+- HUD click handler fires only once (was possible to double-fire on rapid clicks)
+- Dropped audio buffers are now logged for diagnostic purposes
+- Recordings list debounced on window activation (prevents redundant disk scans)
 
 ## [0.2.0] - 2026-03-09
 

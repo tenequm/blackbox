@@ -21,6 +21,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated let saveDirectory: URL
 
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
+  nonisolated let onAudioLevel: (@Sendable (Float) -> Void)?
+  nonisolated let levelSource: LevelSource
 
   private let audioQueue = DispatchQueue(label: "com.tenequm.blackbox.audio")
 
@@ -33,19 +35,25 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var micAudioInput: AVAssetWriterInput?
   nonisolated(unsafe) private var sessionStarted = false
   nonisolated(unsafe) private var stopped = false
-  nonisolated(unsafe) private var fileURL: URL?
+  nonisolated(unsafe) private var audioFileURL: URL?  // audio.m4a inside the directory
+  nonisolated(unsafe) private var fileURL: URL?  // .blackbox directory URL
   nonisolated(unsafe) private var activity: NSObjectProtocol?
   nonisolated(unsafe) private var deviceListenerRegistered = false
+  nonisolated(unsafe) private var lastLevelTime: UInt64 = 0
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool, saveDirectory: URL,
-    onFailure: (@Sendable (RecorderFailure) -> Void)? = nil
+    onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
+    onAudioLevel: (@Sendable (Float) -> Void)? = nil,
+    levelSource: LevelSource = .mic
   ) {
     self.bundleID = bundleID
     self.appName = appName
     self.micEnabled = micEnabled
     self.saveDirectory = saveDirectory
     self.onFailure = onFailure
+    self.onAudioLevel = onAudioLevel
+    self.levelSource = levelSource
   }
 
   // Safety net: CoreAudio device listener holds an Unmanaged.passUnretained(self) pointer.
@@ -123,6 +131,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         writer = nil
         systemAudioInput = nil
         micAudioInput = nil
+        audioFileURL = nil
         fileURL = nil
       }
       self.stream = nil
@@ -163,6 +172,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       micAudioInput = nil
       writer = nil
       sessionStarted = false
+      audioFileURL = nil
       fileURL = nil
     }
 
@@ -299,14 +309,34 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   private func setupWriter() throws {
     try FileManager.default.createDirectory(at: saveDirectory, withIntermediateDirectories: true)
 
+    let attrs = try FileManager.default.attributesOfFileSystem(forPath: saveDirectory.path)
+    if let freeBytes = attrs[.systemFreeSize] as? Int64, freeBytes < 50_000_000 {
+      throw NSError(
+        domain: "Blackbox", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Not enough disk space to start recording"])
+    }
+
+    let now = Date()
     let formatter = DateFormatter()
-    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    formatter.dateFormat = "yyyy-MM-dd-HHmmss"
     // Append short UUID suffix to prevent collision when two recordings start
     // within the same second (e.g. auto + manual simultaneously).
     let suffix = UUID().uuidString.prefix(4)
-    let filename = "\(formatter.string(from: Date()))_\(appName)_\(suffix).m4a"
-    let url = saveDirectory.appendingPathComponent(filename)
-    Log.recorder.info("writing to \(url.lastPathComponent, privacy: .public)")
+    let dirName = "\(formatter.string(from: now))-\(suffix).blackbox"
+    let dirURL = saveDirectory.appendingPathComponent(dirName)
+    try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+
+    let audioURL = dirURL.appendingPathComponent("audio.m4a")
+    Log.recorder.info("writing to \(dirName, privacy: .public)/audio.m4a")
+
+    // Write initial metadata
+    let metadata = RecordingMetadata(
+      title: appName,
+      createdAt: now,
+      appName: appName,
+      speakers: [:]
+    )
+    try metadata.save(in: dirURL)
 
     let audioSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -315,7 +345,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       AVEncoderBitRateKey: 128_000,
     ]
 
-    let newWriter = try AVAssetWriter(url: url, fileType: .m4a)
+    let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
     // Write fragment headers every 10s so the file is recoverable on crash
     newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
@@ -336,6 +366,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       Log.error(
         Log.recorder, "recorder",
         "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
+      // Clean up directory on failure
+      try? FileManager.default.removeItem(at: dirURL)
       throw err ?? RecorderError.writerFailed
     }
 
@@ -344,7 +376,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.writer = newWriter
       self.systemAudioInput = systemInput
       self.micAudioInput = micInput
-      self.fileURL = url
+      self.audioFileURL = audioURL
+      self.fileURL = dirURL
       self.sessionStarted = false
       self.stopped = false
     }
@@ -394,7 +427,13 @@ extension AudioRecorder: SCStreamOutput {
         Log.recorder.debug("first audio buffer received for \(self.appName, privacy: .public)")
       }
       if let input = systemAudioInput, input.isReadyForMoreMediaData {
-        input.append(sampleBuffer)
+        if !input.append(sampleBuffer) {
+          Log.recorder.warning(
+            "system audio append failed for \(self.appName, privacy: .public)")
+        }
+      }
+      if levelSource == .system || levelSource == .both {
+        publishAudioLevel(sampleBuffer)
       }
     case .microphone:
       if !sessionStarted {
@@ -403,11 +442,48 @@ extension AudioRecorder: SCStreamOutput {
         Log.recorder.debug("first mic buffer received for \(self.appName, privacy: .public)")
       }
       if let input = micAudioInput, input.isReadyForMoreMediaData {
-        input.append(sampleBuffer)
+        if !input.append(sampleBuffer) {
+          Log.recorder.warning("mic append failed for \(self.appName, privacy: .public)")
+        }
+      }
+      if levelSource == .mic || levelSource == .both {
+        publishAudioLevel(sampleBuffer)
       }
     @unknown default:
       return
     }
+  }
+
+  /// Compute RMS audio level from a sample buffer and publish via callback.
+  /// Throttled to ~4Hz to avoid flooding the UI.
+  nonisolated private func publishAudioLevel(_ sampleBuffer: CMSampleBuffer) {
+    guard let onAudioLevel else { return }
+    let now = DispatchTime.now().uptimeNanoseconds
+    guard now - lastLevelTime >= 250_000_000 else { return }  // 250ms
+    lastLevelTime = now
+
+    guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    var length = 0
+    var dataPointer: UnsafeMutablePointer<Int8>?
+    guard
+      CMBlockBufferGetDataPointer(
+        blockBuffer, atOffset: 0, lengthAtOffsetOut: nil,
+        totalLengthOut: &length, dataPointerOut: &dataPointer) == noErr,
+      let dataPointer, length > 0
+    else { return }
+
+    let floatCount = length / MemoryLayout<Float>.size
+    guard floatCount > 0 else { return }
+    let samples = UnsafeBufferPointer(
+      start: UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self),
+      count: floatCount
+    )
+    var sumOfSquares: Float = 0
+    for sample in samples {
+      sumOfSquares += sample * sample
+    }
+    let rms = (sumOfSquares / Float(floatCount)).squareRoot()
+    onAudioLevel(rms)
   }
 }
 
@@ -429,6 +505,14 @@ extension AudioRecorder: SCStreamDelegate {
       "stream stopped for \(appName) (code=\(code)): \(error.localizedDescription)")
     onFailure?(failure)
   }
+}
+
+// MARK: - Level Source
+
+nonisolated enum LevelSource: Sendable, Equatable {
+  case mic
+  case system
+  case both
 }
 
 // MARK: - Error Types

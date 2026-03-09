@@ -14,18 +14,39 @@ final class RecordingHUD {
       ))
   }
 
-  func showRecordingSaved(appName: String, fileName: String, fileURL: URL) {
+  func showRecordingSaved(appName: String) {
     show(
       content: HUDContentView(
         title: "Recording Saved",
-        subtitle: "\(appName) - \(fileName)",
+        subtitle: appName,
         icon: NSApplication.shared.applicationIconImage
       ),
-      onClick: { NSWorkspace.shared.activateFileViewerSelecting([fileURL]) }
+      duration: 10,
+      onClick: {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        for window in NSApplication.shared.windows
+        where !(window is NSPanel) && window.canBecomeMain {
+          window.makeKeyAndOrderFront(nil)
+          return
+        }
+      }
     )
   }
 
-  private func show(content: HUDContentView, onClick: (() -> Void)? = nil) {
+  func showError(message: String) {
+    show(
+      content: HUDContentView(
+        title: "Error",
+        subtitle: message,
+        icon: NSApplication.shared.applicationIconImage
+      ),
+      duration: 5
+    )
+  }
+
+  private func show(
+    content: HUDContentView, duration: Double = 2.5, onClick: (() -> Void)? = nil
+  ) {
     hideTask?.cancel()
     panel?.close()
 
@@ -67,7 +88,7 @@ final class RecordingHUD {
       userInfo: [.announcement: content.title])
 
     hideTask = Task {
-      try? await Task.sleep(for: .seconds(2.5))
+      try? await Task.sleep(for: .seconds(duration))
       guard !Task.isCancelled else { return }
       self.dismiss()
     }
@@ -92,11 +113,9 @@ private final class HUDPanel: NSPanel {
   var onClick: (() -> Void)?
 
   override func sendEvent(_ event: NSEvent) {
-    if event.type == .leftMouseUp, let onClick {
-      onClick()
-      Task { @MainActor [weak self] in
-        self?.onClick = nil  // fire once
-      }
+    if event.type == .leftMouseUp, let action = onClick {
+      self.onClick = nil
+      action()
     }
     super.sendEvent(event)
   }
