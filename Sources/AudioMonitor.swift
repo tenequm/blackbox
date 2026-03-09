@@ -16,6 +16,7 @@ final class AudioMonitor {
   private(set) var isPaused = false
   private(set) var graceCountdown: TimeInterval?
   private(set) var isSaving = false
+  private(set) var formattedElapsed: String?
   private var savingCount = 0
 
   private var sessions: [String: RecordingSession] = [:]
@@ -27,6 +28,7 @@ final class AudioMonitor {
 
   // Manual recording state
   private var manualRecorder: AudioRecorder?
+  private var elapsedTimer: Timer?
 
   // Recording start HUD
   private let hud = RecordingHUD()
@@ -116,6 +118,7 @@ final class AudioMonitor {
   func stopMonitoring() async {
     monitoringTask?.cancel()
     monitoringTask = nil
+    stopElapsedTimer()
     for token in notificationTokens {
       NSWorkspace.shared.notificationCenter.removeObserver(token)
     }
@@ -157,6 +160,39 @@ final class AudioMonitor {
     }
   }
 
+  // MARK: - Elapsed Timer
+
+  private func startElapsedTimer() {
+    guard elapsedTimer == nil else { return }
+    tickElapsed()
+    elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.tickElapsed()
+      }
+    }
+  }
+
+  private func stopElapsedTimer() {
+    elapsedTimer?.invalidate()
+    elapsedTimer = nil
+    formattedElapsed = nil
+  }
+
+  private func tickElapsed() {
+    guard let start = recordingStartTime else {
+      formattedElapsed = nil
+      return
+    }
+    let total = max(0, Int(Date().timeIntervalSince(start)))
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    formattedElapsed =
+      h > 0
+      ? String(format: "%d:%02d:%02d", h, m, s)
+      : String(format: "%d:%02d", m, s)
+  }
+
   // MARK: - Manual Recording
 
   func startManualRecording() {
@@ -187,6 +223,7 @@ final class AudioMonitor {
         recordingStartTime = Date()
         currentAppName = "Manual recording"
         isRecording = true
+        startElapsedTimer()
         hud.show(appName: "Manual recording", bundleID: nil)
       } catch {
         setError("Failed to start recording: \(error.localizedDescription)")
@@ -204,6 +241,7 @@ final class AudioMonitor {
     // Clear the failed recorder
     manualRecorder = nil
     isManualRecording = false
+    stopElapsedTimer()
 
     // Save the failed recorder's file
     savingCount += 1
@@ -236,6 +274,7 @@ final class AudioMonitor {
     let appName = currentAppName ?? recorder.appName
     manualRecorder = nil
     isManualRecording = false
+    stopElapsedTimer()
     savingCount += 1
     isSaving = true
     Task {
@@ -414,9 +453,11 @@ final class AudioMonitor {
         currentAppName = "\(active.count) apps"
       }
       recordingStartTime = first.startTime
+      startElapsedTimer()
     } else {
       currentAppName = nil
       recordingStartTime = nil
+      stopElapsedTimer()
     }
   }
 

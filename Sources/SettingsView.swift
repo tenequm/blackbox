@@ -33,7 +33,7 @@ struct SettingsView: View {
       debugSection
     }
     .formStyle(.grouped)
-    .frame(width: 480)
+    .frame(minWidth: 420, idealWidth: 480, maxWidth: 640)
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
       refreshPermissions()

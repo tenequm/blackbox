@@ -31,9 +31,15 @@ struct BlackboxApp: App {
         Image(systemName: "pause.circle")
           .foregroundStyle(.secondary)
       } else if monitor.isRecording {
-        Image(systemName: "waveform.circle.fill")
-          .symbolRenderingMode(.palette)
-          .foregroundStyle(.red, .primary)
+        HStack(spacing: 4) {
+          Image(systemName: "waveform.circle.fill")
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(.red, .primary)
+          if let elapsed = monitor.formattedElapsed {
+            Text(elapsed)
+              .font(.system(.body, design: .monospaced))
+          }
+        }
       } else {
         Image(systemName: "waveform")
       }
@@ -134,6 +140,23 @@ struct MenuContent: View {
   @Environment(\.openWindow) private var openWindow
 
   var body: some View {
+    // Primary action
+    if monitor.isManualRecording {
+      Button("Stop Recording") {
+        monitor.stopManualRecording()
+      }
+    } else if !monitor.isRecording {
+      Button("Record Now") {
+        monitor.startManualRecording()
+      }
+    }
+
+    Button(monitor.isPaused ? "Resume Monitoring" : "Pause Monitoring") {
+      monitor.togglePause()
+    }
+
+    Divider()
+
     // Status
     if monitor.permissionNeeded {
       Text("Screen Recording permission required")
@@ -158,38 +181,15 @@ struct MenuContent: View {
     } else if monitor.isPaused {
       Text("Monitoring paused")
         .foregroundStyle(.secondary)
-    } else if let appName = monitor.currentAppName, let start = monitor.recordingStartTime {
-      TimelineView(.periodic(from: .now, by: 1)) { context in
-        let elapsed = context.date.timeIntervalSince(start)
-        if let grace = monitor.graceCountdown {
-          Text("\(appName) - \(formatElapsed(elapsed)) (ending in \(Int(grace))s)")
-        } else {
-          Text("Recording \(appName) - \(formatElapsed(elapsed))")
-        }
+    } else if monitor.isRecording, let appName = monitor.currentAppName {
+      if let grace = monitor.graceCountdown {
+        Text("\(appName) - \(monitor.formattedElapsed ?? "0:00") (ending in \(Int(grace))s)")
+      } else {
+        Text("Recording \(appName) - \(monitor.formattedElapsed ?? "0:00")")
       }
     } else if monitor.isSaving {
       Text("Saving recording...")
         .foregroundStyle(.secondary)
-    } else {
-      Text(idleStatusText)
-        .foregroundStyle(.secondary)
-    }
-
-    Divider()
-
-    // Recording controls
-    if monitor.isManualRecording {
-      Button("Stop Recording") {
-        monitor.stopManualRecording()
-      }
-    } else if !monitor.isRecording {
-      Button("Record System Audio") {
-        monitor.startManualRecording()
-      }
-    }
-
-    Button(monitor.isPaused ? "Resume Monitoring" : "Pause Monitoring") {
-      monitor.togglePause()
     }
 
     Divider()
@@ -241,14 +241,6 @@ struct MenuContent: View {
 
   // MARK: - Computed Properties
 
-  private var idleStatusText: String {
-    let running = NSWorkspace.shared.runningApplications
-    let names = monitor.targetBundleIDs.compactMap { bid in
-      running.first(where: { $0.bundleIdentifier == bid })?.localizedName
-    }
-    return names.isEmpty ? "No target apps running" : "Monitoring \(names.joined(separator: ", "))"
-  }
-
   private var recentRecordings: [URL] {
     let dir = monitor.saveDirectory
     guard
@@ -297,16 +289,6 @@ private struct AboutView: View {
 }
 
 // MARK: - Helpers
-
-private func formatElapsed(_ interval: TimeInterval) -> String {
-  let total = max(0, Int(interval))
-  let h = total / 3600
-  let m = (total % 3600) / 60
-  let s = total % 60
-  return h > 0
-    ? String(format: "%d:%02d:%02d", h, m, s)
-    : String(format: "%d:%02d", m, s)
-}
 
 private func restartApp() {
   let url = Bundle.main.bundleURL
