@@ -212,46 +212,17 @@ final class TranscriptionService {
     return tempURL
   }
 
-  /// Mixes tracks and converts to MP3 via afconvert.
-  static func exportMP3(from fileURL: URL, to outputURL: URL) async throws {
+  /// Exports a single-track M4A copy. Mixes tracks first if multi-track.
+  static func exportM4A(from fileURL: URL, to outputURL: URL) async throws {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-    var sourceURL = fileURL
-    var needsCleanup = false
-
     if tracks.count >= 2 {
-      sourceURL = try await mixTracks(from: fileURL)
-      needsCleanup = true
-    }
-
-    defer {
-      if needsCleanup {
-        try? FileManager.default.removeItem(at: sourceURL)
-      }
-    }
-
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, Error>) in
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
-      process.arguments = [
-        sourceURL.path, outputURL.path,
-        "-f", "MPE3", "-d", ".mp3", "-b", "192000",
-      ]
-      process.terminationHandler = { proc in
-        if proc.terminationStatus == 0 {
-          continuation.resume()
-        } else {
-          continuation.resume(
-            throwing: TranscriptionError.transcriptionFailed("MP3 conversion failed"))
-        }
-      }
-      do {
-        try process.run()
-      } catch {
-        continuation.resume(throwing: error)
-      }
+      let mixed = try await mixTracks(from: fileURL)
+      defer { try? FileManager.default.removeItem(at: mixed) }
+      try FileManager.default.copyItem(at: mixed, to: outputURL)
+    } else {
+      try FileManager.default.copyItem(at: fileURL, to: outputURL)
     }
   }
 

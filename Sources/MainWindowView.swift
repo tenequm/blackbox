@@ -184,12 +184,12 @@ struct RecordingsView: View {
       let baseName =
         recording.audioURL.deletingLastPathComponent().deletingPathExtension().lastPathComponent
       let panel = NSSavePanel()
-      panel.nameFieldStringValue = "\(baseName).mp3"
-      panel.allowedContentTypes = [.mp3]
+      panel.nameFieldStringValue = "\(baseName).m4a"
+      panel.allowedContentTypes = [.mpeg4Audio]
       guard panel.runModal() == .OK, let dest = panel.url else { return }
       Task {
         do {
-          try await TranscriptionService.exportMP3(from: recording.audioURL, to: dest)
+          try await TranscriptionService.exportM4A(from: recording.audioURL, to: dest)
         } catch {
           exportError = error.localizedDescription
         }
@@ -200,7 +200,7 @@ struct RecordingsView: View {
       panel.canChooseDirectories = true
       panel.canCreateDirectories = true
       panel.prompt = "Export"
-      panel.message = "Choose a folder to export \(selected.count) recordings as MP3"
+      panel.message = "Choose a folder to export \(selected.count) recordings as M4A"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
       Task {
         var failed = 0
@@ -208,9 +208,9 @@ struct RecordingsView: View {
           let baseName =
             recording.audioURL.deletingLastPathComponent().deletingPathExtension()
             .lastPathComponent
-          let target = dest.appendingPathComponent("\(baseName).mp3")
+          let target = dest.appendingPathComponent("\(baseName).m4a")
           do {
-            try await TranscriptionService.exportMP3(from: recording.audioURL, to: target)
+            try await TranscriptionService.exportM4A(from: recording.audioURL, to: target)
           } catch {
             failed += 1
           }

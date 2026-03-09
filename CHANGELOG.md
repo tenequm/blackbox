@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recordings detail view with built-in audio player and transcription UI
 - NavigationSplitView layout for recordings (sidebar + detail pane)
 - Soniox API key field in Settings
-- MP3 export for recordings (single combined audio stream via `afconvert`)
+- M4A export for recordings (single-track copy, auto-mixes if multi-track)
 - Real-time audio level metering with animated waveform icon in menu bar
 - HUD-based error notifications with configurable duration
 - Disk space pre-check (50 MB minimum) before starting a recording
