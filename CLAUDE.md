@@ -1,15 +1,16 @@
 # Blackbox
 
-macOS menu bar app that auto-records call audio from target apps (Chrome, Zoom) using ScreenCaptureKit.
+macOS menu bar app that auto-records call audio using ScreenCaptureKit. Detects calls via CoreAudio microphone activity monitoring.
 
 ## Project Structure
 
 ```
 Package.swift              - SPM manifest, macOS 15+, Swift 6.2
 Sources/
-  BlackboxApp.swift        - @main App, MenuBarExtra, Settings scene, AppDelegate
-  AudioMonitor.swift       - @Observable: process/window monitoring, recording lifecycle
+  BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
+  AudioMonitor.swift       - @Observable: mic activity detection, auto/manual recording lifecycle
   AudioRecorder.swift      - SCStream + AVAssetWriter, dual-track M4A
+  MainWindowView.swift     - Main window: TabView with Recordings table + Settings
   SettingsView.swift       - Settings UI, defaults constants
   OnboardingView.swift     - First-launch onboarding: permissions walkthrough
   RecordingHUD.swift       - Floating NSPanel toast on recording start
@@ -51,15 +52,15 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 3. **Bundle**: `make bundle` - creates signed .app with correct bundle ID
 4. **Test install**: `make install && open /Applications/Blackbox.app`
 5. **Verify permissions**: First launch should prompt for Screen Recording (as "Blackbox", not terminal)
-6. **Test auto-recording**: Open Chrome, navigate to Google Meet - recording should start when meeting window detected
+6. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
 7. **Test manual recording**: Menu > Record System Audio - should record and stop cleanly
 8. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
-9. **Test settings**: All settings persist across restart, changes take effect within 3 seconds
+9. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
 10. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
 
 ## Key Architecture Decisions
 
-- **Window title detection** (not audio silence) drives recording lifecycle. `CGWindowListCopyWindowInfo` checks for meeting patterns like "Meet -" or "Zoom".
+- **Mic activity detection** drives recording lifecycle. CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere` listener on the default input device fires instantly when any app starts/stops using the microphone. Event-driven, no polling. Auto-recordings capture system audio only (no mic) so detection stays clean - `DeviceIsRunningSomewhere` accurately reflects other apps' mic usage.
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks run on a background dispatch queue (`audioQueue`). Thread safety: `stop()` dispatches `markAsFinished()` on `audioQueue.sync` to serialize with callbacks.
 - **Dual-track M4A**: system audio + mic as separate AVAssetWriterInputs. Most players mix both tracks on playback. Note: some players only play the first track.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter) before process exit.
@@ -71,6 +72,7 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 
 With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
+- AudioMonitor is `@unchecked Sendable` for CoreAudio callback Unmanaged pointer dance
 - AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state
 - SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called on background queues)
 - Callbacks hop to MainActor via `Task { @MainActor in ... }`

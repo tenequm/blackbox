@@ -2,7 +2,7 @@
 
 macOS menu bar app that automatically records audio from your calls.
 
-Monitors Chrome, Zoom, and Telegram for meetings, records both system audio and microphone, and saves M4A files locally.
+Detects when your microphone becomes active (e.g. during calls) and records system audio automatically. Works with any app - Zoom, Meet, Teams, Discord, FaceTime, Telegram, and more. Saves M4A files locally.
 
 ## Install
 
@@ -12,11 +12,11 @@ On first launch, grant Screen Recording and Microphone permissions when prompted
 
 ## Features
 
-- Auto-detects meetings by window title (Google Meet, Zoom, Telegram)
-- Records system audio + microphone as dual-track M4A
-- Manual record/stop for any target app
+- Auto-records when your microphone becomes active (any calling app)
+- Manual record/stop for on-demand system audio capture
+- Dual-track M4A (system audio + microphone in manual recordings)
 - Notification when recording is saved (click to reveal in Finder)
-- Configurable apps, patterns, save location, and grace period
+- Configurable grace period, save location, and notification preferences
 - Auto-updates
 
 ## Build from source

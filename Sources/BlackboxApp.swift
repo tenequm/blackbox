@@ -6,38 +6,45 @@ import SwiftUI
 struct BlackboxApp: App {
   @NSApplicationDelegateAdaptor private var delegate: AppDelegate
   @State private var monitor = AudioMonitor()
+  @State private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
   init() {
     LogFile.rotateIfNeeded()
     Log.info(Log.app, "app", "launched")
-    // Set monitor reference on delegate early for graceful shutdown.
-    // @NSApplicationDelegateAdaptor sets the delegate before App.init runs.
-    (NSApplication.shared.delegate as? AppDelegate)?.monitor = monitor
+    // Set monitor reference on delegate for graceful shutdown and startup.
+    delegate.monitor = monitor
   }
 
   var body: some Scene {
     MenuBarExtra {
-      MenuContent(monitor: monitor, updater: updaterController.updater)
+      MenuContent(monitor: monitor, updater: updaterController.updater, selectedTab: $selectedTab)
     } label: {
-      if monitor.permissionNeeded || monitor.micPermissionNeeded {
+      if monitor.permissionNeeded {
         Image(systemName: "exclamationmark.triangle.fill")
           .foregroundStyle(.yellow)
       } else if monitor.errorMessage != nil {
         Image(systemName: "exclamationmark.triangle.fill")
           .foregroundStyle(.yellow)
-      } else if monitor.isPaused {
-        Image(systemName: "pause.circle")
-          .foregroundStyle(.secondary)
       } else if monitor.isRecording {
-        HStack(spacing: 4) {
-          Image(systemName: "waveform.circle.fill")
-            .symbolRenderingMode(.palette)
-            .foregroundStyle(.red, .primary)
-          if let elapsed = monitor.formattedElapsed {
-            Text(elapsed)
+        if let grace = monitor.graceCountdown {
+          HStack(spacing: 4) {
+            Image(systemName: "waveform.circle")
+              .foregroundStyle(.secondary)
+            Text(String(format: "0:%02d", Int(ceil(grace))))
               .font(.system(.body, design: .monospaced))
+              .foregroundStyle(.secondary)
+          }
+        } else {
+          HStack(spacing: 4) {
+            Image(systemName: "waveform.circle.fill")
+              .symbolRenderingMode(.palette)
+              .foregroundStyle(.red, .primary)
+            if let elapsed = monitor.formattedElapsed {
+              Text(elapsed)
+                .font(.system(.body, design: .monospaced))
+            }
           }
         }
       } else {
@@ -46,9 +53,11 @@ struct BlackboxApp: App {
     }
     .menuBarExtraStyle(.menu)
 
-    Settings {
-      SettingsView()
+    Window("Blackbox", id: "main") {
+      MainWindowView(selectedTab: $selectedTab)
     }
+    .defaultSize(width: 700, height: 500)
+    .defaultPosition(.center)
 
     Window("About Blackbox", id: "about") {
       AboutView()
@@ -135,8 +144,8 @@ struct BlackboxApp: App {
 struct MenuContent: View {
   let monitor: AudioMonitor
   let updater: SPUUpdater
+  @Binding var selectedTab: MainTab
   @Environment(\.dismiss) private var dismiss
-  @Environment(\.openSettings) private var openSettings
   @Environment(\.openWindow) private var openWindow
 
   var body: some View {
@@ -145,14 +154,11 @@ struct MenuContent: View {
       Button("Stop Recording") {
         monitor.stopManualRecording()
       }
-    } else if !monitor.isRecording {
+    } else {
       Button("Record Now") {
         monitor.startManualRecording()
       }
-    }
-
-    Button(monitor.isPaused ? "Resume Monitoring" : "Pause Monitoring") {
-      monitor.togglePause()
+      .disabled(monitor.isRecording)
     }
 
     Divider()
@@ -170,7 +176,7 @@ struct MenuContent: View {
       }
       Button("Restart Blackbox") { restartApp() }
     } else if monitor.micPermissionNeeded {
-      Text("Microphone permission needed for full recording")
+      Text("Microphone permission needed for manual recordings")
         .foregroundStyle(.orange)
       Button("Grant Microphone Access") {
         Task { await AVCaptureDevice.requestAccess(for: .audio) }
@@ -178,9 +184,6 @@ struct MenuContent: View {
     } else if let errorMsg = monitor.errorMessage {
       Text(errorMsg)
         .foregroundStyle(.red)
-    } else if monitor.isPaused {
-      Text("Monitoring paused")
-        .foregroundStyle(.secondary)
     } else if monitor.isRecording, let appName = monitor.currentAppName {
       if let grace = monitor.graceCountdown {
         Text("\(appName) - \(monitor.formattedElapsed ?? "0:00") (ending in \(Int(grace))s)")
@@ -194,23 +197,10 @@ struct MenuContent: View {
 
     Divider()
 
-    // Recent recordings
-    Menu("Recent Recordings") {
-      ForEach(recentRecordings, id: \.absoluteString) { url in
-        Button(url.lastPathComponent) {
-          NSWorkspace.shared.activateFileViewerSelecting([url])
-        }
-      }
-      if recentRecordings.isEmpty {
-        Text("No recordings yet")
-          .foregroundStyle(.secondary)
-      }
-    }
-
-    Button("Open Recordings Folder") {
-      let url = monitor.saveDirectory
-      try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-      NSWorkspace.shared.open(url)
+    Button("Open Blackbox") {
+      selectedTab = .recordings
+      openWindow(id: "main")
+      NSApplication.shared.activate(ignoringOtherApps: true)
     }
     .keyboardShortcut("o")
 
@@ -226,7 +216,8 @@ struct MenuContent: View {
     }
 
     Button("Settings...") {
-      openSettings()
+      selectedTab = .settings
+      openWindow(id: "main")
       NSApplication.shared.activate(ignoringOtherApps: true)
     }
     .keyboardShortcut(",", modifiers: .command)
@@ -239,30 +230,6 @@ struct MenuContent: View {
     .keyboardShortcut("q")
   }
 
-  // MARK: - Computed Properties
-
-  private var recentRecordings: [URL] {
-    let dir = monitor.saveDirectory
-    guard
-      let files = try? FileManager.default.contentsOfDirectory(
-        at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
-        options: .skipsHiddenFiles)
-    else { return [] }
-    return
-      files
-      .filter { $0.pathExtension == "m4a" }
-      .sorted {
-        let d1 =
-          (try? $0.resourceValues(forKeys: [.contentModificationDateKey])
-            .contentModificationDate) ?? .distantPast
-        let d2 =
-          (try? $1.resourceValues(forKeys: [.contentModificationDateKey])
-            .contentModificationDate) ?? .distantPast
-        return d1 > d2
-      }
-      .prefix(5)
-      .map { $0 }
-  }
 }
 
 // MARK: - About
