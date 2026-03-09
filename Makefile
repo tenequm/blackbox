@@ -1,11 +1,13 @@
 APP_NAME = Blackbox
+VERSION = 0.2.0
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
+DMG_NAME = $(APP_NAME)-$(VERSION).dmg
 SPARKLE_PATH = $(shell find .build/artifacts -name "Sparkle.framework" -path "*/macos-arm64_x86_64/*" | head -1)
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format
+.PHONY: build bundle install run clean format dmg release
 
 build:
 	swift build -c release
@@ -38,6 +40,21 @@ install: bundle
 
 run: bundle
 	open "$(APP_BUNDLE)"
+
+dmg: bundle
+	rm -rf "$(BUILD_DIR)/dmg-stage"
+	mkdir -p "$(BUILD_DIR)/dmg-stage"
+	cp -R "$(APP_BUNDLE)" "$(BUILD_DIR)/dmg-stage/"
+	ln -s /Applications "$(BUILD_DIR)/dmg-stage/Applications"
+	rm -f "$(BUILD_DIR)/$(DMG_NAME)"
+	hdiutil create -volname "$(APP_NAME)" -srcfolder "$(BUILD_DIR)/dmg-stage" -ov -format UDZO "$(BUILD_DIR)/$(DMG_NAME)"
+	rm -rf "$(BUILD_DIR)/dmg-stage"
+	@echo "DMG created: $(BUILD_DIR)/$(DMG_NAME)"
+
+release: dmg
+	xcrun notarytool submit "$(BUILD_DIR)/$(DMG_NAME)" --keychain-profile "blackbox" --wait
+	xcrun stapler staple "$(BUILD_DIR)/$(DMG_NAME)"
+	@echo "Notarized: $(BUILD_DIR)/$(DMG_NAME)"
 
 format:
 	swift-format --recursive Sources/ --in-place
