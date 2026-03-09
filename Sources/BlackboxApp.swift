@@ -1,3 +1,4 @@
+import AVFoundation
 import Sparkle
 import SwiftUI
 
@@ -20,7 +21,7 @@ struct BlackboxApp: App {
     MenuBarExtra {
       MenuContent(monitor: monitor, updater: updaterController.updater)
     } label: {
-      if monitor.permissionNeeded {
+      if monitor.permissionNeeded || monitor.micPermissionNeeded {
         Image(systemName: "exclamationmark.triangle.fill")
           .foregroundStyle(.yellow)
       } else if monitor.errorMessage != nil {
@@ -145,6 +146,12 @@ struct MenuContent: View {
         )
       }
       Button("Restart Blackbox") { restartApp() }
+    } else if monitor.micPermissionNeeded {
+      Text("Microphone permission needed for full recording")
+        .foregroundStyle(.orange)
+      Button("Grant Microphone Access") {
+        Task { await AVCaptureDevice.requestAccess(for: .audio) }
+      }
     } else if let errorMsg = monitor.errorMessage {
       Text(errorMsg)
         .foregroundStyle(.red)

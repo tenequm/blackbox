@@ -10,6 +10,7 @@ final class AudioMonitor {
   private(set) var currentAppName: String?
   private(set) var recordingStartTime: Date?
   private(set) var permissionNeeded = false
+  private(set) var micPermissionNeeded = false
   private(set) var isManualRecording = false
   private(set) var errorMessage: String?
   private(set) var isPaused = false
@@ -159,18 +160,20 @@ final class AudioMonitor {
   // MARK: - Manual Recording
 
   func startManualRecording() {
+    startManualRecordingInternal()
+  }
+
+  private func startManualRecordingInternal(micOverride: Bool? = nil) {
     guard manualRecorder == nil else { return }
 
+    let useMic = micOverride ?? micEnabled
     let recorder = AudioRecorder(
       appName: "Manual recording",
-      micEnabled: micEnabled,
+      micEnabled: useMic,
       saveDirectory: saveDirectory,
-      onError: { [weak self] error in
+      onFailure: { [weak self] failure in
         Task { @MainActor [weak self] in
-          self?.setError("Manual recording interrupted: \(error.localizedDescription)")
-          self?.manualRecorder = nil
-          self?.isManualRecording = false
-          self?.updateState()
+          self?.handleManualRecorderFailure(failure)
         }
       }
     )
@@ -191,6 +194,40 @@ final class AudioMonitor {
         isManualRecording = false
         updateState()
       }
+    }
+  }
+
+  private func handleManualRecorderFailure(_ failure: RecorderFailure) {
+    guard let failedRecorder = manualRecorder else { return }
+    let appName = currentAppName ?? failedRecorder.appName
+
+    // Clear the failed recorder
+    manualRecorder = nil
+    isManualRecording = false
+
+    // Save the failed recorder's file
+    savingCount += 1
+    isSaving = true
+    Task {
+      let url = await failedRecorder.stop()
+      savingCount -= 1
+      isSaving = savingCount > 0
+      if let url, notifyOnSaved {
+        postRecordingSavedNotification(appName: appName, fileURL: url)
+      }
+    }
+
+    // Decide whether to auto-restart
+    switch failure {
+    case .permissionDenied:
+      permissionNeeded = true
+      updateState()
+    case .micFailed:
+      setError("Microphone lost - recording continues without mic")
+      startManualRecordingInternal(micOverride: false)
+    case .systemStopped, .deviceChangeFailed, .other:
+      setError("Recording interrupted - restarting...")
+      startManualRecordingInternal()
     }
   }
 
@@ -220,6 +257,11 @@ final class AudioMonitor {
       return
     }
     permissionNeeded = false
+
+    // Check mic permission for menu bar warning (non-blocking)
+    micPermissionNeeded =
+      micEnabled && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized
+
     guard !isPaused else { return }
 
     let runningApps = NSWorkspace.shared.runningApplications
@@ -275,16 +317,16 @@ final class AudioMonitor {
 
   // MARK: - Session Management
 
-  private func startSession(bundleID: String, appName: String) {
+  private func startSession(bundleID: String, appName: String, micOverride: Bool? = nil) {
+    let useMic = micOverride ?? micEnabled
     let recorder = AudioRecorder(
       bundleID: bundleID,
       appName: appName,
-      micEnabled: micEnabled,
+      micEnabled: useMic,
       saveDirectory: saveDirectory,
-      onError: { [weak self] error in
+      onFailure: { [weak self] failure in
         Task { @MainActor [weak self] in
-          self?.setError("Recording of \(appName) was interrupted")
-          self?.stopSession(bundleID: bundleID)
+          self?.handleSessionFailure(failure, bundleID: bundleID, appName: appName)
         }
       }
     )
@@ -315,6 +357,31 @@ final class AudioMonitor {
         }
         updateState()
       }
+    }
+  }
+
+  private func handleSessionFailure(
+    _ failure: RecorderFailure, bundleID: String, appName: String
+  ) {
+    // Save the current recording first
+    stopSession(bundleID: bundleID)
+
+    switch failure {
+    case .permissionDenied:
+      permissionNeeded = true
+    case .micFailed:
+      setError("Microphone lost - recording continues without mic")
+      startSession(bundleID: bundleID, appName: appName, micOverride: false)
+    case .systemStopped:
+      Log.info(Log.monitor, "monitor", "auto-restarting session for \(appName)")
+      startSession(bundleID: bundleID, appName: appName)
+    case .deviceChangeFailed:
+      Log.info(Log.monitor, "monitor", "restarting session for \(appName) after device change")
+      startSession(bundleID: bundleID, appName: appName)
+    case .other(let msg):
+      setError("Recording of \(appName): \(msg)")
+      // Re-poll to restart if meeting window is still there
+      pollMeetingWindows()
     }
   }
 
