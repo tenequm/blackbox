@@ -139,7 +139,11 @@ struct RecordingsView: View {
 
       var results: [RecordingFile] = []
 
-      for url in files where url.pathExtension == "blackbox" {
+      for url in files
+      where url.pathExtension == "blackbox"
+        || FileManager.default.fileExists(
+          atPath: url.appendingPathComponent("audio.m4a").path)
+      {
         let audioURL = url.appendingPathComponent("audio.m4a")
         guard FileManager.default.fileExists(atPath: audioURL.path) else { continue }
         let metadata = RecordingMetadata.load(in: url)
@@ -173,18 +177,22 @@ struct RecordingsView: View {
   }
 
   private func exportRecordings(_ ids: Set<String>) {
-    let sources = recordings.filter { ids.contains($0.id) }.map(\.audioURL)
-    guard !sources.isEmpty else { return }
+    let selected = recordings.filter { ids.contains($0.id) }
+    guard !selected.isEmpty else { return }
 
-    if sources.count == 1, let source = sources.first {
+    if selected.count == 1, let recording = selected.first {
+      let baseName =
+        recording.audioURL.deletingLastPathComponent().deletingPathExtension().lastPathComponent
       let panel = NSSavePanel()
-      panel.nameFieldStringValue = source.lastPathComponent
-      panel.allowedContentTypes = [.mpeg4Audio]
+      panel.nameFieldStringValue = "\(baseName).mp3"
+      panel.allowedContentTypes = [.mp3]
       guard panel.runModal() == .OK, let dest = panel.url else { return }
-      do {
-        try FileManager.default.copyItem(at: source, to: dest)
-      } catch {
-        exportError = error.localizedDescription
+      Task {
+        do {
+          try await TranscriptionService.exportMP3(from: recording.audioURL, to: dest)
+        } catch {
+          exportError = error.localizedDescription
+        }
       }
     } else {
       let panel = NSOpenPanel()
@@ -192,19 +200,24 @@ struct RecordingsView: View {
       panel.canChooseDirectories = true
       panel.canCreateDirectories = true
       panel.prompt = "Export"
-      panel.message = "Choose a folder to export \(sources.count) recordings"
+      panel.message = "Choose a folder to export \(selected.count) recordings as MP3"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
-      var failed = 0
-      for source in sources {
-        let target = dest.appendingPathComponent(source.lastPathComponent)
-        do {
-          try FileManager.default.copyItem(at: source, to: target)
-        } catch {
-          failed += 1
+      Task {
+        var failed = 0
+        for recording in selected {
+          let baseName =
+            recording.audioURL.deletingLastPathComponent().deletingPathExtension()
+            .lastPathComponent
+          let target = dest.appendingPathComponent("\(baseName).mp3")
+          do {
+            try await TranscriptionService.exportMP3(from: recording.audioURL, to: target)
+          } catch {
+            failed += 1
+          }
         }
-      }
-      if failed > 0 {
-        exportError = "Failed to export \(failed) of \(sources.count) recordings"
+        if failed > 0 {
+          exportError = "Failed to export \(failed) of \(selected.count) recordings"
+        }
       }
     }
   }
@@ -889,7 +902,7 @@ private struct TranscriptSegmentView: View {
 
 struct RecordingFile: Identifiable {
   var id: String { url.path }
-  let url: URL  // .blackbox directory
+  let url: URL  // recording directory
   let audioURL: URL  // audio.m4a inside the directory
   var title: String  // from metadata.title
   let date: Date  // from metadata.createdAt

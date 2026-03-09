@@ -12,20 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-process mic detection using macOS 14.2+ CoreAudio APIs (`kAudioProcessPropertyIsRunningInput`) - replaces system-wide `DeviceIsRunningSomewhere` listener
 - Microphone capture on auto-recordings - both system audio and mic are now recorded during calls
 - Call app name resolution from bundle ID (shown in HUD, notifications, and file names)
-- Transcription service with Soniox integration (dual-track support for system + mic audio)
+- Transcription service with Soniox integration
 - Recordings detail view with built-in audio player and transcription UI
 - NavigationSplitView layout for recordings (sidebar + detail pane)
 - Soniox API key field in Settings
-- `.blackbox` directory bundle format for recordings (audio.m4a + metadata.json + transcript.json per recording)
-- UTI declaration for `.blackbox` recording package type (`com.tenequm.blackbox.recording`)
-- One-time migration from flat `.m4a` files to `.blackbox` directory format
+- MP3 export for recordings (single combined audio stream via `afconvert`)
 - Real-time audio level metering with animated waveform icon in menu bar
 - HUD-based error notifications with configurable duration
 - Disk space pre-check (50 MB minimum) before starting a recording
 - Restart rate limiting for auto-recovery (max 3 restarts per 30-second window)
+- Virtual audio processor exclusion (Krisp, SoundSource, Loopback) to prevent voice duplication
 
 ### Changed
 
+- Recording uses dual-track capture (system audio + mic as separate AVAssetWriterInputs) with auto-mix to single-track M4A on save via AVMutableComposition
+- Recordings stored as plain directories instead of `.blackbox` macOS package bundles
+- Transcription uses Soniox `stt-async-v4` model with mix-first approach (multi-track files mixed before upload)
 - Auto-recordings now include microphone audio (previously system audio only)
 - Recordings UI redesigned from flat table to split view with playback and transcription
 - "Record Microphone" setting now applies to all recordings, not just manual ones
@@ -36,8 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transcription file upload uses streaming (64 KB chunks) instead of loading entire file into memory
 - Auto-recording now degrades gracefully on mic failure (continues without mic instead of stopping)
 
+### Removed
+
+- `.blackbox` bundle format and UTI declaration
+- One-time migration from flat `.m4a` to `.blackbox` format (no longer needed)
+
 ### Fixed
 
+- Voice duplication when using Krisp or other virtual audio processors
+- Soniox speaker field parsing (v4 API returns String, not Int)
+- Transcription quality - proper speaker diarization with timestamps instead of single text blob
+- `stop()` no longer returns URL for corrupt files (guards on `writer.status == .completed`)
+- AVAssetWriter failure during recording now triggers auto-recovery instead of silently truncating
+- `applicationShouldTerminate` double-reply race prevented with `hasReplied` flag
+- Menu bar audio level icons use valid SF Symbols (`speaker.wave.1`/`.2`/`.3`)
+- Removed unnecessary `.screen` output registration from SCStream (wasted GPU resources)
 - Menu bar countdown/elapsed timer font changed to `.monospacedDigit()` for stable width
 - Auto-recording now starts after manual recording stops during an active call
 - HUD click handler fires only once (was possible to double-fire on rapid clicks)

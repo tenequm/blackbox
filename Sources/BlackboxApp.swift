@@ -118,14 +118,19 @@ struct BlackboxApp: App {
         return .terminateNow
       }
       Log.info(Log.app, "app", "terminating, cleaning up recordings")
+      var hasReplied = false
       let timeoutTask = Task {
-        try? await Task.sleep(for: .seconds(5))
-        guard !Task.isCancelled else { return }
+        try? await Task.sleep(for: .seconds(8))
+        guard !Task.isCancelled, !hasReplied else { return }
+        hasReplied = true
+        Log.error(Log.app, "app", "termination cleanup timed out after 8s")
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       Task {
         await monitor.stopMonitoring()
         timeoutTask.cancel()
+        guard !hasReplied else { return }
+        hasReplied = true
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       return .terminateLater
@@ -148,11 +153,14 @@ struct MenuContent: View {
       Button("Stop Recording") {
         monitor.stopManualRecording()
       }
+    } else if monitor.isRecording {
+      Button("Stop Recording") {
+        monitor.forceStopAutoRecording()
+      }
     } else {
       Button("Record Now") {
         monitor.startManualRecording()
       }
-      .disabled(monitor.isRecording)
     }
 
     Divider()
@@ -251,15 +259,15 @@ private struct AboutView: View {
 
 // MARK: - Helpers
 
-/// Maps audio RMS level to a waveform SF Symbol.
+/// Maps audio RMS level to a speaker SF Symbol.
 /// Thresholds tuned for typical call audio captured via ScreenCaptureKit.
 private func recordingWaveformIcon(level: Float) -> String {
   if level > 0.05 {
-    return "waveform"
+    return "speaker.wave.3"
   } else if level > 0.01 {
-    return "waveform.mid"
+    return "speaker.wave.2"
   } else {
-    return "waveform.low"
+    return "speaker.wave.1"
   }
 }
 

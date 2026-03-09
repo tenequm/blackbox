@@ -292,6 +292,11 @@ final class AudioMonitor: @unchecked Sendable {
     }
   }
 
+  func forceStopAutoRecording() {
+    cancelGracePeriod()
+    stopAutoRecording()
+  }
+
   func stopManualRecording() {
     guard let recorder = manualRecorder else { return }
     let appName = currentAppName ?? recorder.appName

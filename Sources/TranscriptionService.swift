@@ -122,8 +122,8 @@ final class TranscriptionService {
   }
 
   /// Transcribes an audio file. For dual-track recordings (system audio + mic),
-  /// each track is transcribed separately for better speaker attribution:
-  /// the mic track becomes "You" and system audio speakers are diarized independently.
+  /// tracks are mixed into a single file first so Soniox can diarize speakers
+  /// from the combined audio, producing proper speaker separation and timestamps.
   func transcribe(
     fileURL: URL,
     onStatus: @escaping (TranscriptionStatus) -> Void
@@ -131,24 +131,25 @@ final class TranscriptionService {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
+    var uploadURL = fileURL
+    var needsCleanup = false
+
     if tracks.count >= 2 {
       Log.info(
         Log.transcription, "transcription",
-        "dual-track file detected (\(tracks.count) tracks), transcribing separately")
-      return try await transcribeDualTrack(fileURL: fileURL, onStatus: onStatus)
-    } else {
-      return try await transcribeSingleFile(fileURL: fileURL, onStatus: onStatus)
+        "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
+      uploadURL = try await Self.mixTracks(from: fileURL)
+      needsCleanup = true
     }
-  }
 
-  // MARK: - Single File (mono or single-track)
+    defer {
+      if needsCleanup {
+        try? FileManager.default.removeItem(at: uploadURL)
+      }
+    }
 
-  private func transcribeSingleFile(
-    fileURL: URL,
-    onStatus: @escaping (TranscriptionStatus) -> Void
-  ) async throws -> TranscriptDocument {
     onStatus(.uploading)
-    let fileId = try await uploadFile(fileURL)
+    let fileId = try await uploadFile(uploadURL)
     var transcriptionId: String?
 
     do {
@@ -166,132 +167,92 @@ final class TranscriptionService {
     }
   }
 
-  // MARK: - Dual Track (system audio + mic)
+  // MARK: - Audio Mixing & Export
 
-  private func transcribeDualTrack(
-    fileURL: URL,
-    onStatus: @escaping (TranscriptionStatus) -> Void
-  ) async throws -> TranscriptDocument {
-    onStatus(.uploading)
-
-    // Extract each track to a temporary mono M4A
-    let systemURL = try await extractTrack(from: fileURL, trackIndex: 0)
-    let micURL = try await extractTrack(from: fileURL, trackIndex: 1)
-    defer {
-      try? FileManager.default.removeItem(at: systemURL)
-      try? FileManager.default.removeItem(at: micURL)
-    }
-
-    // Upload both files in parallel
-    async let systemUpload = uploadFile(systemURL)
-    async let micUpload = uploadFile(micURL)
-    let (sysFileId, micFileId) = try await (systemUpload, micUpload)
-
-    // Create transcriptions: system audio with diarization, mic without
-    async let systemCreate = createTranscription(fileId: sysFileId, enableDiarization: true)
-    async let micCreate = createTranscription(fileId: micFileId, enableDiarization: false)
-    let (sysTxId, micTxId) = try await (systemCreate, micCreate)
-
-    onStatus(.transcribing)
-
-    do {
-      // Poll both in parallel
-      async let sysPoll: Void = pollUntilComplete(
-        transcriptionId: sysTxId, onStatus: { _ in })
-      async let micPoll: Void = pollUntilComplete(
-        transcriptionId: micTxId, onStatus: { _ in })
-      try await sysPoll
-      try await micPoll
-
-      // Fetch both transcripts (either track may be silent)
-      async let systemDoc = fetchTranscript(transcriptionId: sysTxId, allowEmpty: true)
-      async let micDoc = fetchTranscript(transcriptionId: micTxId, allowEmpty: true)
-      let (sysDoc, mDoc) = try await (systemDoc, micDoc)
-
-      if sysDoc.segments.isEmpty && mDoc.segments.isEmpty {
-        throw TranscriptionError.transcriptionFailed("no speech detected in either track")
-      }
-
-      let merged = mergeTranscripts(system: sysDoc, mic: mDoc)
-      onStatus(.completed)
-      fireAndForgetCleanup(
-        transcriptionIds: [sysTxId, micTxId], fileIds: [sysFileId, micFileId])
-      return merged
-    } catch {
-      fireAndForgetCleanup(
-        transcriptionIds: [sysTxId, micTxId], fileIds: [sysFileId, micFileId])
-      throw error
-    }
-  }
-
-  // MARK: - Track Extraction
-
-  private func extractTrack(from fileURL: URL, trackIndex: Int) async throws -> URL {
+  /// Mixes all audio tracks into a single-track M4A for unified transcription/export.
+  static func mixTracks(from fileURL: URL) async throws -> URL {
     let asset = AVURLAsset(url: fileURL)
-    let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-    guard trackIndex < audioTracks.count else {
-      throw TranscriptionError.transcriptionFailed("audio track \(trackIndex) not found")
-    }
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    guard tracks.count >= 2 else { return fileURL }
 
     let composition = AVMutableComposition()
-    guard
-      let compositionTrack = composition.addMutableTrack(
-        withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-    else {
-      throw TranscriptionError.transcriptionFailed("could not create composition track")
-    }
-
-    let sourceTrack = audioTracks[trackIndex]
     let duration = try await asset.load(.duration)
-    try compositionTrack.insertTimeRange(
-      CMTimeRange(start: .zero, duration: duration),
-      of: sourceTrack,
-      at: .zero
-    )
+
+    for sourceTrack in tracks {
+      guard
+        let compositionTrack = composition.addMutableTrack(
+          withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+      else { continue }
+      try compositionTrack.insertTimeRange(
+        CMTimeRange(start: .zero, duration: duration),
+        of: sourceTrack,
+        at: .zero
+      )
+    }
 
     let tempURL =
       FileManager.default.temporaryDirectory
-      .appendingPathComponent("blackbox-track\(trackIndex)-\(UUID().uuidString).m4a")
+      .appendingPathComponent("blackbox-mixed-\(UUID().uuidString).m4a")
 
     guard
       let exporter = AVAssetExportSession(
         asset: composition, presetName: AVAssetExportPresetAppleM4A)
     else {
-      throw TranscriptionError.transcriptionFailed("could not create export session")
+      throw TranscriptionError.transcriptionFailed("could not create export session for mixing")
     }
 
     do {
       try await exporter.export(to: tempURL, as: .m4a)
     } catch {
       throw TranscriptionError.transcriptionFailed(
-        "track export failed: \(error.localizedDescription)")
+        "track mixing failed: \(error.localizedDescription)")
     }
 
-    Log.info(Log.transcription, "transcription", "extracted track \(trackIndex) to temp file")
+    Log.info(Log.transcription, "transcription", "mixed \(tracks.count) tracks into single file")
     return tempURL
   }
 
-  // MARK: - Merge Transcripts
+  /// Mixes tracks and converts to MP3 via afconvert.
+  static func exportMP3(from fileURL: URL, to outputURL: URL) async throws {
+    let asset = AVURLAsset(url: fileURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-  /// Merges system audio and mic transcripts. Mic segments are labeled as speaker -1 ("You").
-  private func mergeTranscripts(
-    system: TranscriptDocument, mic: TranscriptDocument
-  ) -> TranscriptDocument {
-    let micSegments = mic.segments.map { segment in
-      TranscriptSegment(speaker: -1, time: segment.time, text: segment.text)
+    var sourceURL = fileURL
+    var needsCleanup = false
+
+    if tracks.count >= 2 {
+      sourceURL = try await mixTracks(from: fileURL)
+      needsCleanup = true
     }
 
-    var allSegments = system.segments + micSegments
-    allSegments.sort { $0.time < $1.time }
+    defer {
+      if needsCleanup {
+        try? FileManager.default.removeItem(at: sourceURL)
+      }
+    }
 
-    Log.info(
-      Log.transcription, "transcription",
-      "merged \(system.segments.count) system + \(mic.segments.count) mic segments")
-
-    return TranscriptDocument(
-      segments: allSegments,
-      language: system.language ?? mic.language,
-      createdAt: Date())
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<Void, Error>) in
+      let process = Process()
+      process.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+      process.arguments = [
+        sourceURL.path, outputURL.path,
+        "-f", "MPE3", "-d", ".mp3", "-b", "192000",
+      ]
+      process.terminationHandler = { proc in
+        if proc.terminationStatus == 0 {
+          continuation.resume()
+        } else {
+          continuation.resume(
+            throwing: TranscriptionError.transcriptionFailed("MP3 conversion failed"))
+        }
+      }
+      do {
+        try process.run()
+      } catch {
+        continuation.resume(throwing: error)
+      }
+    }
   }
 
   // MARK: - Upload
@@ -364,7 +325,7 @@ final class TranscriptionService {
     fileId: String, enableDiarization: Bool
   ) async throws -> String {
     var config: [String: Any] = [
-      "model": "stt-async-v3",
+      "model": "stt-async-v4",
       "file_id": fileId,
       "language_hints": ["en"],
       "enable_language_identification": true,
@@ -469,7 +430,15 @@ final class TranscriptionService {
       // Skip translation tokens
       if token["translation_status"] as? String == "translation" { continue }
 
-      let speaker = token["speaker"] as? Int ?? 0
+      // Soniox v4 returns speaker as String ("1", "2"), v3 returned Int
+      let speaker: Int
+      if let s = token["speaker"] as? Int {
+        speaker = s
+      } else if let s = token["speaker"] as? String, let i = Int(s) {
+        speaker = i
+      } else {
+        speaker = 0
+      }
       let text = token["text"] as? String ?? ""
 
       if speaker != currentSpeaker {

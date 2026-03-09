@@ -26,21 +26,5 @@
     <string>https://github.com/tenequm/blackbox/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>8FE6PMYVVKWR12TGUuqeX+C6DJMYZm2FnbEBRtAI7ec=</string>
-    <key>UTExportedTypeDeclarations</key>
-    <array>
-        <dict>
-            <key>UTTypeConformsTo</key>
-            <array><string>com.apple.package</string></array>
-            <key>UTTypeDescription</key>
-            <string>Blackbox Recording</string>
-            <key>UTTypeIdentifier</key>
-            <string>com.tenequm.blackbox.recording</string>
-            <key>UTTypeTagSpecification</key>
-            <dict>
-                <key>public.filename-extension</key>
-                <array><string>blackbox</string></array>
-            </dict>
-        </dict>
-    </array>
 </dict>
 </plist>

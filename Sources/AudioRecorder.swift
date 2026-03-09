@@ -5,7 +5,8 @@ import ScreenCaptureKit
 
 /// Records audio from a specific app via ScreenCaptureKit.
 ///
-/// Lifecycle is controlled externally (by AudioMonitor). This class captures and writes.
+/// Dual-track capture: system audio and mic written as separate AVAssetWriterInputs,
+/// then auto-mixed to single-track M4A on save via AVMutableComposition.
 /// All mutable recording state is accessed exclusively from `audioQueue` (a serial dispatch queue).
 /// `stop()` dispatches teardown onto `audioQueue` to serialize with callbacks, then awaits the writer.
 ///
@@ -22,30 +23,29 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
   nonisolated let onAudioLevel: (@Sendable (Float) -> Void)?
-  nonisolated let levelSource: LevelSource
 
   private let audioQueue = DispatchQueue(label: "com.tenequm.blackbox.audio")
 
   // Stream - set/cleared on MainActor (before start / after stopCapture)
   nonisolated(unsafe) private var stream: SCStream?
 
-  // All writer state published to audioQueue via sync in setupWriter/stop
+  // All writer state accessed exclusively on audioQueue
   nonisolated(unsafe) private var writer: AVAssetWriter?
-  nonisolated(unsafe) private var systemAudioInput: AVAssetWriterInput?
-  nonisolated(unsafe) private var micAudioInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var audioInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var micInput: AVAssetWriterInput?
   nonisolated(unsafe) private var sessionStarted = false
   nonisolated(unsafe) private var stopped = false
-  nonisolated(unsafe) private var audioFileURL: URL?  // audio.m4a inside the directory
-  nonisolated(unsafe) private var fileURL: URL?  // .blackbox directory URL
+  nonisolated(unsafe) private var audioFileURL: URL?
+  nonisolated(unsafe) private var fileURL: URL?  // recording directory URL
   nonisolated(unsafe) private var activity: NSObjectProtocol?
   nonisolated(unsafe) private var deviceListenerRegistered = false
   nonisolated(unsafe) private var lastLevelTime: UInt64 = 0
+  nonisolated(unsafe) private var writerFailureReported = false
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool, saveDirectory: URL,
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
-    onAudioLevel: (@Sendable (Float) -> Void)? = nil,
-    levelSource: LevelSource = .mic
+    onAudioLevel: (@Sendable (Float) -> Void)? = nil
   ) {
     self.bundleID = bundleID
     self.appName = appName
@@ -53,14 +53,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     self.saveDirectory = saveDirectory
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
-    self.levelSource = levelSource
   }
 
-  // Safety net: CoreAudio device listener holds an Unmanaged.passUnretained(self) pointer.
-  // stop() handles the normal path; deinit catches leaks if stop() is never called.
-  //
-  // deinit is nonisolated in Swift 6, so we inline the CoreAudio C call directly
-  // rather than calling the MainActor-isolated removeDeviceListener().
   deinit {
     if deviceListenerRegistered {
       let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -88,26 +82,36 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     let filter: SCContentFilter
     if let bundleID {
-      // App-specific capture
       guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
         Log.error(Log.recorder, "recorder", "app not found: \(bundleID)")
         throw RecorderError.appNotFound
       }
       filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
     } else {
-      // Display-wide capture (all system audio)
+      // Display-wide capture: exclude virtual audio processors (Krisp, etc.)
+      // whose processed mic output would duplicate the user's voice.
+      let virtualAudioPrefixes = [
+        "ai.krisp",
+        "com.rogueamoeba.SoundSource",
+        "com.rogueamoeba.loopback",
+      ]
+      let excluded = content.applications.filter { app in
+        let bid = app.bundleIdentifier
+        return virtualAudioPrefixes.contains { bid.hasPrefix($0) }
+      }
+      if !excluded.isEmpty {
+        let names = excluded.map(\.bundleIdentifier).joined(separator: ", ")
+        Log.info(Log.recorder, "recorder", "excluding virtual audio apps from capture: \(names)")
+      }
       filter = SCContentFilter(
-        display: display, excludingApplications: [], exceptingWindows: [])
+        display: display, excludingApplications: excluded, exceptingWindows: [])
     }
 
-    // Set up file writer before starting stream
     try setupWriter()
 
     let config = makeStreamConfig()
-
     let stream = SCStream(filter: filter, configuration: config, delegate: self)
     do {
-      try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: audioQueue)
       try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
       if micEnabled {
         try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: audioQueue)
@@ -124,13 +128,12 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       addDeviceListener()
     } catch {
       Log.error(Log.recorder, "recorder", "stream failed to start for \(appName): \(error)")
-      // Clean up writer, stream, and activity if any step fails
       audioQueue.sync {
         writer?.cancelWriting()
         if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
         writer = nil
-        systemAudioInput = nil
-        micAudioInput = nil
+        audioInput = nil
+        micInput = nil
         audioFileURL = nil
         fileURL = nil
       }
@@ -144,8 +147,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   }
 
   /// Stops capture and finalizes the recording file.
-  /// Serializes writer teardown on audioQueue to prevent races with callbacks.
-  /// Returns the saved file URL, or nil if no audio was captured or write failed.
   @discardableResult
   func stop() async -> URL? {
     Log.recorder.info("stop() for \(self.appName, privacy: .public)")
@@ -155,42 +156,34 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
     stream = nil
 
-    // Capture and nil all writer state inside audioQueue.sync to serialize with callbacks.
-    // After this block, no callback can access writer/inputs (they see nil/stopped).
     var capturedWriter: AVAssetWriter?
     var capturedFileURL: URL?
+    var capturedAudioFileURL: URL?
+    var capturedMicEnabled = false
     var wasStarted = false
     audioQueue.sync {
       wasStarted = sessionStarted
       capturedWriter = writer
       capturedFileURL = fileURL
+      capturedAudioFileURL = audioFileURL
+      capturedMicEnabled = micInput != nil
       stopped = true
-      systemAudioInput?.markAsFinished()
-      micAudioInput?.markAsFinished()
-      // Nil out so any in-flight callback that passed the stopped guard sees nil
-      systemAudioInput = nil
-      micAudioInput = nil
+      audioInput?.markAsFinished()
+      micInput?.markAsFinished()
+      audioInput = nil
+      micInput = nil
       writer = nil
       sessionStarted = false
       audioFileURL = nil
       fileURL = nil
     }
 
-    // finishWriting uses captured locals - safe from MainActor after audioQueue.sync.
-    // Timeout guards against AVAssetWriter hanging indefinitely (rare but documented).
-    // applicationShouldTerminate has its own 5s timeout for quit, but manual "Stop Recording"
-    // would hang forever without this.
     var savedURL: URL?
     if let capturedWriter {
       if !wasStarted {
         capturedWriter.cancelWriting()
         if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
       } else {
-        // Timeout guard: if finishWriting hangs (rare but documented), cancelWriting
-        // terminates it so stop() doesn't block forever. applicationShouldTerminate has
-        // its own 5s timeout for quit, but manual "Stop Recording" needs this.
-        // We stay on MainActor (no TaskGroup/sending dance) - the timeout Task captures
-        // capturedWriter from the same actor context.
         let timeoutTask = Task {
           try await Task.sleep(for: .seconds(5))
           Log.error(Log.recorder, "recorder", "finishWriting timed out after 5s, cancelling")
@@ -203,10 +196,18 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
           Log.error(
             Log.recorder, "recorder",
             "writer failed: \(capturedWriter.error?.localizedDescription ?? "unknown")")
-          // Don't delete - the file may contain recoverable audio up to the last
-          // movieFragmentInterval boundary. Preserve it so the user can attempt recovery.
-          savedURL = capturedFileURL
-        } else {
+        }
+        if capturedWriter.status == .completed {
+          // Mix dual-track to single-track if mic was enabled
+          if capturedMicEnabled, let audioFile = capturedAudioFileURL {
+            do {
+              try await Self.mixToSingleTrack(audioFile)
+            } catch {
+              Log.error(
+                Log.recorder, "recorder",
+                "mix failed, keeping dual-track: \(error.localizedDescription)")
+            }
+          }
           savedURL = capturedFileURL
         }
       }
@@ -242,9 +243,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   // MARK: - Device Change Monitoring
 
-  /// Called on MainActor when CoreAudio reports the default input device changed.
-  /// Attempts seamless mic switch via updateConfiguration. Falls back to onFailure
-  /// if the update fails, letting AudioMonitor handle stream restart.
   func handleDefaultDeviceChange() {
     guard micEnabled, let stream else { return }
     guard let newDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID else {
@@ -280,7 +278,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     )
     if status == noErr {
       deviceListenerRegistered = true
-      Log.recorder.debug("device change listener registered for \(self.appName, privacy: .public)")
     } else {
       Log.error(Log.recorder, "recorder", "failed to register device listener: \(status)")
     }
@@ -301,7 +298,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       selfPtr
     )
     deviceListenerRegistered = false
-    Log.recorder.debug("device change listener removed for \(self.appName, privacy: .public)")
   }
 
   // MARK: - Writer Setup
@@ -319,17 +315,14 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     let now = Date()
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-    // Append short UUID suffix to prevent collision when two recordings start
-    // within the same second (e.g. auto + manual simultaneously).
     let suffix = UUID().uuidString.prefix(4)
-    let dirName = "\(formatter.string(from: now))-\(suffix).blackbox"
+    let dirName = "\(formatter.string(from: now))-\(suffix)"
     let dirURL = saveDirectory.appendingPathComponent(dirName)
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
     let audioURL = dirURL.appendingPathComponent("audio.m4a")
     Log.recorder.info("writing to \(dirName, privacy: .public)/audio.m4a")
 
-    // Write initial metadata
     let metadata = RecordingMetadata(
       title: appName,
       createdAt: now,
@@ -346,19 +339,18 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     ]
 
     let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
-    // Write fragment headers every 10s so the file is recoverable on crash
     newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
-    let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-    systemInput.expectsMediaDataInRealTime = true
-    newWriter.add(systemInput)
+    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+    input.expectsMediaDataInRealTime = true
+    newWriter.add(input)
 
-    var micInput: AVAssetWriterInput?
+    var newMicInput: AVAssetWriterInput?
     if micEnabled {
-      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-      input.expectsMediaDataInRealTime = true
-      newWriter.add(input)
-      micInput = input
+      let mi = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+      mi.expectsMediaDataInRealTime = true
+      newWriter.add(mi)
+      newMicInput = mi
     }
 
     guard newWriter.startWriting() else {
@@ -366,20 +358,19 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       Log.error(
         Log.recorder, "recorder",
         "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
-      // Clean up directory on failure
       try? FileManager.default.removeItem(at: dirURL)
       throw err ?? RecorderError.writerFailed
     }
 
-    // Publish mutable state to audioQueue with memory barrier so callbacks see it
     audioQueue.sync {
       self.writer = newWriter
-      self.systemAudioInput = systemInput
-      self.micAudioInput = micInput
+      self.audioInput = input
+      self.micInput = newMicInput
       self.audioFileURL = audioURL
       self.fileURL = dirURL
       self.sessionStarted = false
       self.stopped = false
+      self.writerFailureReported = false
     }
   }
 }
@@ -387,11 +378,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 // MARK: - CoreAudio Device Change Callback
 
 extension AudioRecorder {
-  // C function pointer for AudioObjectAddPropertyListener.
-  // Stored as a static let so the same pointer is used for both Add and Remove.
-  // Uses the non-block variant to avoid the known Swift closure identity bug
-  // that prevents correct listener removal with AudioObjectRemovePropertyListenerBlock.
-  // Fires on an internal CoreAudio thread; dispatches to MainActor for stream access.
   nonisolated static let deviceChangeListenerProc: AudioObjectPropertyListenerProc = {
     _, _, _, clientData in
     guard let clientData else { return noErr }
@@ -419,36 +405,35 @@ extension AudioRecorder: SCStreamOutput {
     switch type {
     case .screen:
       return
+
     case .audio:
-      // Start session on first buffer (system or mic, whichever arrives first)
       if !sessionStarted {
         writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
         sessionStarted = true
-        Log.recorder.debug("first audio buffer received for \(self.appName, privacy: .public)")
       }
-      if let input = systemAudioInput, input.isReadyForMoreMediaData {
+
+      if let input = audioInput, input.isReadyForMoreMediaData {
         if !input.append(sampleBuffer) {
-          Log.recorder.warning(
-            "system audio append failed for \(self.appName, privacy: .public)")
+          Log.recorder.warning("audio append failed for \(self.appName, privacy: .public)")
+          if !writerFailureReported, let w = writer, w.status == .failed {
+            writerFailureReported = true
+            let desc = w.error?.localizedDescription ?? "unknown writer error"
+            Log.error(Log.recorder, "recorder", "writer entered failed state: \(desc)")
+            onFailure?(.other(desc))
+          }
         }
       }
-      if levelSource == .system || levelSource == .both {
-        publishAudioLevel(sampleBuffer)
-      }
+
+      publishAudioLevel(sampleBuffer)
+
     case .microphone:
-      if !sessionStarted {
-        writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
-        sessionStarted = true
-        Log.recorder.debug("first mic buffer received for \(self.appName, privacy: .public)")
-      }
-      if let input = micAudioInput, input.isReadyForMoreMediaData {
+      guard sessionStarted else { return }
+      if let input = micInput, input.isReadyForMoreMediaData {
         if !input.append(sampleBuffer) {
           Log.recorder.warning("mic append failed for \(self.appName, privacy: .public)")
         }
       }
-      if levelSource == .mic || levelSource == .both {
-        publishAudioLevel(sampleBuffer)
-      }
+
     @unknown default:
       return
     }
@@ -459,7 +444,7 @@ extension AudioRecorder: SCStreamOutput {
   nonisolated private func publishAudioLevel(_ sampleBuffer: CMSampleBuffer) {
     guard let onAudioLevel else { return }
     let now = DispatchTime.now().uptimeNanoseconds
-    guard now - lastLevelTime >= 250_000_000 else { return }  // 250ms
+    guard now - lastLevelTime >= 250_000_000 else { return }
     lastLevelTime = now
 
     guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
@@ -487,6 +472,45 @@ extension AudioRecorder: SCStreamOutput {
   }
 }
 
+// MARK: - Post-Recording Mix
+
+extension AudioRecorder {
+  /// Mixes a dual-track M4A (system audio + mic) into a single-track file,
+  /// atomically replacing the original.
+  private static func mixToSingleTrack(_ fileURL: URL) async throws {
+    let asset = AVURLAsset(url: fileURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    guard tracks.count >= 2 else { return }
+
+    let composition = AVMutableComposition()
+    let duration = try await asset.load(.duration)
+
+    for sourceTrack in tracks {
+      guard
+        let compositionTrack = composition.addMutableTrack(
+          withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+      else { continue }
+      try compositionTrack.insertTimeRange(
+        CMTimeRange(start: .zero, duration: duration),
+        of: sourceTrack, at: .zero)
+    }
+
+    let tempURL = fileURL.deletingLastPathComponent()
+      .appendingPathComponent("audio-mixed.m4a")
+
+    guard
+      let exporter = AVAssetExportSession(
+        asset: composition, presetName: AVAssetExportPresetAppleM4A)
+    else {
+      throw RecorderError.mixFailed
+    }
+
+    try await exporter.export(to: tempURL, as: .m4a)
+    _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tempURL)
+    Log.info(Log.recorder, "recorder", "mixed \(tracks.count) tracks into single file")
+  }
+}
+
 // MARK: - SCStreamDelegate
 
 extension AudioRecorder: SCStreamDelegate {
@@ -495,7 +519,7 @@ extension AudioRecorder: SCStreamDelegate {
     let failure: RecorderFailure
     switch code {
     case -3801: failure = .permissionDenied
-    case -3802: failure = .systemStopped  // content invalidated (e.g. display disconnected)
+    case -3802: failure = .systemStopped
     case -3820: failure = .micFailed
     case -3821: failure = .systemStopped
     default: failure = .other(error.localizedDescription)
@@ -507,26 +531,20 @@ extension AudioRecorder: SCStreamDelegate {
   }
 }
 
-// MARK: - Level Source
-
-nonisolated enum LevelSource: Sendable, Equatable {
-  case mic
-  case system
-  case both
-}
-
 // MARK: - Error Types
 
 enum RecorderError: Error, LocalizedError {
   case noDisplay
   case appNotFound
   case writerFailed
+  case mixFailed
 
   var errorDescription: String? {
     switch self {
     case .noDisplay: "No display found"
     case .appNotFound: "Target application not found"
     case .writerFailed: "Failed to start audio writer"
+    case .mixFailed: "Failed to mix audio tracks"
     }
   }
 }
@@ -534,17 +552,9 @@ enum RecorderError: Error, LocalizedError {
 /// Categorized runtime failures reported by AudioRecorder.
 /// AudioMonitor uses these to decide recovery strategy.
 enum RecorderFailure: Sendable {
-  /// Microphone capture specifically failed (-3820). Stream is dead.
-  /// Recovery: restart without mic to preserve system audio.
   case micFailed
-  /// System killed the stream (-3821) due to sleep/wake or resource pressure.
-  /// Recovery: save file, restart with new stream.
   case systemStopped
-  /// Screen recording permission was revoked. Cannot recover without user action.
   case permissionDenied
-  /// updateConfiguration failed to switch mic device.
-  /// Recovery: restart stream to pick up new device.
   case deviceChangeFailed
-  /// Unexpected error.
   case other(String)
 }

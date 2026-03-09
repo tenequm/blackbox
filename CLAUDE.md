@@ -9,7 +9,7 @@ Package.swift              - SPM manifest, macOS 15+, Swift 6.2
 Sources/
   BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
   AudioMonitor.swift       - @Observable: mic activity detection, auto/manual recording lifecycle
-  AudioRecorder.swift      - SCStream + AVAssetWriter, dual-track M4A
+  AudioRecorder.swift      - SCStream + AVAssetWriter, dual-track capture + auto-mix on save
   MainWindowView.swift     - Main window: TabView with Recordings table + Settings
   SettingsView.swift       - Settings UI, defaults constants
   OnboardingView.swift     - First-launch onboarding: permissions walkthrough
@@ -96,8 +96,8 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 - **Per-process mic detection** drives recording lifecycle. CoreAudio per-process APIs (`kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`) enumerate which specific processes have active mic input, filtering out Blackbox's own PID and ScreenCaptureKit XPC helpers (`com.apple.screencapturekit*`, `com.apple.replayd`). This allows auto-recordings to capture both system audio AND mic without a detection feedback loop. A 3-second polling fallback catches cases where listeners don't fire. Requires macOS 14.2+.
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks run on a background dispatch queue (`audioQueue`). Thread safety: `stop()` dispatches `markAsFinished()` on `audioQueue.sync` to serialize with callbacks.
-- **Dual-track M4A**: system audio + mic as separate AVAssetWriterInputs. Most players mix both tracks on playback. Note: some players only play the first track.
-- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter) before process exit.
+- **Dual-track capture + auto-mix**: system audio + mic captured as separate AVAssetWriterInputs (standard ScreenCaptureKit pattern), then auto-mixed to single-track M4A on save via AVMutableComposition + AVAssetExportSession. The mix step atomically replaces the dual-track file. If mix fails, the dual-track file is kept as fallback. Virtual audio processors (Krisp, SoundSource, Loopback) are excluded from display-wide capture to prevent voice duplication.
+- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter + mix step) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (mic failed, system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures. Manual recordings also auto-restart.
 - **Device following**: CoreAudio `AudioObjectAddPropertyListener` monitors default input device changes. `updateConfiguration()` switches mic seamlessly on running stream; falls back to stream restart on failure.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
