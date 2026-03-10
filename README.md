@@ -36,4 +36,4 @@ Blackbox's ScreenCaptureKit audio capture architecture was informed by studying 
 
 ## License
 
-Apache 2.0
+GPL v3 - see [LICENSE](LICENSE)
