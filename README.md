@@ -30,6 +30,10 @@ open /Applications/Blackbox.app
 
 Requires macOS 15+ and Swift 6.2+ (Xcode 16+).
 
+## Acknowledgments
+
+Blackbox's ScreenCaptureKit audio capture architecture was informed by studying [Azayaka](https://github.com/Mnpn/Azayaka) by Martin Persson - a clean, well-built macOS screen and audio recorder. Azayaka's approach to dual-track recording and its PCM buffer conversion patterns (based on [Apple's ScreenCaptureKit documentation](https://developer.apple.com/documentation/screencapturekit/capturing_screen_content_in_macos) and [this gist by aibo-cora](https://gist.github.com/aibo-cora/c57d1a4125e145e586ecb61ebecff47c)) were valuable references during development.
+
 ## License
 
 Apache 2.0
