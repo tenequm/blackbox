@@ -172,6 +172,11 @@ final class AudioMonitor: @unchecked Sendable {
     }
   }
 
+  private func handleLowDiskSpace(_ remainingBytes: Int64) {
+    let mb = remainingBytes / 1_000_000
+    setError("Low disk space (\(mb) MB remaining)")
+  }
+
   // MARK: - Elapsed Timer
 
   private func startElapsedTimer() {
@@ -231,6 +236,11 @@ final class AudioMonitor: @unchecked Sendable {
         Task { @MainActor [weak self] in
           self?.audioLevel = level
         }
+      },
+      onLowDiskSpace: { [weak self] remaining in
+        Task { @MainActor [weak self] in
+          self?.handleLowDiskSpace(remaining)
+        }
       }
     )
 
@@ -280,6 +290,9 @@ final class AudioMonitor: @unchecked Sendable {
     case .micFailed:
       setError("Microphone lost - recording continues without mic")
       startManualRecordingInternal(micOverride: false)
+    case .lowDiskSpace:
+      setError("Recording stopped - not enough disk space")
+      updateAutoState()
     case .systemStopped, .deviceChangeFailed, .other:
       if shouldAllowRestart(
         count: &manualRestartCount, windowStart: &manualRestartWindowStart)
@@ -645,6 +658,11 @@ final class AudioMonitor: @unchecked Sendable {
         Task { @MainActor [weak self] in
           self?.audioLevel = level
         }
+      },
+      onLowDiskSpace: { [weak self] remaining in
+        Task { @MainActor [weak self] in
+          self?.handleLowDiskSpace(remaining)
+        }
       }
     )
 
@@ -731,6 +749,10 @@ final class AudioMonitor: @unchecked Sendable {
     case .micFailed:
       Log.info(Log.monitor, "monitor", "auto-recording mic failed, restarting without mic")
       startAutoRecording(micOverride: false)
+    case .lowDiskSpace:
+      setError("Recording stopped - not enough disk space")
+      autoRecordingAppName = nil
+      updateAutoState()
     case .other:
       setError("Recording interrupted")
       autoRecordingAppName = nil

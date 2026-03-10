@@ -23,6 +23,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
   nonisolated let onAudioLevel: (@Sendable (Float) -> Void)?
+  nonisolated let onLowDiskSpace: (@Sendable (Int64) -> Void)?
 
   private let audioQueue = DispatchQueue(label: "com.tenequm.blackbox.audio")
 
@@ -41,11 +42,14 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var deviceListenerRegistered = false
   nonisolated(unsafe) private var lastLevelTime: UInt64 = 0
   nonisolated(unsafe) private var writerFailureReported = false
+  nonisolated(unsafe) private var diskSpaceTimer: DispatchSourceTimer?
+  nonisolated(unsafe) private var lowDiskSpaceWarned = false
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool, saveDirectory: URL,
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
-    onAudioLevel: (@Sendable (Float) -> Void)? = nil
+    onAudioLevel: (@Sendable (Float) -> Void)? = nil,
+    onLowDiskSpace: (@Sendable (Int64) -> Void)? = nil
   ) {
     self.bundleID = bundleID
     self.appName = appName
@@ -53,6 +57,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     self.saveDirectory = saveDirectory
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
+    self.onLowDiskSpace = onLowDiskSpace
   }
 
   deinit {
@@ -126,6 +131,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       try await stream.startCapture()
       Log.recorder.info("stream started for \(self.appName, privacy: .public)")
       addDeviceListener()
+      startDiskSpaceMonitor()
     } catch {
       Log.error(Log.recorder, "recorder", "stream failed to start for \(appName): \(error)")
       audioQueue.sync {
@@ -168,6 +174,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       capturedAudioFileURL = audioFileURL
       capturedMicEnabled = micInput != nil
       stopped = true
+      diskSpaceTimer?.cancel()
+      diskSpaceTimer = nil
+      lowDiskSpaceWarned = false
       audioInput?.markAsFinished()
       micInput?.markAsFinished()
       audioInput = nil
@@ -259,6 +268,31 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         Log.error(Log.recorder, "recorder", "updateConfiguration failed: \(error)")
         onFailure?(.deviceChangeFailed)
       }
+    }
+  }
+
+  private func startDiskSpaceMonitor() {
+    let timer = DispatchSource.makeTimerSource(queue: audioQueue)
+    timer.schedule(deadline: .now() + 30, repeating: 30)
+    timer.setEventHandler { [weak self] in
+      self?.checkDiskSpace()
+    }
+    timer.resume()
+    diskSpaceTimer = timer
+  }
+
+  private func checkDiskSpace() {
+    guard !stopped else { return }
+    let attrs = try? FileManager.default.attributesOfFileSystem(forPath: saveDirectory.path)
+    guard let freeBytes = attrs?[.systemFreeSize] as? Int64 else { return }
+
+    if freeBytes < 100_000_000 {
+      Log.error(Log.recorder, "recorder", "critical disk space (\(freeBytes) bytes), stopping")
+      onFailure?(.lowDiskSpace)
+    } else if freeBytes < 500_000_000, !lowDiskSpaceWarned {
+      lowDiskSpaceWarned = true
+      Log.info(Log.recorder, "recorder", "low disk space warning (\(freeBytes) bytes)")
+      onLowDiskSpace?(freeBytes)
     }
   }
 
@@ -556,5 +590,6 @@ enum RecorderFailure: Sendable {
   case systemStopped
   case permissionDenied
   case deviceChangeFailed
+  case lowDiskSpace
   case other(String)
 }

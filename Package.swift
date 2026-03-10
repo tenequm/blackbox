@@ -23,5 +23,25 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
             ]
         ),
+        .testTarget(
+            name: "BlackboxTests",
+            dependencies: ["Blackbox"],
+            path: "Tests",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .defaultIsolation(MainActor.self),
+                .unsafeFlags([
+                    "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+                ]),
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+                    "-Xlinker", "-rpath",
+                    "-Xlinker",
+                    "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+                ]),
+            ]
+        ),
     ]
 )

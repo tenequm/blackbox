@@ -217,6 +217,10 @@ struct MenuContent: View {
       updater.checkForUpdates()
     }
 
+    Button("Report a Bug") {
+      NSWorkspace.shared.open(URL(string: "https://github.com/tenequm/blackbox/issues/new")!)
+    }
+
     Button("Settings...") {
       selectedTab = .settings
       openWindow(id: "main")

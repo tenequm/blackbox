@@ -16,7 +16,11 @@ Sources/
   RecordingHUD.swift       - Floating NSPanel toast (top-right), recording start + save with click-to-reveal
   Log.swift                - OSLog + file logging, debug export
 Info.plist                 - LSUIElement, NSMicrophoneUsageDescription
-Makefile                   - build, bundle, dmg, release, install, run, format, clean
+Makefile                   - build, bundle, dmg, release, install, run, format, test, check, clean
+Tests/
+  BlackboxTests.swift      - Swift Testing placeholder (framework ready, tests TBD)
+.claude/skills/
+  release-dmg/SKILL.md     - /release-dmg slash command for full release automation
 ```
 
 ## Build & Run
@@ -28,7 +32,9 @@ make dmg        # bundle + create DMG with Applications symlink
 make release    # dmg + notarize + staple
 make install    # bundle + copy to /Applications
 make run        # bundle + open .app
-make format     # swift-format --recursive Sources/ --in-place
+make test       # swift test (Swift Testing framework)
+make check      # format + build + test (full validation)
+make format     # swift-format --recursive Sources/ Tests/ --in-place
 make clean      # remove build artifacts
 ```
 
@@ -47,47 +53,34 @@ make clean      # remove build artifacts
 ### No external linters needed
 The Swift 6 compiler with strict concurrency + warnings-as-errors catches more real bugs than SwiftLint. swift-format handles style consistency.
 
+## Testing
+
+- **Framework**: Swift Testing (built into Swift 6.0+ toolchain)
+- **Run**: `make test` or `swift test`
+- **Test target**: `BlackboxTests` in `Tests/` directory
+- **Isolation**: Same `defaultIsolation(MainActor.self)` as production code
+- Tests require CLT framework search paths (configured in Package.swift via unsafeFlags)
+
 ## Pre-Release Checklist
 
-1. **Format**: `make format`
-2. **Build**: `make build` - must compile with zero errors (warnings are errors)
-3. **Bundle**: `make bundle` - creates signed .app with correct bundle ID
-4. **Test install**: `make install && open /Applications/Blackbox.app`
-5. **Verify permissions**: First launch should prompt for Screen Recording (as "Blackbox", not terminal)
-6. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
-7. **Test manual recording**: Menu > Record Now - should record and stop cleanly
-8. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
-9. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
-10. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
+1. **Automated**: `make check` (format + build + test)
+2. **Manual smoke test**: `make install && open /Applications/Blackbox.app`
+3. **Verify permissions**: First launch should prompt for Screen Recording (as "Blackbox", not terminal)
+4. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
+5. **Test manual recording**: Menu > Record Now - should record and stop cleanly
+6. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
+7. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
+8. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
 
 ## Release Process
+
+Use the `/release-dmg <version>` slash command to automate the full release pipeline.
+
+The command handles: version bump (Makefile + Info.plist + CHANGELOG.md), format + build + test, DMG creation, Sparkle signing, git commit + push + tag, GitHub release with changelog notes and appcast.xml.
 
 Version is tracked in two places that must stay in sync:
 - `Makefile` - `VERSION = X.Y.Z` (used for DMG filename)
 - `Info.plist` - `CFBundleShortVersionString` (shown in app) + `CFBundleVersion` (build number)
-
-Steps to release a new version:
-
-```sh
-# 1. Bump version in Makefile (VERSION) and Info.plist (CFBundleShortVersionString + CFBundleVersion)
-# 2. Commit and push
-git add -A && git commit -m "chore: bump version to X.Y.Z" && git push
-
-# 3. Build, create DMG, notarize, and staple
-make release
-
-# 4. Generate Sparkle appcast signature
-SIG=$(.build/artifacts/sparkle/Sparkle/bin/sign_update build/Blackbox-X.Y.Z.dmg)
-
-# 5. Create GitHub release with DMG and appcast.xml
-#    - Generate appcast.xml with version, DMG URL, signature, and file size
-#    - Attach both the DMG and appcast.xml to the release
-gh release create vX.Y.Z build/Blackbox-X.Y.Z.dmg appcast.xml \
-  --title "Blackbox X.Y.Z" --notes "Release notes here"
-
-# 6. Clean up local appcast.xml (it's a release asset, not tracked in repo)
-rm -f appcast.xml
-```
 
 Notary uses keychain profile `blackbox` (configured via `xcrun notarytool store-credentials`).
 Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/appcast.xml`.

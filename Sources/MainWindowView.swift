@@ -362,6 +362,19 @@ struct RecordingDetailView: View {
       teardownPlayer()
       cancelTranscription()
     }
+    .focusable()
+    .onKeyPress(.space) {
+      togglePlayback()
+      return .handled
+    }
+    .onKeyPress(.leftArrow) {
+      skip(by: -15)
+      return .handled
+    }
+    .onKeyPress(.rightArrow) {
+      skip(by: 15)
+      return .handled
+    }
   }
 
   // MARK: - Header

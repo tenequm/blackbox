@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-10
+
 ### Added
 
 - Per-process mic detection using macOS 14.2+ CoreAudio APIs (`kAudioProcessPropertyIsRunningInput`) - replaces system-wide `DeviceIsRunningSomewhere` listener
@@ -22,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disk space pre-check (50 MB minimum) before starting a recording
 - Restart rate limiting for auto-recovery (max 3 restarts per 30-second window)
 - Virtual audio processor exclusion (Krisp, SoundSource, Loopback) to prevent voice duplication
+- "Report a Bug" menu item (opens GitHub issues)
+- Keyboard shortcuts for playback: Space (play/pause), Left/Right arrows (skip 15s)
+- Low disk space monitoring during recording (warning at 500 MB, auto-stop at 100 MB)
+- Polished DMG installer with proper icon layout via `create-dmg`
+- Swift Testing framework setup (`make test`, `make check`)
+- `/release-dmg` slash command for automated release pipeline
 
 ### Changed
 
@@ -84,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tenequm/blackbox/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/tenequm/blackbox/releases/tag/v0.1.0

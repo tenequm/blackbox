@@ -1,5 +1,5 @@
 APP_NAME = Blackbox
-VERSION = 0.2.0
+VERSION = 0.3.0
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
 DMG_NAME = $(APP_NAME)-$(VERSION).dmg
@@ -7,7 +7,7 @@ SPARKLE_PATH = $(shell find .build/artifacts -name "Sparkle.framework" -path "*/
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format dmg release
+.PHONY: build bundle install run clean format test check dmg release
 
 build:
 	swift build -c release
@@ -43,13 +43,18 @@ run: bundle
 	open "$(APP_BUNDLE)"
 
 dmg: bundle
-	rm -rf "$(BUILD_DIR)/dmg-stage"
-	mkdir -p "$(BUILD_DIR)/dmg-stage"
-	cp -R "$(APP_BUNDLE)" "$(BUILD_DIR)/dmg-stage/"
-	ln -s /Applications "$(BUILD_DIR)/dmg-stage/Applications"
+	@command -v create-dmg >/dev/null 2>&1 || { echo "ERROR: create-dmg not found. Install via: brew install create-dmg"; exit 1; }
 	rm -f "$(BUILD_DIR)/$(DMG_NAME)"
-	hdiutil create -volname "$(APP_NAME)" -srcfolder "$(BUILD_DIR)/dmg-stage" -ov -format UDZO "$(BUILD_DIR)/$(DMG_NAME)"
-	rm -rf "$(BUILD_DIR)/dmg-stage"
+	create-dmg \
+		--volname "$(APP_NAME)" \
+		--window-pos 200 120 \
+		--window-size 540 380 \
+		--icon-size 128 \
+		--icon "$(APP_NAME).app" 140 190 \
+		--app-drop-link 400 190 \
+		--no-internet-enable \
+		"$(BUILD_DIR)/$(DMG_NAME)" \
+		"$(APP_BUNDLE)"
 	@echo "DMG created: $(BUILD_DIR)/$(DMG_NAME)"
 
 release: dmg
@@ -58,8 +63,14 @@ release: dmg
 	xcrun stapler staple "$(BUILD_DIR)/$(DMG_NAME)"
 	@echo "Notarized: $(BUILD_DIR)/$(DMG_NAME)"
 
+test:
+	swift test
+
+check: format build test
+	@echo "All checks passed."
+
 format:
-	swift-format --recursive Sources/ --in-place
+	swift-format --recursive Sources/ Tests/ --in-place
 
 clean:
 	swift package clean
