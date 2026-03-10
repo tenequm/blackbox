@@ -242,9 +242,8 @@ struct SettingsView: View {
       var totalBytes = 0
 
       for dir in files
-      where dir.pathExtension == "blackbox"
-        || FileManager.default.fileExists(
-          atPath: dir.appendingPathComponent("audio.m4a").path)
+      where FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent("audio.m4a").path)
       {
         let audioURL = dir.appendingPathComponent("audio.m4a")
         if let size = try? audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {

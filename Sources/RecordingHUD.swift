@@ -5,7 +5,7 @@ final class RecordingHUD {
   private var panel: HUDPanel?
   private var hideTask: Task<Void, Never>?
 
-  func showRecordingStarted(appName: String, bundleID: String?) {
+  func showRecordingStarted(appName: String) {
     show(
       content: HUDContentView(
         title: "Recording Started",
@@ -13,6 +13,8 @@ final class RecordingHUD {
         icon: NSApplication.shared.applicationIconImage
       ))
   }
+
+  static let openMainWindowNotification = Notification.Name("RecordingHUD.openMainWindow")
 
   func showRecordingSaved(appName: String) {
     show(
@@ -23,12 +25,7 @@ final class RecordingHUD {
       ),
       duration: 10,
       onClick: {
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        for window in NSApplication.shared.windows
-        where !(window is NSPanel) && window.canBecomeMain {
-          window.makeKeyAndOrderFront(nil)
-          return
-        }
+        NotificationCenter.default.post(name: RecordingHUD.openMainWindowNotification, object: nil)
       }
     )
   }
@@ -139,6 +136,7 @@ private struct HUDContentView: View {
           .foregroundStyle(.secondary)
       }
     }
+    .fixedSize()
     .padding(.horizontal, 16)
     .padding(.vertical, 12)
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))

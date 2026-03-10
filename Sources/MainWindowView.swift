@@ -140,9 +140,8 @@ struct RecordingsView: View {
       var results: [RecordingFile] = []
 
       for url in files
-      where url.pathExtension == "blackbox"
-        || FileManager.default.fileExists(
-          atPath: url.appendingPathComponent("audio.m4a").path)
+      where FileManager.default.fileExists(
+        atPath: url.appendingPathComponent("audio.m4a").path)
       {
         let audioURL = url.appendingPathComponent("audio.m4a")
         guard FileManager.default.fileExists(atPath: audioURL.path) else { continue }
@@ -318,6 +317,8 @@ struct RecordingDetailView: View {
   @State private var timeObserver: Any?
   @State private var isDragging = false
   @State private var playerError: String?
+  @State private var waveformSamples: [Float] = []
+  @State private var trackSelection: TrackSelection = .both
 
   // UI
   @State private var showDeleteConfirmation = false
@@ -453,20 +454,31 @@ struct RecordingDetailView: View {
 
   private var playbackControls: some View {
     VStack(spacing: 8) {
-      Slider(
-        value: $currentTime,
-        in: 0...max(duration, 0.01)
-      ) { editing in
-        isDragging = editing
-        if !editing {
-          seekTo(currentTime)
+      WaveformView(
+        samples: waveformSamples,
+        progress: duration > 0 ? currentTime / duration : 0,
+        onSeek: { fraction in
+          let time = fraction * duration
+          seekTo(time)
         }
-      }
+      )
+      .frame(height: 48)
 
       HStack {
         Text(formatTime(currentTime))
           .font(.caption.monospacedDigit())
           .foregroundStyle(.secondary)
+        Spacer()
+        Picker("", selection: $trackSelection) {
+          ForEach(TrackSelection.allCases) { t in
+            Text(t.label).tag(t)
+          }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 180)
+        .onChange(of: trackSelection) { _, newValue in
+          applyTrackSelection(newValue)
+        }
         Spacer()
         Text("-\(formatTime(max(0, duration - currentTime)))")
           .font(.caption.monospacedDigit())
@@ -510,11 +522,13 @@ struct RecordingDetailView: View {
     playerError = nil
     currentTime = 0
 
-    // Get duration once asset is loaded
+    // Get duration + waveform once asset is loaded
     Task {
       do {
         let dur = try await asset.load(.duration)
         duration = dur.seconds.isFinite ? dur.seconds : 0
+        let samples = await WaveformExtractor.extract(from: recording.audioURL)
+        waveformSamples = samples
       } catch {
         playerError = error.localizedDescription
         Log.error(
@@ -578,6 +592,19 @@ struct RecordingDetailView: View {
     let cmTime = CMTime(seconds: time, preferredTimescale: 600)
     player?.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
     currentTime = time
+  }
+
+  private func applyTrackSelection(_ selection: TrackSelection) {
+    guard let tracks = player?.currentItem?.tracks else { return }
+    let audioTracks = tracks.filter { $0.assetTrack?.mediaType == .audio }
+    // Track 0 = system audio, Track 1 = mic (if present)
+    for (i, track) in audioTracks.enumerated() {
+      switch selection {
+      case .both: track.isEnabled = true
+      case .system: track.isEnabled = (i == 0)
+      case .mic: track.isEnabled = (i != 0)
+      }
+    }
   }
 
   private func skip(by seconds: TimeInterval) {
@@ -911,6 +938,20 @@ private struct TranscriptSegmentView: View {
   }
 }
 
+// MARK: - Track Selection
+
+enum TrackSelection: String, CaseIterable, Identifiable {
+  case both, system, mic
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .both: "Both"
+    case .system: "System"
+    case .mic: "Mic"
+    }
+  }
+}
+
 // MARK: - Recording File
 
 struct RecordingFile: Identifiable {
@@ -924,5 +965,137 @@ struct RecordingFile: Identifiable {
 
   var sizeFormatted: String {
     ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+  }
+}
+
+// MARK: - Waveform View
+
+private struct WaveformView: View {
+  let samples: [Float]
+  let progress: Double
+  let onSeek: (Double) -> Void
+
+  var body: some View {
+    GeometryReader { geo in
+      Canvas { context, size in
+        guard !samples.isEmpty else { return }
+        let barWidth: CGFloat = 2
+        let gap: CGFloat = 1.5
+        let step = barWidth + gap
+        let barCount = Int(size.width / step)
+        guard barCount > 0 else { return }
+
+        let midY = size.height / 2
+        let maxAmp = size.height / 2 - 1
+
+        for i in 0..<barCount {
+          let sampleIdx = i * samples.count / barCount
+          let amp = CGFloat(samples[min(sampleIdx, samples.count - 1)])
+          let barHeight = max(2, amp * maxAmp)
+          let x = CGFloat(i) * step
+          let fraction = Double(i) / Double(barCount)
+          let color: Color = fraction <= progress ? .accentColor : .secondary.opacity(0.3)
+
+          let rect = CGRect(
+            x: x,
+            y: midY - barHeight,
+            width: barWidth,
+            height: barHeight * 2
+          )
+          context.fill(
+            Path(roundedRect: rect, cornerRadius: 1),
+            with: .color(color)
+          )
+        }
+      }
+      .contentShape(Rectangle())
+      .gesture(
+        DragGesture(minimumDistance: 0)
+          .onChanged { value in
+            let fraction = max(0, min(1, value.location.x / geo.size.width))
+            onSeek(fraction)
+          }
+      )
+    }
+  }
+}
+
+// MARK: - Waveform Extractor
+
+enum WaveformExtractor {
+  nonisolated static let bucketCount = 300
+
+  static func extract(from url: URL) async -> [Float] {
+    let asset = AVURLAsset(url: url)
+    guard
+      let tracks = try? await asset.loadTracks(withMediaType: .audio),
+      !tracks.isEmpty,
+      let reader = try? AVAssetReader(asset: asset)
+    else { return [] }
+    return await Task.detached {
+      extractSync(tracks: tracks, reader: reader)
+    }.value
+  }
+
+  nonisolated private static func extractSync(tracks: [AVAssetTrack], reader: AVAssetReader)
+    -> [Float]
+  {
+    let outputSettings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatLinearPCM,
+      AVLinearPCMBitDepthKey: 16,
+      AVLinearPCMIsFloatKey: false,
+      AVLinearPCMIsBigEndianKey: false,
+      AVLinearPCMIsNonInterleaved: false,
+    ]
+    // AudioMixOutput combines all tracks into a single mixed stream
+    let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: outputSettings)
+    output.alwaysCopiesSampleData = false
+    reader.add(output)
+    guard reader.startReading() else { return [] }
+
+    // First pass: collect all samples into a flat buffer
+    var allSamples: [Int16] = []
+    allSamples.reserveCapacity(48000 * 60 * 5)  // ~5 min at 48kHz pre-alloc
+
+    while let buffer = output.copyNextSampleBuffer() {
+      guard let blockBuffer = CMSampleBufferGetDataBuffer(buffer) else { continue }
+      let length = CMBlockBufferGetDataLength(blockBuffer)
+      let sampleCount = length / MemoryLayout<Int16>.size
+      let startIndex = allSamples.count
+      allSamples.append(contentsOf: repeatElement(0, count: sampleCount))
+      allSamples.withUnsafeMutableBufferPointer { ptr in
+        _ = CMBlockBufferCopyDataBytes(
+          blockBuffer, atOffset: 0, dataLength: length,
+          destination: ptr.baseAddress!.advanced(by: startIndex))
+      }
+    }
+
+    guard !allSamples.isEmpty else { return [] }
+
+    // Second pass: downsample into buckets
+    let samplesPerBucket = max(1, allSamples.count / bucketCount)
+    var result = [Float](repeating: 0, count: bucketCount)
+
+    for i in 0..<bucketCount {
+      let start = i * samplesPerBucket
+      let end = min(start + samplesPerBucket, allSamples.count)
+      guard start < end else { continue }
+      var sum: Float = 0
+      for j in start..<end {
+        let s = Float(allSamples[j]) / 32768.0
+        sum += s * s
+      }
+      result[i] = (sum / Float(end - start)).squareRoot()
+    }
+
+    // Normalize to 0...1
+    let peak = result.max() ?? 1
+    if peak > 0 {
+      for i in 0..<result.count {
+        result[i] /= peak
+      }
+    }
+
+    return result
   }
 }

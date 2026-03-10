@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Waveform visualization in recording detail view (amplitude bars via Canvas, click/drag to seek)
+- Track selector (Both/System/Mic) for playback controls
+- System notification when Screen Recording permission is revoked during recording
+- Input+output check for call detection (filters out dictation, Siri, voice memos)
+
+### Changed
+
+- Mic capture uses AVAudioEngine instead of SCStream `.microphone` (independent pipeline, automatic device following)
+- Call detection uses polling-only (no CoreAudio property listeners)
+- Dual-track M4A is now the final output format (no post-recording mixing)
+- Display-wide audio capture no longer excludes any apps
+
+### Fixed
+
+- `dispatch_assert_queue_fail` crash in disk space monitor (MainActor isolation inherited by DispatchSource handler on audioQueue)
+- Config change data race: AVAudioEngine handler now dispatches to audioQueue instead of running on arbitrary CoreAudio thread
+- Format mismatch on mic device change: preserves original tap format so AVAssetWriterInput encoder doesn't fail mid-stream
+- Inaccurate mic timestamps: uses AVAudioTime from tap callback via CMClockMakeHostTimeFromSystemUnits for proper multi-track sync
+- Idle sleep could interrupt recording: changed ProcessInfo activity to `.userInitiated` (prevents sleep)
+- Auto-recording not retried when initial start fails during active call
+- Silent file loss on finishWriting timeout: now saves partial file (playable due to movieFragmentInterval)
+
+### Removed
+
+- Apple Voice Processing (`setVoiceProcessingEnabled`) - removed for reliability (VPIO aggregate device caused format issues)
+- Post-recording audio mixing (AVMutableComposition + AVAssetExportSession)
+- Virtual audio processor exclusion list (Krisp, SoundSource, Loopback)
+- CoreAudio device change listener for mic following
+- CoreAudio process list and per-process input listeners (~140 lines)
+- Dead code: `Log.fault`, unused `TranscriptionService` error cases, stale `.blackbox` path checks
+
 ## [0.3.0] - 2026-03-10
 
 ### Added

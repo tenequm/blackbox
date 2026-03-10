@@ -1,6 +1,6 @@
 # Blackbox
 
-macOS menu bar app that auto-records call audio using ScreenCaptureKit. Detects calls via CoreAudio microphone activity monitoring.
+macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per-process audio state polling. Captures system audio via ScreenCaptureKit and mic via AVAudioEngine as independent pipelines.
 
 ## Project Structure
 
@@ -8,8 +8,8 @@ macOS menu bar app that auto-records call audio using ScreenCaptureKit. Detects 
 Package.swift              - SPM manifest, macOS 15+, Swift 6.2
 Sources/
   BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
-  AudioMonitor.swift       - @Observable: mic activity detection, auto/manual recording lifecycle
-  AudioRecorder.swift      - SCStream + AVAssetWriter, dual-track capture + auto-mix on save
+  AudioMonitor.swift       - @Observable: call detection (polling), auto/manual recording lifecycle
+  AudioRecorder.swift      - SCStream (system audio) + AVAudioEngine (mic) + AVAssetWriter, dual-track capture
   MainWindowView.swift     - Main window: TabView with Recordings table + Settings
   SettingsView.swift       - Settings UI, defaults constants
   OnboardingView.swift     - First-launch onboarding: permissions walkthrough
@@ -87,19 +87,21 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 ## Key Architecture Decisions
 
-- **Per-process mic detection** drives recording lifecycle. CoreAudio per-process APIs (`kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`) enumerate which specific processes have active mic input, filtering out Blackbox's own PID and ScreenCaptureKit XPC helpers (`com.apple.screencapturekit*`, `com.apple.replayd`). This allows auto-recordings to capture both system audio AND mic without a detection feedback loop. A 3-second polling fallback catches cases where listeners don't fire. Requires macOS 14.2+.
-- **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks run on a background dispatch queue (`audioQueue`). Thread safety: `stop()` dispatches `markAsFinished()` on `audioQueue.sync` to serialize with callbacks.
-- **Dual-track capture + auto-mix**: system audio + mic captured as separate AVAssetWriterInputs (standard ScreenCaptureKit pattern), then auto-mixed to single-track M4A on save via AVMutableComposition + AVAssetExportSession. The mix step atomically replaces the dual-track file. If mix fails, the dual-track file is kept as fallback. Virtual audio processors (Krisp, SoundSource, Loopback) are excluded from display-wide capture to prevent voice duplication.
-- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (finalizing AVAssetWriter + mix step) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
-- **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (mic failed, system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures. Manual recordings also auto-restart.
-- **Device following**: CoreAudio `AudioObjectAddPropertyListener` monitors default input device changes. `updateConfiguration()` switches mic seamlessly on running stream; falls back to stream restart on failure.
+- **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio per-process APIs enumerate processes with BOTH `IsRunningInput` AND `IsRunningOutput` (filtering out own PID and ScreenCaptureKit helpers). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code. Requires macOS 14.2+.
+- **Two independent capture pipelines**: SCStream captures system audio only (`captureMicrophone = false`). AVAudioEngine captures mic independently via `inputNode.installTap()`. Either can fail without affecting the other. No virtual audio exclusion list needed.
+- **AVAudioEngine device following**: On hardware change, `AVAudioEngineConfigurationChange` notification fires. Handler reinstalls tap and restarts engine (sub-second gap, same file). Replaces manual CoreAudio device listener + `updateConfiguration()`.
+- **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
+- **Dual-track M4A, no mixing**: system audio + mic written as separate AVAssetWriterInputs. No post-processing. Session starts on first system audio sample; mic samples before that are dropped.
+- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
+- **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
 
 ## Concurrency Model
 
 With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
-- AudioMonitor is `@unchecked Sendable` for CoreAudio callback Unmanaged pointer dance
-- AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state
+- AudioMonitor is purely MainActor-isolated (no `@unchecked Sendable` needed - polling-only, no C callbacks)
+- AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state on `audioQueue`
 - SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called on background queues)
-- Callbacks hop to MainActor via `Task { @MainActor in ... }`
+- AVAudioEngine tap callback dispatches to `audioQueue` via `audioQueue.async` to serialize with SCStream callbacks
+- AVAudioEngine config change observer is `nonisolated` (fires on NotificationCenter delivery thread, dispatches to `audioQueue` for thread safety)

@@ -94,19 +94,15 @@ nonisolated enum TranscriptionStatus: Equatable, Sendable {
 }
 
 nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
-  case noAPIKey
   case uploadFailed(String)
   case transcriptionFailed(String)
   case pollTimeout
-  case cancelled
 
   var errorDescription: String? {
     switch self {
-    case .noAPIKey: "Soniox API key not configured"
     case .uploadFailed(let msg): "Upload failed: \(msg)"
     case .transcriptionFailed(let msg): "Transcription failed: \(msg)"
     case .pollTimeout: "Transcription timed out"
-    case .cancelled: "Transcription cancelled"
     }
   }
 }
@@ -372,7 +368,7 @@ final class TranscriptionService {
   // MARK: - Fetch Transcript
 
   private func fetchTranscript(
-    transcriptionId: String, allowEmpty: Bool = false
+    transcriptionId: String
   ) async throws -> TranscriptDocument {
     let request = try makeRequest(
       .get, "/v1/transcriptions/\(transcriptionId)/transcript")
@@ -382,9 +378,6 @@ final class TranscriptionService {
     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
       let tokens = json["tokens"] as? [[String: Any]], !tokens.isEmpty
     else {
-      if allowEmpty {
-        return TranscriptDocument(segments: [], language: nil, createdAt: Date())
-      }
       throw TranscriptionError.transcriptionFailed("empty or invalid transcript response")
     }
 
@@ -486,7 +479,6 @@ final class TranscriptionService {
   private enum HTTPMethod: String {
     case get = "GET"
     case post = "POST"
-    case delete = "DELETE"
   }
 
   private func makeRequest(_ method: HTTPMethod, _ path: String) throws -> URLRequest {

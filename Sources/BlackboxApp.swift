@@ -21,8 +21,6 @@ struct BlackboxApp: App {
     MenuBarExtra {
       MenuContent(monitor: monitor, updater: updaterController.updater, selectedTab: $selectedTab)
     } label: {
-      // Menu bar images are rendered as template images by macOS - foregroundStyle
-      // and symbolRenderingMode have no effect. State is conveyed via distinct SF Symbols.
       if monitor.permissionNeeded || monitor.errorMessage != nil {
         Image(systemName: "exclamationmark.triangle.fill")
       } else if monitor.isRecording {
@@ -30,14 +28,14 @@ struct BlackboxApp: App {
           HStack(spacing: 4) {
             Image(systemName: "waveform.circle")
             Text(String(format: "0:%02d", Int(ceil(grace))))
-              .monospacedDigit()
+              .frame(width: 32, alignment: .leading)
           }
         } else {
           HStack(spacing: 4) {
             Image(systemName: recordingWaveformIcon(level: monitor.audioLevel))
             if let elapsed = monitor.formattedElapsed {
               Text(elapsed)
-                .monospacedDigit()
+                .frame(width: 38, alignment: .leading)
             }
           }
         }
@@ -234,6 +232,13 @@ struct MenuContent: View {
       NSApplication.shared.terminate(nil)
     }
     .keyboardShortcut("q")
+    .onReceive(
+      NotificationCenter.default.publisher(for: RecordingHUD.openMainWindowNotification)
+    ) { _ in
+      selectedTab = .recordings
+      openWindow(id: "main")
+      NSApplication.shared.activate(ignoringOtherApps: true)
+    }
   }
 
 }
@@ -263,15 +268,15 @@ private struct AboutView: View {
 
 // MARK: - Helpers
 
-/// Maps audio RMS level to a speaker SF Symbol.
+/// Maps audio RMS level to a waveform SF Symbol.
 /// Thresholds tuned for typical call audio captured via ScreenCaptureKit.
 private func recordingWaveformIcon(level: Float) -> String {
   if level > 0.05 {
-    return "speaker.wave.3"
+    return "waveform"
   } else if level > 0.01 {
-    return "speaker.wave.2"
+    return "waveform.mid"
   } else {
-    return "speaker.wave.1"
+    return "waveform.low"
   }
 }
 

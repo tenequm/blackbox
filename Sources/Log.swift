@@ -21,12 +21,6 @@ nonisolated enum Log {
     logger.error("\(message, privacy: .public)")
     LogFile.write("ERROR", category, message)
   }
-
-  /// Log fault to both os.Logger and file.
-  nonisolated static func fault(_ logger: Logger, _ category: String, _ message: String) {
-    logger.fault("\(message, privacy: .public)")
-    LogFile.write("FAULT", category, message)
-  }
 }
 
 // MARK: - File Sink
