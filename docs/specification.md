@@ -36,7 +36,7 @@ This document records architectural decisions and their reasoning. Implementatio
 │  │  System audio only     │       │  Mic via inputNode tap       │  │
 │  │  captureMicrophone     │       │                              │  │
 │  │    = false             │       │  Follows system default      │  │
-│  │  Display-wide filter   │       │  device automatically        │  │
+│  │  Display-wide filter   │       │                              │  │
 │  │  No app exclusion list │       │                              │  │
 │  └───────────┬────────────┘       └──────────────┬───────────────┘  │
 │              │                                   │                  │
@@ -138,3 +138,18 @@ Architectural decisions with reasoning and alternatives considered.
 **Decision:** When Screen Recording permission is revoked (macOS 15+ monthly re-auth), send a system notification in addition to the menu bar indicator.
 
 **Why:** During a call, the user is focused on the call app and may not notice the menu bar state change. System notifications appear in Notification Center regardless of focus. The notification informs the user that mic is still recording and guides them to re-authorize.
+
+### D7: No Voice Processing (VPIO incompatible with SCStream)
+
+**Decision:** Do not enable `setVoiceProcessingEnabled(true)` on AVAudioEngine's inputNode. Accept mic-side echo in dual-track recordings.
+
+**The problem:** Without AEC, the mic track picks up the remote person's voice through speakers. Playing both tracks simultaneously produces audible echo/doubling. The track selector (Both/System/Mic) lets users isolate tracks during playback.
+
+**Why VPIO was rejected:** Tested and confirmed that VPIO's aggregate device silences SCStream's system audio capture. VPIO hooks into the system audio output path to get its AEC reference signal, which interferes with SCStream's display-wide capture. The alona project independently confirmed: "When capturing system audio, voice processing causes audio quality issues." This is a fundamental incompatibility - VPIO and SCStream system audio cannot coexist.
+
+**Alternatives considered:**
+- **SCStream `.microphone`** (macOS 15+): Avoids VPIO conflict but delivers raw mic audio (no AEC). Loses automatic device following (the main reason we use AVAudioEngine - see D1).
+- **Post-processing DSP**: No reliable open-source macOS implementation for echo cancellation.
+- **CoreAudio Process Taps for system audio**: Different capture mechanism that might not conflict with VPIO, but major architectural change with uncertain benefit.
+
+**Tradeoff accepted:** Mic track contains echo of remote audio. Mitigated by track selector in playback UI and TranscriptionService mixing tracks before upload to Soniox.
