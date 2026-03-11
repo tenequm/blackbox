@@ -338,6 +338,7 @@ struct RecordingDetailView: View {
 
   // UI
   @State private var showDeleteConfirmation = false
+  @State private var isProcessingAEC = false
 
   // Metadata
   @State private var metadata: RecordingMetadata?
@@ -440,6 +441,21 @@ struct RecordingDetailView: View {
             Image(systemName: "doc.text")
           }
           .help("Export Transcript")
+        }
+
+        if !recording.hasProcessed {
+          Button {
+            runAEC()
+          } label: {
+            if isProcessingAEC {
+              ProgressView()
+                .controlSize(.small)
+            } else {
+              Image(systemName: "waveform.badge.magnifyingglass")
+            }
+          }
+          .help("Remove echo from mic track")
+          .disabled(isProcessingAEC)
         }
 
         Button {
@@ -659,6 +675,18 @@ struct RecordingDetailView: View {
   private func skip(by seconds: TimeInterval) {
     let newTime = max(0, min(duration, currentTime + seconds))
     seekTo(newTime)
+  }
+
+  // MARK: - Echo Cancellation
+
+  private func runAEC() {
+    isProcessingAEC = true
+    Task {
+      await AECProcessor.process(recordingDirectory: recording.url)
+      isProcessingAEC = false
+      // Reload recordings to pick up the new processed file
+      onTitleChanged()
+    }
   }
 
   // MARK: - Metadata

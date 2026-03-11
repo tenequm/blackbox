@@ -63,6 +63,9 @@ struct BlackboxApp: App {
     private var onboardingWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+      installCrashHandler()
+      checkForPreviousCrash()
+
       // Existing users who already granted screen recording don't need onboarding
       if CGPreflightScreenCaptureAccess() {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
@@ -76,6 +79,26 @@ struct BlackboxApp: App {
 
       if willOnboard {
         showOnboarding()
+      }
+    }
+
+    private func installCrashHandler() {
+      // Mark process as running; cleared on clean exit
+      UserDefaults.standard.set(true, forKey: "processRunning")
+      NSSetUncaughtExceptionHandler { exception in
+        let reason = exception.reason ?? "Unknown"
+        Log.error(Log.app, "crash", "Uncaught exception: \(exception.name.rawValue) - \(reason)")
+      }
+    }
+
+    private func checkForPreviousCrash() {
+      let wasRunning = UserDefaults.standard.bool(forKey: "processRunning")
+      if wasRunning {
+        Log.error(Log.app, "crash", "Previous session did not exit cleanly")
+        Task {
+          try? await Task.sleep(for: .seconds(2))
+          monitor?.setError("Previous session crashed unexpectedly")
+        }
       }
     }
 
@@ -111,6 +134,7 @@ struct BlackboxApp: App {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+      UserDefaults.standard.set(false, forKey: "processRunning")
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
         return .terminateNow

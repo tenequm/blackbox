@@ -118,7 +118,7 @@ final class AudioMonitor {
 
   func clearError() { errorMessage = nil }
 
-  private func setError(_ message: String) {
+  func setError(_ message: String) {
     Log.error(Log.monitor, "monitor", message)
     errorMessage = message
     notifyError(message: message)
@@ -274,9 +274,8 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
+      if url != nil {
         notifyRecordingSaved(appName: appName)
-        Task { await AECProcessor.process(recordingDirectory: url) }
       }
       updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
@@ -570,9 +569,8 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
+      if url != nil {
         notifyRecordingSaved(appName: appName)
-        Task { await AECProcessor.process(recordingDirectory: url) }
       }
       updateAutoState()
     }

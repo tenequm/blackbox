@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-11
+
+### Fixed
+
+- Crash on echo cancellation: DTLN-aec CoreML model bundle was not included in app bundle (only present in dev builds)
+- Silent crashes now detected on next launch with error shown in menu bar
+- Uncaught Objective-C exceptions now logged before process exit
+
+### Changed
+
+- Echo cancellation is now manual (button in recording detail view) instead of automatic on recording stop
+
 ## [0.4.0] - 2026-03-11
 
 ### Added
@@ -132,7 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/tenequm/blackbox/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tenequm/blackbox/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tenequm/blackbox/compare/v0.1.0...v0.2.0

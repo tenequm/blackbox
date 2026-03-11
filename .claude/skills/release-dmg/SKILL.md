@@ -50,14 +50,15 @@ This runs: `make format` (auto-fix) -> `make build` (Swift 6.2, warnings-as-erro
 
 If any step fails, stop and report. Do NOT proceed to artifact creation with broken code.
 
-## Step 3: Build DMG
+## Step 3: Build, Notarize, Staple DMG
 
-<!-- TODO: When notarization account is approved, change this to `make release` -->
-Run DMG creation without notarization (account pending):
+Build the DMG, submit for notarization, and staple the ticket:
 
 ```bash
-make dmg
+make release
 ```
+
+This runs: `make dmg` -> `xcrun notarytool submit --wait` -> `xcrun stapler staple`.
 
 Verify the DMG exists at `build/Blackbox-X.Y.Z.dmg` and report its file size.
 
@@ -133,4 +134,4 @@ Report:
 - DMG: file size
 - GitHub release URL (from `gh release view vX.Y.Z --json url -q .url`)
 - Sparkle appcast: attached to release
-- Notarization: SKIPPED (account pending) <!-- TODO: remove when notarization works -->
+- Notarization: stapled

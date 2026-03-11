@@ -1,5 +1,5 @@
 APP_NAME = Blackbox
-VERSION = 0.4.0
+VERSION = 0.4.1
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
 DMG_NAME = $(APP_NAME)-$(VERSION).dmg
@@ -20,6 +20,9 @@ bundle: build
 	install_name_tool -add_rpath @executable_path/../Frameworks "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Assets/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
+	@for bundle in .build/arm64-apple-macosx/release/*.bundle; do \
+		[ -d "$$bundle" ] && cp -R "$$bundle" "$(APP_BUNDLE)/Contents/Resources/" && echo "Bundled: $$(basename $$bundle)"; \
+	done
 	cp -R "$(SPARKLE_PATH)" "$(APP_BUNDLE)/Contents/Frameworks/"
 	@if [ -n "$(SIGN_ID)" ]; then \
 		echo "Signing with: $(SIGN_ID)"; \
