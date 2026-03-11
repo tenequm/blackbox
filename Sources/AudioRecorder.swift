@@ -51,6 +51,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var micBuffersDroppedNotReady: Int = 0
   nonisolated(unsafe) private var micBuffersConversionFailed: Int = 0
   nonisolated(unsafe) private var micBuffersAppendFailed: Int = 0
+  nonisolated(unsafe) private var micPeakLevel: Float = 0
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
@@ -168,7 +169,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       if micEnabled {
         Log.info(
           Log.recorder, "recorder",
-          "mic stats: received=\(micBuffersReceived) appended=\(micBuffersAppended) preSession=\(micBuffersDroppedPreSession) notReady=\(micBuffersDroppedNotReady) convFail=\(micBuffersConversionFailed) appendFail=\(micBuffersAppendFailed)"
+          "mic stats: received=\(micBuffersReceived) appended=\(micBuffersAppended) preSession=\(micBuffersDroppedPreSession) notReady=\(micBuffersDroppedNotReady) convFail=\(micBuffersConversionFailed) appendFail=\(micBuffersAppendFailed) peakLevel=\(String(format: "%.6f", micPeakLevel))"
         )
       }
       wasStarted = sessionStarted
@@ -246,14 +247,30 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   // MARK: - AVAudioEngine Mic Capture
 
   private func startMicCapture() throws {
+    // Log mic permission status for diagnostics
+    let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
+    let authName: String
+    switch micAuth {
+    case .authorized: authName = "authorized"
+    case .denied: authName = "DENIED"
+    case .restricted: authName = "RESTRICTED"
+    case .notDetermined: authName = "notDetermined"
+    @unknown default: authName = "unknown(\(micAuth.rawValue))"
+    }
+
     let engine = AVAudioEngine()
     let inputNode = engine.inputNode
+
+    // Log the actual input device being used
+    let inputDeviceID = inputNode.auAudioUnit.deviceID
+    let deviceName = Self.audioDeviceName(for: inputDeviceID) ?? "unknown"
 
     let format = inputNode.inputFormat(forBus: 0)
     micTapFormat = format
     Log.info(
       Log.recorder, "recorder",
-      "mic format: \(format.channelCount)ch, \(format.sampleRate)Hz")
+      "mic format: \(format.channelCount)ch, \(format.sampleRate)Hz, device: \(deviceName) (\(inputDeviceID)), permission: \(authName)"
+    )
     let tapHandler: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = {
       [weak self] buffer, when in
       guard let self else { return }
@@ -312,6 +329,16 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       micBuffersDroppedNotReady += 1
       return
     }
+    // Track mic peak level to detect silence
+    if let floatData = buffer.floatChannelData, buffer.frameLength > 0 {
+      let samples = UnsafeBufferPointer(
+        start: floatData[0], count: Int(buffer.frameLength))
+      for s in samples {
+        let abs = Swift.abs(s)
+        if abs > micPeakLevel { micPeakLevel = abs }
+      }
+    }
+
     if input.append(sampleBuffer) {
       micBuffersAppended += 1
     } else {
@@ -464,7 +491,25 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.micBuffersDroppedNotReady = 0
       self.micBuffersConversionFailed = 0
       self.micBuffersAppendFailed = 0
+      self.micPeakLevel = 0
     }
+  }
+
+  /// Resolve CoreAudio device ID to its human-readable name.
+  nonisolated private static func audioDeviceName(for deviceID: AudioDeviceID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyDeviceNameCFString,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let buf = UnsafeMutablePointer<UnsafeRawPointer?>.allocate(capacity: 1)
+    defer { buf.deallocate() }
+    buf.initialize(to: nil)
+    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, buf) == noErr,
+      let raw = buf.pointee
+    else { return nil }
+    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
   }
 }
 
