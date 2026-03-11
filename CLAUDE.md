@@ -10,6 +10,7 @@ Sources/
   BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
   AudioMonitor.swift       - @Observable: call detection (polling), auto/manual recording lifecycle
   AudioRecorder.swift      - SCStream (system audio) + AVAudioEngine (mic) + AVAssetWriter, dual-track capture
+  AECProcessor.swift       - DTLN-aec CoreML post-processing: echo cancellation on mic track
   MainWindowView.swift     - Main window: TabView with Recordings table + Settings
   SettingsView.swift       - Settings UI, defaults constants
   OnboardingView.swift     - First-launch onboarding: permissions walkthrough
@@ -61,6 +62,11 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 - **Isolation**: Same `defaultIsolation(MainActor.self)` as production code
 - Tests require CLT framework search paths (configured in Package.swift via unsafeFlags)
 
+## Logs
+
+App logs: `~/Library/Logs/Blackbox/blackbox.log`
+Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
+
 ## Pre-Release Checklist
 
 1. **Automated**: `make check` (format + build + test)
@@ -91,7 +97,8 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 - **Two independent capture pipelines**: SCStream captures system audio only (`captureMicrophone = false`). AVAudioEngine captures mic independently via `inputNode.installTap()`. Either can fail without affecting the other. No virtual audio exclusion list needed.
 - **AVAudioEngine device following**: On hardware change, `AVAudioEngineConfigurationChange` notification fires. Handler reinstalls tap and restarts engine (sub-second gap, same file). Replaces manual CoreAudio device listener + `updateConfiguration()`.
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
-- **Dual-track M4A, no mixing**: system audio + mic written as separate AVAssetWriterInputs. No post-processing. Session starts on first system audio sample; mic samples before that are dropped.
+- **Dual-track M4A, no mixing**: system audio + mic written as separate AVAssetWriterInputs. No real-time processing. Session starts on first system audio sample; mic samples before that are dropped.
+- **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using system audio as far-end reference. Reads both tracks from `audio.m4a`, resamples to 16kHz mono, runs AEC, writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified. Playback and transcription prefer the processed file.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.

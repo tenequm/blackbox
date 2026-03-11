@@ -274,8 +274,9 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if url != nil {
+      if let url {
         notifyRecordingSaved(appName: appName)
+        Task { await AECProcessor.process(recordingDirectory: url) }
       }
       updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
@@ -569,8 +570,9 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if url != nil {
+      if let url {
         notifyRecordingSaved(appName: appName)
+        Task { await AECProcessor.process(recordingDirectory: url) }
       }
       updateAutoState()
     }

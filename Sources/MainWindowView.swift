@@ -143,10 +143,18 @@ struct RecordingsView: View {
       where FileManager.default.fileExists(
         atPath: url.appendingPathComponent("audio.m4a").path)
       {
-        let audioURL = url.appendingPathComponent("audio.m4a")
-        guard FileManager.default.fileExists(atPath: audioURL.path) else { continue }
+        let originalURL = url.appendingPathComponent("audio.m4a")
+        guard FileManager.default.fileExists(atPath: originalURL.path) else { continue }
+        // Prefer processed file for playback when available
+        let processedURL = url.appendingPathComponent("audio-processed.m4a")
+        let hasProcessed = FileManager.default.fileExists(atPath: processedURL.path)
+        let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
-        let audioValues = try? audioURL.resourceValues(forKeys: [.fileSizeKey])
+        let originalSize =
+          (try? originalURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let processedSize =
+          hasProcessed
+          ? ((try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) : 0
         let sidecar = TranscriptDocument.sidecarURL(for: url)
         results.append(
           RecordingFile(
@@ -157,7 +165,8 @@ struct RecordingsView: View {
               ?? (try? url.resourceValues(
                 forKeys: [.contentModificationDateKey]
               ).contentModificationDate) ?? .distantPast,
-            size: audioValues?.fileSize ?? 0,
+            size: originalSize + processedSize,
+            hasProcessed: hasProcessed,
             hasTranscript: FileManager.default.fileExists(atPath: sidecar.path)
           ))
       }
@@ -281,6 +290,12 @@ private struct RecordingRow: View {
               isEditing = true
             }
         }
+        if recording.hasProcessed {
+          Image(systemName: "waveform.badge.magnifyingglass")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .help("Echo cancellation applied")
+        }
         if recording.hasTranscript {
           Image(systemName: "text.quote")
             .font(.caption2)
@@ -319,6 +334,7 @@ struct RecordingDetailView: View {
   @State private var playerError: String?
   @State private var waveformSamples: [Float] = []
   @State private var trackSelection: TrackSelection = .both
+  @State private var useProcessed: Bool = true
 
   // UI
   @State private var showDeleteConfirmation = false
@@ -469,6 +485,17 @@ struct RecordingDetailView: View {
           .font(.caption.monospacedDigit())
           .foregroundStyle(.secondary)
         Spacer()
+        if recording.hasProcessed {
+          Picker("", selection: $useProcessed) {
+            Text("Original").tag(false)
+            Text("Processed").tag(true)
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 150)
+          .onChange(of: useProcessed) { _, _ in
+            switchAudioSource()
+          }
+        }
         Picker("", selection: $trackSelection) {
           ForEach(TrackSelection.allCases) { t in
             Text(t.label).tag(t)
@@ -514,8 +541,30 @@ struct RecordingDetailView: View {
     .padding()
   }
 
+  private var activeAudioURL: URL {
+    if useProcessed, recording.hasProcessed {
+      return recording.url.appendingPathComponent("audio-processed.m4a")
+    }
+    return recording.url.appendingPathComponent("audio.m4a")
+  }
+
+  private func switchAudioSource() {
+    let wasPlaying = isPlaying
+    let savedTime = currentTime
+    teardownPlayer()
+    setupPlayer()
+    if savedTime > 0, savedTime < duration {
+      seekTo(savedTime)
+    }
+    if wasPlaying {
+      player?.play()
+      isPlaying = true
+    }
+    trackSelection = .both
+  }
+
   private func setupPlayer() {
-    let asset = AVURLAsset(url: recording.audioURL)
+    let asset = AVURLAsset(url: activeAudioURL)
     let item = AVPlayerItem(asset: asset)
     let p = AVPlayer(playerItem: item)
     player = p
@@ -527,7 +576,7 @@ struct RecordingDetailView: View {
       do {
         let dur = try await asset.load(.duration)
         duration = dur.seconds.isFinite ? dur.seconds : 0
-        let samples = await WaveformExtractor.extract(from: recording.audioURL)
+        let samples = await WaveformExtractor.extract(from: activeAudioURL)
         waveformSamples = samples
       } catch {
         playerError = error.localizedDescription
@@ -961,6 +1010,7 @@ struct RecordingFile: Identifiable {
   var title: String  // from metadata.title
   let date: Date  // from metadata.createdAt
   let size: Int
+  let hasProcessed: Bool
   let hasTranscript: Bool
 
   var sizeFormatted: String {

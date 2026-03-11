@@ -250,6 +250,10 @@ struct SettingsView: View {
           count += 1
           totalBytes += size
         }
+        let processedURL = dir.appendingPathComponent("audio-processed.m4a")
+        if let size = try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+          totalBytes += size
+        }
       }
 
       return (

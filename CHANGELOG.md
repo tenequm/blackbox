@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Echo cancellation post-processing (DTLN-aec CoreML, 256-unit model) for cleaner mic recordings
+- Original/Processed audio toggle in recording detail view (defaults to processed when available)
+- Echo cancellation indicator icon in recordings list
 - Waveform visualization in recording detail view (amplitude bars via Canvas, click/drag to seek)
 - Track selector (Both/System/Mic) for playback controls
 - System notification when Screen Recording permission is revoked during recording
@@ -16,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Playback and transcription prefer echo-cancelled audio (`audio-processed.m4a`) when available
+- Processed recordings stored at 16kHz mono AAC alongside originals for size savings and debugging
 - Mic capture uses AVAudioEngine instead of SCStream `.microphone` (independent pipeline, automatic device following)
 - Call detection uses polling-only (no CoreAudio property listeners)
 - Dual-track M4A is now the final output format (no post-recording mixing)

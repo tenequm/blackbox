@@ -6,12 +6,15 @@ let package = Package(
     platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
+        .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
     ],
     targets: [
         .executableTarget(
             name: "Blackbox",
             dependencies: [
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "DTLNAecCoreML", package: "dtln-aec-coreml"),
+                .product(name: "DTLNAec256", package: "dtln-aec-coreml"),
             ],
             path: "Sources",
             swiftSettings: [
