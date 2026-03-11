@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-03-11
+
+### Fixed
+
+- False positive "Previous session crashed unexpectedly" error shown on every launch (crash detection flag was read after being overwritten)
+- Mic track silent in recordings: AVAssetWriterInput was configured for 2-channel output but AVAudioEngine mic delivers 1-channel audio
+- Mic buffer diagnostics: logs received/appended/dropped counts on recording stop for easier debugging
+
 ## [0.4.1] - 2026-03-11
 
 ### Fixed
@@ -144,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.4.1...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/tenequm/blackbox/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tenequm/blackbox/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tenequm/blackbox/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0

@@ -64,7 +64,6 @@ struct BlackboxApp: App {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       installCrashHandler()
-      checkForPreviousCrash()
 
       // Existing users who already granted screen recording don't need onboarding
       if CGPreflightScreenCaptureAccess() {
@@ -83,22 +82,21 @@ struct BlackboxApp: App {
     }
 
     private func installCrashHandler() {
-      // Mark process as running; cleared on clean exit
+      // Read previous state BEFORE marking current session as running
+      let previousSessionCrashed = UserDefaults.standard.bool(forKey: "processRunning")
       UserDefaults.standard.set(true, forKey: "processRunning")
-      NSSetUncaughtExceptionHandler { exception in
-        let reason = exception.reason ?? "Unknown"
-        Log.error(Log.app, "crash", "Uncaught exception: \(exception.name.rawValue) - \(reason)")
-      }
-    }
 
-    private func checkForPreviousCrash() {
-      let wasRunning = UserDefaults.standard.bool(forKey: "processRunning")
-      if wasRunning {
+      if previousSessionCrashed {
         Log.error(Log.app, "crash", "Previous session did not exit cleanly")
         Task {
           try? await Task.sleep(for: .seconds(2))
           monitor?.setError("Previous session crashed unexpectedly")
         }
+      }
+
+      NSSetUncaughtExceptionHandler { exception in
+        let reason = exception.reason ?? "Unknown"
+        Log.error(Log.app, "crash", "Uncaught exception: \(exception.name.rawValue) - \(reason)")
       }
     }
 

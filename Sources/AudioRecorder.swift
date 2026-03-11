@@ -45,6 +45,12 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var diskSpaceTimer: DispatchSourceTimer?
   nonisolated(unsafe) private var lowDiskSpaceWarned = false
   nonisolated(unsafe) private var micTapFormat: AVAudioFormat?
+  nonisolated(unsafe) private var micBuffersReceived: Int = 0
+  nonisolated(unsafe) private var micBuffersAppended: Int = 0
+  nonisolated(unsafe) private var micBuffersDroppedPreSession: Int = 0
+  nonisolated(unsafe) private var micBuffersDroppedNotReady: Int = 0
+  nonisolated(unsafe) private var micBuffersConversionFailed: Int = 0
+  nonisolated(unsafe) private var micBuffersAppendFailed: Int = 0
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
@@ -159,6 +165,12 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     var capturedFileURL: URL?
     var wasStarted = false
     audioQueue.sync {
+      if micEnabled {
+        Log.info(
+          Log.recorder, "recorder",
+          "mic stats: received=\(micBuffersReceived) appended=\(micBuffersAppended) preSession=\(micBuffersDroppedPreSession) notReady=\(micBuffersDroppedNotReady) convFail=\(micBuffersConversionFailed) appendFail=\(micBuffersAppendFailed)"
+        )
+      }
       wasStarted = sessionStarted
       capturedWriter = writer
       capturedFileURL = fileURL
@@ -285,13 +297,25 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   /// Handles mic audio buffer on audioQueue. Drops samples until system audio session starts.
   nonisolated private func handleMicBuffer(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
-    guard !stopped, sessionStarted else { return }
+    micBuffersReceived += 1
+    guard !stopped else { return }
+    guard sessionStarted else {
+      micBuffersDroppedPreSession += 1
+      return
+    }
     guard let sampleBuffer = buffer.asSampleBuffer(timestamp: time) else {
+      micBuffersConversionFailed += 1
       Log.recorder.warning("mic PCM-to-CMSampleBuffer conversion failed")
       return
     }
-    guard let input = micInput, input.isReadyForMoreMediaData else { return }
-    if !input.append(sampleBuffer) {
+    guard let input = micInput, input.isReadyForMoreMediaData else {
+      micBuffersDroppedNotReady += 1
+      return
+    }
+    if input.append(sampleBuffer) {
+      micBuffersAppended += 1
+    } else {
+      micBuffersAppendFailed += 1
       Log.recorder.warning("mic append failed for \(self.appName, privacy: .public)")
     }
     publishAudioLevel(sampleBuffer)
@@ -387,23 +411,30 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     )
     try metadata.save(in: dirURL)
 
-    let audioSettings: [String: Any] = [
+    let systemAudioSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
       AVSampleRateKey: 48000.0,
       AVNumberOfChannelsKey: 2,
       AVEncoderBitRateKey: 128_000,
     ]
 
+    let micAudioSettings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatMPEG4AAC,
+      AVSampleRateKey: 48000.0,
+      AVNumberOfChannelsKey: 1,
+      AVEncoderBitRateKey: 64_000,
+    ]
+
     let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
     newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
-    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: systemAudioSettings)
     input.expectsMediaDataInRealTime = true
     newWriter.add(input)
 
     var newMicInput: AVAssetWriterInput?
     if micEnabled {
-      let mi = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+      let mi = AVAssetWriterInput(mediaType: .audio, outputSettings: micAudioSettings)
       mi.expectsMediaDataInRealTime = true
       newWriter.add(mi)
       newMicInput = mi
@@ -427,6 +458,12 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.sessionStarted = false
       self.stopped = false
       self.writerFailureReported = false
+      self.micBuffersReceived = 0
+      self.micBuffersAppended = 0
+      self.micBuffersDroppedPreSession = 0
+      self.micBuffersDroppedNotReady = 0
+      self.micBuffersConversionFailed = 0
+      self.micBuffersAppendFailed = 0
     }
   }
 }
