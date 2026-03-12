@@ -36,8 +36,8 @@ This document records architectural decisions and their reasoning. Implementatio
 │  │  System audio only     │       │  Mic via inputNode tap       │  │
 │  │  captureMicrophone     │       │                              │  │
 │  │    = false             │       │  Follows system default      │  │
-│  │  Display-wide filter   │       │                              │  │
-│  │  No app exclusion list │       │                              │  │
+│  │  Per-app filter         │       │                              │  │
+│  │  Display-wide fallback  │       │                              │  │
 │  └───────────┬────────────┘       └──────────────┬───────────────┘  │
 │              │                                   │                  │
 │              ▼                                   ▼                  │
@@ -125,13 +125,24 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Why both:** Input+output together identifies processes that are both capturing mic and playing audio - the defining characteristic of a call. Filters out most false positives without maintaining a hardcoded list of known call apps.
 
-### D5: Remove virtual audio processor exclusion list
+### D5: Per-app audio capture with display-wide fallback
 
-**Decision:** No hardcoded bundle ID prefix list for filtering apps from display-wide capture.
+**Decision:** When a single calling app is detected, capture only that app's audio via `SCContentFilter(display:including:[app])`. Fall back to display-wide capture when conditions are uncertain.
 
-**Previous implementation:** Excluded `ai.krisp`, `com.rogueamoeba.SoundSource`, `com.rogueamoeba.loopback` from SCContentFilter.
+**Previous implementation:** Display-wide capture with no app exclusion list. Before that, a hardcoded exclusion list for Krisp, SoundSource, Loopback.
 
-**Why removed:** With `captureMicrophone = false` on SCStream, the voice duplication scenario does not apply to the system audio path. The exclusion list was also fragile (missed unknown apps, could exclude audio the user wants captured).
+**Why per-app:** Display-wide capture picks up audio from virtual audio processors (Krisp, Loopback, etc.) that create delayed copies of the call audio in their output path. This causes audible echo/duplication in recordings - confirmed via autocorrelation analysis showing ~53ms signal duplication from Krisp's speaker processing. Per-app capture inherently excludes these processors since they are separate processes.
+
+**Why not an exclusion list:** The previous exclusion list approach was fragile (missed unknown apps, could exclude audio the user wants). Per-app capture solves the problem generically without maintaining a list.
+
+**Helper bundle ID resolution:** CoreAudio reports Chrome/Electron helper processes (e.g., `com.google.Chrome.helper.renderer`) as the audio client, not the main app. The `.helper` suffix is stripped to resolve to the parent app's bundle ID for SCContentFilter lookup.
+
+**Fallback to display-wide when:**
+- Bundle ID is nil (process has no bundle identifier)
+- Multiple calling apps detected simultaneously (can't pick one)
+- Target app not found in SCShareableContent (crash recovery, race condition)
+
+**Tradeoff accepted:** Per-app capture excludes notification sounds and other apps' audio during calls. This is desirable for call recording - cleaner output with only call audio.
 
 ### D6: System notification for permission re-authorization
 

@@ -41,8 +41,9 @@ install: bundle
 	cp -R "$(APP_BUNDLE)" "/Applications/$(APP_NAME).app"
 	xattr -rc "/Applications/$(APP_NAME).app"
 
-run: bundle
-	-killall $(APP_NAME) 2>/dev/null; sleep 1
+run:
+	-killall $(APP_NAME) 2>/dev/null; while pgrep -x $(APP_NAME) >/dev/null 2>&1; do sleep 0.5; done
+	$(MAKE) bundle
 	open "$(APP_BUNDLE)"
 
 dmg: bundle

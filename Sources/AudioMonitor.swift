@@ -21,6 +21,8 @@ final class AudioMonitor {
   // Auto-recording triggered by call detection
   private var autoRecorder: AudioRecorder?
   private var autoRecordingAppName: String?
+  private var autoRecordingBundleID: String?
+  private var previousCallers: Set<String> = []
   // Manual recording triggered by user
   private var manualRecorder: AudioRecorder?
 
@@ -431,6 +433,9 @@ final class AudioMonitor {
   private func evaluateCallState() {
     let callers = Self.findActiveCallingProcesses()
     let running = !callers.isEmpty
+    let resolvedCallers = Set(callers.compactMap { $0.map { Self.resolveParentBundleID($0) } })
+
+    defer { previousCallers = resolvedCallers }
 
     if running != lastKnownMicRunning {
       Log.info(
@@ -438,26 +443,71 @@ final class AudioMonitor {
         "call state changed: activeCallers=\(callers.count), running=\(running)")
       lastKnownMicRunning = running
       if running {
-        handleMicBecameActive(appBundleID: callers.first ?? nil)
+        // Single caller: per-app capture. Multiple callers: nil → display-wide fallback.
+        let bundleID = callers.count == 1 ? callers.first ?? nil : nil
+        handleMicBecameActive(appBundleID: bundleID)
       } else {
         handleMicBecameInactive()
       }
+    } else if running, isRecording {
+      if resolvedCallers.count < previousCallers.count, resolvedCallers.count == 1,
+        autoRecordingBundleID == nil
+      {
+        // Callers decreased to 1 during display-wide capture. Restart with per-app capture
+        // for the remaining caller. This correctly handles both cases:
+        // - Call ended, processor lingers (Krisp): per-app for Krisp, Krisp drops soon → stop.
+        // - User closed processor, call continues: per-app for Chrome, call continues normally.
+        let remainingBundleID = callers.first ?? nil
+        Log.info(
+          Log.monitor, "monitor",
+          "callers decreased to 1 during display-wide, switching to per-app: \(remainingBundleID ?? "nil")"
+        )
+        stopAutoRecording()
+        handleMicBecameActive(appBundleID: remainingBundleID)
+      } else if resolvedCallers.count == 1, let currentCaller = resolvedCallers.first,
+        !previousCallers.contains(currentCaller), currentCaller != autoRecordingBundleID
+      {
+        // Single caller identity changed (e.g., Chrome → Zoom). Restart for the new caller.
+        Log.info(
+          Log.monitor, "monitor",
+          "new caller detected: \(currentCaller), restarting recording")
+        stopAutoRecording()
+        handleMicBecameActive(appBundleID: callers.first ?? nil)
+      }
     } else if running, autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
-      // Recovery: callers active but no recording running (e.g., start() failed previously)
+      // Recovery: callers active but no recording running (e.g., start() failed previously).
       Log.info(Log.monitor, "monitor", "retrying auto-recording for active call")
       handleMicBecameActive(appBundleID: callers.first ?? nil)
     }
   }
 
+  /// Resolve helper subprocess bundle IDs to the parent app.
+  /// e.g. "com.google.Chrome.helper.renderer" → "com.google.Chrome"
+  private static func resolveParentBundleID(_ bundleID: String) -> String {
+    let parts = bundleID.split(separator: ".")
+    if let idx = parts.firstIndex(where: { $0 == "helper" }), idx > 1 {
+      return parts[..<idx].joined(separator: ".")
+    }
+    return bundleID
+  }
+
   /// Resolve a bundle ID to a human-readable app name.
   private static func resolveAppName(bundleID: String?) -> String {
     guard let bundleID else { return "Call" }
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+    let resolved = resolveParentBundleID(bundleID)
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: resolved).first,
       let name = app.localizedName
     {
       return name
     }
-    // Fallback: extract last component of bundle ID (e.g. "com.zoom.us" -> "zoom")
+    // Fallback: try original bundle ID if parent resolution found nothing
+    if resolved != bundleID,
+      let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+      let name = app.localizedName
+    {
+      return name
+    }
+    // Last resort: extract last component of bundle ID (e.g. "com.zoom.us" -> "zoom")
     let components = bundleID.split(separator: ".")
     if let last = components.last, last != "app" {
       return String(last)
@@ -487,6 +537,7 @@ final class AudioMonitor {
     }
     permissionNeeded = false
 
+    autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
     loadSettings()
     startAutoRecording()
@@ -510,6 +561,7 @@ final class AudioMonitor {
     let useMic = micEnabled
     let appName = autoRecordingAppName ?? "Call"
     let recorder = AudioRecorder(
+      bundleID: autoRecordingBundleID,
       appName: appName,
       micEnabled: useMic,
       saveDirectory: saveDirectory,
@@ -562,6 +614,7 @@ final class AudioMonitor {
     let appName = autoRecordingAppName ?? "Call"
     autoRecorder = nil
     autoRecordingAppName = nil
+    autoRecordingBundleID = nil
     Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
     savingCount += 1
     isSaving = true
@@ -598,6 +651,7 @@ final class AudioMonitor {
       permissionNeeded = true
       notifyPermissionLost()
       autoRecordingAppName = nil
+      autoRecordingBundleID = nil
       updateAutoState()
     case .systemStopped:
       if shouldAllowRestart(
@@ -609,15 +663,18 @@ final class AudioMonitor {
         Log.error(Log.monitor, "monitor", "auto-recording restart limit exceeded")
         setError("Recording failed repeatedly")
         autoRecordingAppName = nil
+        autoRecordingBundleID = nil
         updateAutoState()
       }
     case .lowDiskSpace:
       setError("Recording stopped - not enough disk space")
       autoRecordingAppName = nil
+      autoRecordingBundleID = nil
       updateAutoState()
     case .other:
       setError("Recording interrupted")
       autoRecordingAppName = nil
+      autoRecordingBundleID = nil
       updateAutoState()
     }
   }

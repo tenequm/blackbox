@@ -90,13 +90,17 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
 
     let filter: SCContentFilter
-    if let bundleID {
-      guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
-        Log.error(Log.recorder, "recorder", "app not found: \(bundleID)")
-        throw RecorderError.appNotFound
-      }
+    if let bundleID,
+      let app = content.applications.first(where: { $0.bundleIdentifier == bundleID })
+    {
       filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+      Log.info(Log.recorder, "recorder", "per-app capture: \(bundleID)")
     } else {
+      if let bundleID {
+        Log.info(
+          Log.recorder, "recorder",
+          "app \(bundleID) not found in SCShareableContent, falling back to display-wide")
+      }
       filter = SCContentFilter(
         display: display, excludingApplications: [], exceptingWindows: [])
     }
@@ -685,13 +689,11 @@ extension AVAudioPCMBuffer {
 
 enum RecorderError: Error, LocalizedError {
   case noDisplay
-  case appNotFound
   case writerFailed
 
   var errorDescription: String? {
     switch self {
     case .noDisplay: "No display found"
-    case .appNotFound: "Target application not found"
     case .writerFailed: "Failed to start audio writer"
     }
   }
