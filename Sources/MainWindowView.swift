@@ -1142,9 +1142,10 @@ enum WaveformExtractor {
       let startIndex = allSamples.count
       allSamples.append(contentsOf: repeatElement(0, count: sampleCount))
       allSamples.withUnsafeMutableBufferPointer { ptr in
+        guard let base = ptr.baseAddress else { return }
         _ = CMBlockBufferCopyDataBytes(
           blockBuffer, atOffset: 0, dataLength: length,
-          destination: ptr.baseAddress!.advanced(by: startIndex))
+          destination: base.advanced(by: startIndex))
       }
     }
 
