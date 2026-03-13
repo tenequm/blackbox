@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-13
+
+### Added
+
+- Per-app audio capture: when a single calling app is detected, captures only that app's audio via SCContentFilter. Falls back to display-wide capture for multiple callers or unresolved apps
+- Crash recovery watchdog helper (BlackboxWatchdog)
+- AEC regression test suite and golden reference validation scripts
+- App icon and screenshot in README
+
+### Changed
+
+- AEC post-processing streams chunk-by-chunk instead of loading entire tracks into memory (constant ~16KB vs ~3x recording size)
+
+### Fixed
+
+- Crash when Krisp switches audio devices during recording (ObjCTryBlock broken in release builds due to NS_NOESCAPE block optimization)
+- Uncaught exception handler crash on background thread (inherited @MainActor isolation)
+- Config change observer crash on CoreAudio I/O thread (inherited @MainActor isolation)
+- Race between stop() and config change handlers causing concurrent AVAudioEngine mutation
+- Zero-format (0Hz, 0ch) from inputNode during device transitions now rejected before installTap
+- Rapid device switching causing unnecessary mic audio gaps (300ms debounce)
+
 ## [0.4.3] - 2026-03-11
 
 ### Added
@@ -158,7 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.4.3...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/tenequm/blackbox/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tenequm/blackbox/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tenequm/blackbox/compare/v0.4.0...v0.4.1
