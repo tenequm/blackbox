@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import ObjCExceptionCatcher
 import ScreenCaptureKit
 
 /// Records system audio via ScreenCaptureKit and mic via AVAudioEngine as independent pipelines.
@@ -52,6 +53,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var micBuffersConversionFailed: Int = 0
   nonisolated(unsafe) private var micBuffersAppendFailed: Int = 0
   nonisolated(unsafe) private var micPeakLevel: Float = 0
+  nonisolated(unsafe) private var configChangeGeneration: Int = 0
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
@@ -158,18 +160,37 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   func stop() async -> URL? {
     Log.recorder.info("stop() for \(self.appName, privacy: .public)")
 
-    // Stop mic first (instant) to prevent new samples during teardown
-    stopMicCapture()
+    // Remove observer on MainActor (prevents new config change dispatches)
+    if let observer = configChangeObserver {
+      NotificationCenter.default.removeObserver(observer)
+      configChangeObserver = nil
+    }
 
     if let stream {
       try? await stream.stopCapture()
     }
     stream = nil
 
+    // Capture engine ref, clear property on MainActor
+    let capturedEngine = audioEngine
+    audioEngine = nil
+
     var capturedWriter: AVAssetWriter?
     var capturedFileURL: URL?
     var wasStarted = false
     audioQueue.sync {
+      // Set stopped first - blocks any enqueued config change handlers
+      stopped = true
+
+      // Mic teardown on audioQueue (serialized with config change handlers)
+      if let engine = capturedEngine {
+        var exc: NSException?
+        if let inputNode = ObjCGetInputNode(engine, &exc) {
+          let _ = ObjCRemoveTap(inputNode, 0)
+        }
+        let _ = ObjCStopEngine(engine)
+      }
+
       if micEnabled {
         Log.info(
           Log.recorder, "recorder",
@@ -179,7 +200,6 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       wasStarted = sessionStarted
       capturedWriter = writer
       capturedFileURL = fileURL
-      stopped = true
       diskSpaceTimer?.cancel()
       diskSpaceTimer = nil
       lowDiskSpaceWarned = false
@@ -263,13 +283,29 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
 
     let engine = AVAudioEngine()
-    let inputNode = engine.inputNode
+
+    // inputNode access throws NSException if no input device exists
+    var inputNodeException: NSException?
+    guard let inputNode = ObjCGetInputNode(engine, &inputNodeException) else {
+      let reason = inputNodeException?.reason ?? inputNodeException?.name.rawValue ?? "unknown"
+      throw NSError(
+        domain: "Blackbox", code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "No audio input device: \(reason)"])
+    }
 
     // Log the actual input device being used
     let inputDeviceID = inputNode.auAudioUnit.deviceID
     let deviceName = Self.audioDeviceName(for: inputDeviceID) ?? "unknown"
 
     let format = inputNode.inputFormat(forBus: 0)
+    guard format.sampleRate > 0, format.channelCount > 0 else {
+      throw NSError(
+        domain: "Blackbox", code: -1,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "Invalid mic format: \(format.sampleRate)Hz, \(format.channelCount)ch"
+        ])
+    }
     micTapFormat = format
     Log.info(
       Log.recorder, "recorder",
@@ -282,21 +318,37 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         self?.handleMicBuffer(buffer, at: when)
       }
     }
-    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format, block: tapHandler)
 
-    try engine.start()
+    // installTap throws NSException on format mismatch or invalid state
+    if let e = ObjCInstallTap(inputNode, 0, 1024, format, tapHandler) {
+      throw NSError(
+        domain: "Blackbox", code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "installTap failed: \(e.reason ?? e.name.rawValue)"])
+    }
+
+    // engine.start() can throw NSExceptions and NSErrors - catch both
+    var startError: NSError?
+    if let e = ObjCStartEngine(engine, &startError) {
+      let _ = ObjCRemoveTap(inputNode, 0)
+      throw NSError(
+        domain: "Blackbox", code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "engine.start failed: \(e.reason ?? e.name.rawValue)"]
+      )
+    }
+    if let startError {
+      let _ = ObjCRemoveTap(inputNode, 0)
+      throw startError
+    }
     audioEngine = engine
 
     let capturedEngine = engine
     configChangeObserver = NotificationCenter.default.addObserver(
       forName: .AVAudioEngineConfigurationChange,
       object: engine,
-      queue: nil
+      queue: .main
     ) { [weak self] _ in
       guard let self else { return }
-      self.audioQueue.async { [weak self] in
-        self?.handleEngineConfigChange(engine: capturedEngine)
-      }
+      self.debounceConfigChange(engine: capturedEngine)
     }
 
     Log.info(
@@ -310,8 +362,11 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       configChangeObserver = nil
     }
     if let engine = audioEngine {
-      engine.inputNode.removeTap(onBus: 0)
-      engine.stop()
+      var exc: NSException?
+      if let inputNode = ObjCGetInputNode(engine, &exc) {
+        let _ = ObjCRemoveTap(inputNode, 0)
+      }
+      let _ = ObjCStopEngine(engine)
       audioEngine = nil
     }
   }
@@ -352,18 +407,47 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     publishAudioLevel(sampleBuffer)
   }
 
+  /// Debounces rapid config change notifications (e.g. Krisp device switching).
+  /// Dispatches to audioQueue with 300ms delay; only the last notification fires.
+  nonisolated private func debounceConfigChange(engine: AVAudioEngine) {
+    audioQueue.async { [weak self] in
+      guard let self else { return }
+      self.configChangeGeneration += 1
+      let gen = self.configChangeGeneration
+      self.audioQueue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+        guard let self, !self.stopped, self.configChangeGeneration == gen else { return }
+        self.handleEngineConfigChange(engine: engine)
+      }
+    }
+  }
+
   /// Handles AVAudioEngine configuration change (device plugged/unplugged).
   /// Runs on audioQueue to serialize with stopped flag and buffer handling.
-  /// Reinstalls tap with original format and restarts engine. System audio continues regardless.
+  /// Reinstalls tap and restarts engine. System audio continues regardless.
   nonisolated private func handleEngineConfigChange(engine: AVAudioEngine) {
     guard !stopped else { return }
     Log.info(Log.recorder, "recorder", "audio engine config changed, restarting mic capture")
 
-    let inputNode = engine.inputNode
-    inputNode.removeTap(onBus: 0)
+    var inputNodeException: NSException?
+    guard let inputNode = ObjCGetInputNode(engine, &inputNodeException) else {
+      if let e = inputNodeException {
+        Log.error(
+          Log.recorder, "recorder",
+          "inputNode access failed after device change: \(e.reason ?? e.name.rawValue)")
+      }
+      return
+    }
 
-    // Use stored format to prevent format mismatch that would fail the writer
-    let format = micTapFormat ?? inputNode.inputFormat(forBus: 0)
+    let _ = ObjCRemoveTap(inputNode, 0)
+
+    let format = inputNode.inputFormat(forBus: 0)
+    guard format.sampleRate > 0, format.channelCount > 0 else {
+      Log.error(
+        Log.recorder, "recorder",
+        "invalid format after device change: \(format.sampleRate)Hz, \(format.channelCount)ch")
+      return
+    }
+
     let tapHandler: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = {
       [weak self] buffer, when in
       guard let self else { return }
@@ -371,16 +455,31 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         self?.handleMicBuffer(buffer, at: when)
       }
     }
-    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format, block: tapHandler)
 
-    do {
-      try engine.start()
-      Log.info(Log.recorder, "recorder", "mic capture restarted after device change")
-    } catch {
+    if let e = ObjCInstallTap(inputNode, 0, 1024, format, tapHandler) {
       Log.error(
         Log.recorder, "recorder",
-        "mic restart failed after device change, system audio continues: \(error)")
+        "installTap failed after device change: \(e.reason ?? e.name.rawValue)")
+      return
     }
+
+    var startError: NSError?
+    if let e = ObjCStartEngine(engine, &startError) {
+      Log.error(
+        Log.recorder, "recorder",
+        "engine.start exception after device change: \(e.reason ?? e.name.rawValue)")
+      let _ = ObjCRemoveTap(inputNode, 0)
+      return
+    }
+    if let startError {
+      Log.error(
+        Log.recorder, "recorder",
+        "engine.start failed after device change: \(startError)")
+      let _ = ObjCRemoveTap(inputNode, 0)
+      return
+    }
+
+    Log.info(Log.recorder, "recorder", "mic capture restarted after device change")
   }
 
   // MARK: - Disk Space Monitoring
@@ -496,6 +595,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.micBuffersConversionFailed = 0
       self.micBuffersAppendFailed = 0
       self.micPeakLevel = 0
+      self.configChangeGeneration = 0
     }
   }
 
@@ -671,9 +771,9 @@ extension AVAudioPCMBuffer {
       ) == noErr
     else { return nil }
 
-    guard
+    guard let sampleBuffer,
       CMSampleBufferSetDataBufferFromAudioBufferList(
-        sampleBuffer!,
+        sampleBuffer,
         blockBufferAllocator: kCFAllocatorDefault,
         blockBufferMemoryAllocator: kCFAllocatorDefault,
         flags: 0,

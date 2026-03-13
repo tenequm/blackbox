@@ -17,6 +17,7 @@ bundle: build
 	mkdir -p "$(APP_BUNDLE)/Contents/Frameworks"
 	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
 	cp .build/release/$(APP_NAME) "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
+	cp .build/release/BlackboxWatchdog "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"
 	install_name_tool -add_rpath @executable_path/../Frameworks "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Assets/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
@@ -30,9 +31,11 @@ bundle: build
 			codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$$f"; \
 		done; \
 		codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
+		codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
 		codesign --force --options runtime --sign "$(SIGN_ID)" --identifier com.tenequm.Blackbox --timestamp --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	else \
 		echo "No Developer ID found, using ad-hoc signing"; \
+		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
 		codesign --force --sign - --identifier com.tenequm.Blackbox --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	fi
 
@@ -68,7 +71,7 @@ release: dmg
 	@echo "Notarized: $(BUILD_DIR)/$(DMG_NAME)"
 
 test:
-	swift test
+	swift test --disable-xctest
 
 check: format build test
 	@echo "All checks passed."

@@ -9,14 +9,32 @@ let package = Package(
         .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
     ],
     targets: [
+        .target(
+            name: "ObjCExceptionCatcher",
+            path: "Sources/ObjCExceptionCatcher",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("AVFAudio"),
+            ]
+        ),
+        .executableTarget(
+            name: "BlackboxWatchdog",
+            path: "Sources/Watchdog",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .treatAllWarnings(as: .error),
+            ]
+        ),
         .executableTarget(
             name: "Blackbox",
             dependencies: [
+                "ObjCExceptionCatcher",
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "DTLNAecCoreML", package: "dtln-aec-coreml"),
                 .product(name: "DTLNAec256", package: "dtln-aec-coreml"),
             ],
             path: "Sources",
+            exclude: ["ObjCExceptionCatcher", "Watchdog"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .defaultIsolation(MainActor.self),
