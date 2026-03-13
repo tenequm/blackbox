@@ -1,8 +1,16 @@
-# Blackbox
+<p align="center">
+  <img src="Assets/appicon.png" width="128" height="128" alt="Blackbox">
+</p>
 
-macOS menu bar app that automatically records audio from your calls.
+<h1 align="center">Blackbox</h1>
+
+<p align="center">macOS menu bar app that automatically records audio from your calls.</p>
 
 Detects when your microphone becomes active (e.g. during calls) and records system audio automatically. Works with any app - Zoom, Meet, Teams, Discord, FaceTime, Telegram, and more. Saves M4A files locally.
+
+<p align="center">
+  <img src="Assets/screenshot.png" width="720" alt="Blackbox recordings window">
+</p>
 
 ## Install
 

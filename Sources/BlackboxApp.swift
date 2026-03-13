@@ -64,6 +64,7 @@ struct BlackboxApp: App {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       installCrashHandler()
+      launchWatchdog()
 
       // Existing users who already granted screen recording don't need onboarding
       if CGPreflightScreenCaptureAccess() {
@@ -81,6 +82,18 @@ struct BlackboxApp: App {
       }
     }
 
+    private func launchWatchdog() {
+      guard let url = Bundle.main.executableURL else { return }
+      let watchdogURL = url.deletingLastPathComponent()
+        .appendingPathComponent("BlackboxWatchdog")
+      guard FileManager.default.fileExists(atPath: watchdogURL.path) else { return }
+
+      let process = Process()
+      process.executableURL = watchdogURL
+      process.arguments = [String(ProcessInfo.processInfo.processIdentifier)]
+      try? process.run()
+    }
+
     private func installCrashHandler() {
       // Read previous state BEFORE marking current session as running
       let previousSessionCrashed = UserDefaults.standard.bool(forKey: "processRunning")
@@ -94,10 +107,7 @@ struct BlackboxApp: App {
         }
       }
 
-      NSSetUncaughtExceptionHandler { exception in
-        let reason = exception.reason ?? "Unknown"
-        Log.error(Log.app, "crash", "Uncaught exception: \(exception.name.rawValue) - \(reason)")
-      }
+      NSSetUncaughtExceptionHandler(uncaughtExceptionHandler)
     }
 
     private func showOnboarding() {
@@ -286,6 +296,17 @@ private struct AboutView: View {
     .padding(24)
     .frame(width: 260)
   }
+}
+
+// MARK: - Uncaught Exception Handler
+
+/// Must be nonisolated and at file scope - NSSetUncaughtExceptionHandler fires on whatever
+/// thread the exception was thrown on. A @MainActor-inferred closure would SIGTRAP when
+/// called from a background thread due to Swift 6 runtime isolation checks.
+nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
+  Log.error(
+    Log.app, "crash",
+    "Uncaught exception: \(exception.name.rawValue) - \(exception.reason ?? "Unknown")")
 }
 
 // MARK: - Helpers

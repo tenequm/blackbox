@@ -4,6 +4,7 @@
 # Build
 build/
 .build/
+.swiftpm/
 DerivedData/
 *.xcuserstate
 *.xcworkspace/xcuserdata/
