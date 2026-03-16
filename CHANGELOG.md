@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-03-16
+
+### Fixed
+
+- Mic audio recorded at 2x speed when device switches mid-recording (e.g. AirPods connecting during a call) - tap now resamples to 48kHz instead of passing native device rate to AVAssetWriter
+
 ## [0.5.0] - 2026-03-13
 
 ### Added
@@ -180,7 +186,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/tenequm/blackbox/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/tenequm/blackbox/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tenequm/blackbox/compare/v0.4.1...v0.4.2

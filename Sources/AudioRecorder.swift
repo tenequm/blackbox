@@ -297,19 +297,19 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     let inputDeviceID = inputNode.auAudioUnit.deviceID
     let deviceName = Self.audioDeviceName(for: inputDeviceID) ?? "unknown"
 
-    let format = inputNode.inputFormat(forBus: 0)
-    guard format.sampleRate > 0, format.channelCount > 0 else {
+    let nativeFormat = inputNode.inputFormat(forBus: 0)
+    guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
       throw NSError(
         domain: "Blackbox", code: -1,
         userInfo: [
           NSLocalizedDescriptionKey:
-            "Invalid mic format: \(format.sampleRate)Hz, \(format.channelCount)ch"
+            "Invalid mic format: \(nativeFormat.sampleRate)Hz, \(nativeFormat.channelCount)ch"
         ])
     }
-    micTapFormat = format
+    micTapFormat = nativeFormat
     Log.info(
       Log.recorder, "recorder",
-      "mic format: \(format.channelCount)ch, \(format.sampleRate)Hz, device: \(deviceName) (\(inputDeviceID)), permission: \(authName)"
+      "mic format: \(nativeFormat.channelCount)ch, \(nativeFormat.sampleRate)Hz, device: \(deviceName) (\(inputDeviceID)), permission: \(authName)"
     )
     let tapHandler: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = {
       [weak self] buffer, when in
@@ -320,7 +320,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     }
 
     // installTap throws NSException on format mismatch or invalid state
-    if let e = ObjCInstallTap(inputNode, 0, 1024, format, tapHandler) {
+    if let e = ObjCInstallTap(inputNode, 0, 1024, nativeFormat, tapHandler) {
       throw NSError(
         domain: "Blackbox", code: -1,
         userInfo: [NSLocalizedDescriptionKey: "installTap failed: \(e.reason ?? e.name.rawValue)"])
@@ -353,7 +353,8 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     Log.info(
       Log.recorder, "recorder",
-      "mic capture started via AVAudioEngine (format: \(format))")
+      "mic capture started via AVAudioEngine (format: \(nativeFormat), resample: \(nativeFormat.sampleRate != 48000))"
+    )
   }
 
   private func stopMicCapture() {
@@ -379,7 +380,34 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       micBuffersDroppedPreSession += 1
       return
     }
-    guard let sampleBuffer = buffer.asSampleBuffer(timestamp: time) else {
+    // Resample to 48kHz if device rate differs (e.g. 24kHz AirPods).
+    // Linear interpolation - adequate for voice audio, avoids AVAudioConverter @Sendable issues.
+    let outputBuffer: AVAudioPCMBuffer
+    if buffer.format.sampleRate != 48000 {
+      let ratio = 48000.0 / buffer.format.sampleRate
+      let outFrames = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio))
+      guard let outFmt = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1),
+        let outBuf = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: outFrames),
+        let inData = buffer.floatChannelData?[0],
+        let outData = outBuf.floatChannelData?[0]
+      else {
+        micBuffersConversionFailed += 1
+        return
+      }
+      let inCount = Int(buffer.frameLength)
+      for i in 0..<Int(outFrames) {
+        let srcIdx = Double(i) / ratio
+        let lo = Int(srcIdx)
+        let hi = min(lo + 1, inCount - 1)
+        let frac = Float(srcIdx - Double(lo))
+        outData[i] = inData[lo] * (1 - frac) + inData[hi] * frac
+      }
+      outBuf.frameLength = outFrames
+      outputBuffer = outBuf
+    } else {
+      outputBuffer = buffer
+    }
+    guard let sampleBuffer = outputBuffer.asSampleBuffer(timestamp: time) else {
       micBuffersConversionFailed += 1
       Log.recorder.warning("mic PCM-to-CMSampleBuffer conversion failed")
       return
@@ -440,13 +468,18 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     let _ = ObjCRemoveTap(inputNode, 0)
 
-    let format = inputNode.inputFormat(forBus: 0)
-    guard format.sampleRate > 0, format.channelCount > 0 else {
+    let nativeFormat = inputNode.inputFormat(forBus: 0)
+    guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
       Log.error(
         Log.recorder, "recorder",
-        "invalid format after device change: \(format.sampleRate)Hz, \(format.channelCount)ch")
+        "invalid format after device change: \(nativeFormat.sampleRate)Hz, \(nativeFormat.channelCount)ch"
+      )
       return
     }
+    Log.info(
+      Log.recorder, "recorder",
+      "device format after change: \(nativeFormat.channelCount)ch, \(nativeFormat.sampleRate)Hz, resample: \(nativeFormat.sampleRate != 48000)"
+    )
 
     let tapHandler: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = {
       [weak self] buffer, when in
@@ -456,7 +489,7 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       }
     }
 
-    if let e = ObjCInstallTap(inputNode, 0, 1024, format, tapHandler) {
+    if let e = ObjCInstallTap(inputNode, 0, 1024, nativeFormat, tapHandler) {
       Log.error(
         Log.recorder, "recorder",
         "installTap failed after device change: \(e.reason ?? e.name.rawValue)")
