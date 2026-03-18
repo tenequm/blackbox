@@ -1,6 +1,31 @@
 import AVFoundation
 import Foundation
 
+// MARK: - Transcription Provider
+
+nonisolated enum TranscriptionProvider: String, CaseIterable, Identifiable, Sendable {
+  case local, soniox
+
+  /// UserDefaults key for the user's default transcription provider.
+  static let defaultsKey = "defaultTranscriptionProvider"
+
+  var id: String { rawValue }
+
+  var label: String {
+    switch self {
+    case .local: "Local"
+    case .soniox: "Soniox"
+    }
+  }
+
+  var filename: String {
+    switch self {
+    case .local: "transcript-local.json"
+    case .soniox: "transcript-soniox.json"
+    }
+  }
+}
+
 // MARK: - Data Models
 
 nonisolated struct RecordingMetadata: Codable, Sendable {
@@ -39,26 +64,51 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   var segments: [TranscriptSegment]
   var language: String?
   var createdAt: Date
+  var speakers: [String: String]?
 
-  nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
-    recordingURL.appendingPathComponent("transcript.json")
+  nonisolated static func sidecarURL(
+    for recordingURL: URL, provider: TranscriptionProvider
+  ) -> URL {
+    recordingURL.appendingPathComponent(provider.filename)
   }
 
-  nonisolated static func load(for recordingURL: URL) -> TranscriptDocument? {
-    let url = sidecarURL(for: recordingURL)
+  nonisolated static func load(
+    for recordingURL: URL, provider: TranscriptionProvider
+  ) -> TranscriptDocument? {
+    let url = sidecarURL(for: recordingURL, provider: provider)
     guard let data = try? Data(contentsOf: url) else { return nil }
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
     return try? decoder.decode(TranscriptDocument.self, from: data)
   }
 
-  func save(for recordingURL: URL) throws {
-    let url = Self.sidecarURL(for: recordingURL)
+  func save(for recordingURL: URL, provider: TranscriptionProvider) throws {
+    let url = Self.sidecarURL(for: recordingURL, provider: provider)
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(self)
     try data.write(to: url, options: .atomic)
+  }
+
+  /// Migrates legacy `transcript.json` to `transcript-soniox.json`.
+  nonisolated static func migrateLegacyTranscript(in directory: URL) {
+    let legacy = directory.appendingPathComponent("transcript.json")
+    let target = directory.appendingPathComponent(TranscriptionProvider.soniox.filename)
+    if FileManager.default.fileExists(atPath: legacy.path),
+      !FileManager.default.fileExists(atPath: target.path)
+    {
+      try? FileManager.default.moveItem(at: legacy, to: target)
+    }
+  }
+
+  /// Fallback: load pre-migration `transcript.json` if provider-specific file is missing.
+  nonisolated static func loadLegacy(in directory: URL) -> TranscriptDocument? {
+    let url = directory.appendingPathComponent("transcript.json")
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(TranscriptDocument.self, from: data)
   }
 }
 
@@ -86,6 +136,7 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
 
 nonisolated enum TranscriptionStatus: Equatable, Sendable {
   case idle
+  case preparing
   case uploading
   case queued
   case transcribing
@@ -441,7 +492,7 @@ final class TranscriptionService {
       })?["language"] as? String
 
     return TranscriptDocument(
-      segments: segments, language: language, createdAt: Date())
+      segments: segments, language: language, createdAt: Date(), speakers: nil)
   }
 
   // MARK: - Cleanup

@@ -622,8 +622,9 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if url != nil {
+      if let url {
         notifyRecordingSaved(appName: appName)
+        autoTranscribe(recordingDirectory: url)
       }
       updateAutoState()
     }
@@ -748,6 +749,25 @@ final class AudioMonitor {
     if windowStart == nil { windowStart = now }
     count += 1
     return count <= max
+  }
+
+  // MARK: - Auto-Transcription
+
+  private func autoTranscribe(recordingDirectory: URL) {
+    let provider =
+      UserDefaults.standard.string(forKey: TranscriptionProvider.defaultsKey) ?? "local"
+    guard provider == "local", LocalTranscriptionService.modelsReady else { return }
+    Task.detached {
+      do {
+        try await LocalTranscriptionService.transcribeAndSave(
+          recordingDirectory: recordingDirectory)
+        Log.info(Log.transcription, "auto", "auto-transcription complete")
+      } catch {
+        Log.error(
+          Log.transcription, "auto",
+          "auto-transcription failed: \(error.localizedDescription)")
+      }
+    }
   }
 
   // MARK: - Notifications
