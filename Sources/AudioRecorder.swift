@@ -1,6 +1,6 @@
 @preconcurrency import AVFoundation
 import ObjCExceptionCatcher
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 /// Records system audio via ScreenCaptureKit and mic via AVAudioEngine as independent pipelines.
 ///
@@ -23,9 +23,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated let onLowDiskSpace: (@Sendable (Int64) -> Void)?
 
   private let audioQueue = DispatchQueue(label: "com.tenequm.blackbox.audio")
-
-  // Stream - set/cleared on MainActor (before start / after stopCapture)
-  nonisolated(unsafe) private var stream: SCStream?
+  // Streams - set/cleared on MainActor (before start / after stopCapture)
+  nonisolated(unsafe) private var displayStream: SCStream?
+  nonisolated(unsafe) private var appStream: SCStream?
 
   // AVAudioEngine - set on MainActor in start(), torn down in stop()
   nonisolated(unsafe) private var audioEngine: AVAudioEngine?
@@ -33,7 +33,9 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   // All writer state accessed exclusively on audioQueue
   nonisolated(unsafe) private var writer: AVAssetWriter?
-  nonisolated(unsafe) private var audioInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var displayAudioInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var appAudioInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var appStreamFailed = false
   nonisolated(unsafe) private var micInput: AVAssetWriterInput?
   nonisolated(unsafe) private var sessionStarted = false
   nonisolated(unsafe) private var stopped = false
@@ -54,6 +56,21 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
   nonisolated(unsafe) private var micBuffersAppendFailed: Int = 0
   nonisolated(unsafe) private var micPeakLevel: Float = 0
   nonisolated(unsafe) private var configChangeGeneration: Int = 0
+
+  // Display audio stats
+  nonisolated(unsafe) private var displayBuffersReceived: Int = 0
+  nonisolated(unsafe) private var displayBuffersAppended: Int = 0
+  nonisolated(unsafe) private var displayBuffersDroppedNotReady: Int = 0
+  nonisolated(unsafe) private var displayBuffersAppendFailed: Int = 0
+  nonisolated(unsafe) private var displayPeakLevel: Float = 0
+
+  // Per-app audio stats
+  nonisolated(unsafe) private var appBuffersReceived: Int = 0
+  nonisolated(unsafe) private var appBuffersAppended: Int = 0
+  nonisolated(unsafe) private var appBuffersDroppedPreSession: Int = 0
+  nonisolated(unsafe) private var appBuffersDroppedNotReady: Int = 0
+  nonisolated(unsafe) private var appBuffersAppendFailed: Int = 0
+  nonisolated(unsafe) private var appPeakLevel: Float = 0
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
@@ -91,38 +108,58 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       throw RecorderError.noDisplay
     }
 
-    let filter: SCContentFilter
+    // Display-wide filter (always, critical path)
+    let displayFilter = SCContentFilter(
+      display: display, excludingApplications: [], exceptingWindows: [])
+
+    // Per-app filter (optional, best-effort)
+    var appFilter: SCContentFilter?
     if let bundleID,
       let app = content.applications.first(where: { $0.bundleIdentifier == bundleID })
     {
-      filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-      Log.info(Log.recorder, "recorder", "per-app capture: \(bundleID)")
-    } else {
-      if let bundleID {
-        Log.info(
-          Log.recorder, "recorder",
-          "app \(bundleID) not found in SCShareableContent, falling back to display-wide")
-      }
-      filter = SCContentFilter(
-        display: display, excludingApplications: [], exceptingWindows: [])
+      appFilter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+      Log.info(Log.recorder, "recorder", "per-app capture available: \(bundleID)")
+    } else if let bundleID {
+      Log.info(
+        Log.recorder, "recorder",
+        "app \(bundleID) not found, display-wide only")
     }
 
     try setupWriter()
 
     let config = makeStreamConfig()
-    let stream = SCStream(filter: filter, configuration: config, delegate: self)
+
+    // Display-wide stream (critical)
+    let dStream = SCStream(filter: displayFilter, configuration: config, delegate: self)
     do {
-      try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+      try dStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
 
       activity = ProcessInfo.processInfo.beginActivity(
         options: .userInitiated,
         reason: "Recording call audio"
       )
 
-      self.stream = stream
-      try await stream.startCapture()
-      Log.recorder.info("stream started for \(self.appName, privacy: .public)")
+      self.displayStream = dStream
+      try await dStream.startCapture()
+      Log.info(Log.recorder, "recorder", "display-wide stream started for \(appName)")
       startDiskSpaceMonitor()
+
+      // Per-app stream (best-effort)
+      if let appFilter {
+        do {
+          let aStream = SCStream(filter: appFilter, configuration: config, delegate: self)
+          try aStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+          self.appStream = aStream
+          try await aStream.startCapture()
+          Log.info(Log.recorder, "recorder", "per-app stream started for \(appName)")
+        } catch {
+          Log.error(
+            Log.recorder, "recorder",
+            "per-app stream failed to start, continuing with display-wide only: \(error)")
+          audioQueue.sync { appStreamFailed = true }
+          appStream = nil
+        }
+      }
 
       // Start mic capture independently - failure does not stop system audio
       if micEnabled {
@@ -135,18 +172,21 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         }
       }
     } catch {
-      Log.error(Log.recorder, "recorder", "stream failed to start for \(appName): \(error)")
+      Log.error(Log.recorder, "recorder", "display stream failed to start for \(appName): \(error)")
       stopMicCapture()
+      if let aStream = appStream { try? await aStream.stopCapture() }
+      appStream = nil
       audioQueue.sync {
         writer?.cancelWriting()
         if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
         writer = nil
-        audioInput = nil
+        displayAudioInput = nil
+        appAudioInput = nil
         micInput = nil
         audioFileURL = nil
         fileURL = nil
       }
-      self.stream = nil
+      self.displayStream = nil
       if let activity {
         ProcessInfo.processInfo.endActivity(activity)
         self.activity = nil
@@ -166,10 +206,15 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       configChangeObserver = nil
     }
 
-    if let stream {
-      try? await stream.stopCapture()
+    if let displayStream {
+      try? await displayStream.stopCapture()
     }
-    stream = nil
+    self.displayStream = nil
+
+    if let appStream {
+      try? await appStream.stopCapture()
+    }
+    self.appStream = nil
 
     // Capture engine ref, clear property on MainActor
     let capturedEngine = audioEngine
@@ -191,6 +236,16 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
         let _ = ObjCStopEngine(engine)
       }
 
+      Log.info(
+        Log.recorder, "recorder",
+        "display stats: received=\(displayBuffersReceived) appended=\(displayBuffersAppended) notReady=\(displayBuffersDroppedNotReady) appendFail=\(displayBuffersAppendFailed) peakLevel=\(String(format: "%.6f", displayPeakLevel))"
+      )
+      if appAudioInput != nil {
+        Log.info(
+          Log.recorder, "recorder",
+          "app stats: received=\(appBuffersReceived) appended=\(appBuffersAppended) preSession=\(appBuffersDroppedPreSession) notReady=\(appBuffersDroppedNotReady) appendFail=\(appBuffersAppendFailed) peakLevel=\(String(format: "%.6f", appPeakLevel)) failed=\(appStreamFailed)"
+        )
+      }
       if micEnabled {
         Log.info(
           Log.recorder, "recorder",
@@ -203,9 +258,11 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       diskSpaceTimer?.cancel()
       diskSpaceTimer = nil
       lowDiskSpaceWarned = false
-      audioInput?.markAsFinished()
+      displayAudioInput?.markAsFinished()
+      appAudioInput?.markAsFinished()
       micInput?.markAsFinished()
-      audioInput = nil
+      displayAudioInput = nil
+      appAudioInput = nil
       micInput = nil
       writer = nil
       sessionStarted = false
@@ -566,11 +623,16 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     let audioURL = dirURL.appendingPathComponent("audio.m4a")
     Log.recorder.info("writing to \(dirName, privacy: .public)/audio.m4a")
 
+    let hasPerAppTrack = bundleID != nil
+    let trackCount = 1 + (hasPerAppTrack ? 1 : 0) + (micEnabled ? 1 : 0)
     let metadata = RecordingMetadata(
       title: appName,
       createdAt: now,
       appName: appName,
-      speakers: [:]
+      speakers: [:],
+      perAppBundleID: bundleID,
+      perAppName: hasPerAppTrack ? appName : nil,
+      trackCount: trackCount
     )
     try metadata.save(in: dirURL)
 
@@ -591,10 +653,22 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
     let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
     newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
-    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: systemAudioSettings)
-    input.expectsMediaDataInRealTime = true
-    newWriter.add(input)
+    // Track 0: display-wide audio (always)
+    let displayInput = AVAssetWriterInput(
+      mediaType: .audio, outputSettings: systemAudioSettings)
+    displayInput.expectsMediaDataInRealTime = true
+    newWriter.add(displayInput)
 
+    // Track 1: per-app audio (when bundleID available)
+    var newAppInput: AVAssetWriterInput?
+    if hasPerAppTrack {
+      let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: systemAudioSettings)
+      ai.expectsMediaDataInRealTime = true
+      newWriter.add(ai)
+      newAppInput = ai
+    }
+
+    // Track last: mic
     var newMicInput: AVAssetWriterInput?
     if micEnabled {
       let mi = AVAssetWriterInput(mediaType: .audio, outputSettings: micAudioSettings)
@@ -614,13 +688,15 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
     audioQueue.sync {
       self.writer = newWriter
-      self.audioInput = input
+      self.displayAudioInput = displayInput
+      self.appAudioInput = newAppInput
       self.micInput = newMicInput
       self.audioFileURL = audioURL
       self.fileURL = dirURL
       self.sessionStarted = false
       self.stopped = false
       self.writerFailureReported = false
+      self.appStreamFailed = false
       self.micBuffersReceived = 0
       self.micBuffersAppended = 0
       self.micBuffersDroppedPreSession = 0
@@ -629,6 +705,17 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.micBuffersAppendFailed = 0
       self.micPeakLevel = 0
       self.configChangeGeneration = 0
+      self.displayBuffersReceived = 0
+      self.displayBuffersAppended = 0
+      self.displayBuffersDroppedNotReady = 0
+      self.displayBuffersAppendFailed = 0
+      self.displayPeakLevel = 0
+      self.appBuffersReceived = 0
+      self.appBuffersAppended = 0
+      self.appBuffersDroppedPreSession = 0
+      self.appBuffersDroppedNotReady = 0
+      self.appBuffersAppendFailed = 0
+      self.appPeakLevel = 0
     }
   }
 
@@ -658,40 +745,99 @@ extension AudioRecorder: SCStreamOutput {
     didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
     of type: SCStreamOutputType
   ) {
-    guard !stopped,
+    guard type == .audio,
+      !stopped,
       sampleBuffer.isValid,
       CMSampleBufferDataIsReady(sampleBuffer)
     else { return }
 
-    switch type {
-    case .screen:
+    // Runs directly on audioQueue (passed as sampleHandlerQueue to addStreamOutput)
+    if stream === displayStream {
+      handleDisplaySample(sampleBuffer)
+    } else if stream === appStream {
+      handleAppSample(sampleBuffer)
+    }
+  }
+
+  // MARK: - Display Audio (critical path)
+
+  nonisolated private func handleDisplaySample(_ sampleBuffer: CMSampleBuffer) {
+    displayBuffersReceived += 1
+
+    if !sessionStarted {
+      writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
+      sessionStarted = true
+    }
+
+    guard let input = displayAudioInput, input.isReadyForMoreMediaData else {
+      displayBuffersDroppedNotReady += 1
       return
+    }
 
-    case .audio:
-      if !sessionStarted {
-        writer?.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
-        sessionStarted = true
+    if input.append(sampleBuffer) {
+      displayBuffersAppended += 1
+    } else {
+      displayBuffersAppendFailed += 1
+      Log.recorder.warning("display audio append failed for \(self.appName, privacy: .public)")
+      if !writerFailureReported, let w = writer, w.status == .failed {
+        writerFailureReported = true
+        let desc = w.error?.localizedDescription ?? "unknown writer error"
+        Log.error(Log.recorder, "recorder", "writer entered failed state: \(desc)")
+        onFailure?(.other(desc))
       }
+    }
 
-      if let input = audioInput, input.isReadyForMoreMediaData {
-        if !input.append(sampleBuffer) {
-          Log.recorder.warning("audio append failed for \(self.appName, privacy: .public)")
-          if !writerFailureReported, let w = writer, w.status == .failed {
-            writerFailureReported = true
-            let desc = w.error?.localizedDescription ?? "unknown writer error"
-            Log.error(Log.recorder, "recorder", "writer entered failed state: \(desc)")
-            onFailure?(.other(desc))
-          }
-        }
-      }
+    trackPeakLevel(sampleBuffer, peak: &displayPeakLevel)
+    publishAudioLevel(sampleBuffer)
+  }
 
-      publishAudioLevel(sampleBuffer)
+  // MARK: - Per-App Audio (best-effort)
 
-    case .microphone:
-      return  // mic handled by AVAudioEngine, not SCStream
+  nonisolated private func handleAppSample(_ sampleBuffer: CMSampleBuffer) {
+    appBuffersReceived += 1
 
-    @unknown default:
+    guard sessionStarted else {
+      appBuffersDroppedPreSession += 1
       return
+    }
+
+    guard let input = appAudioInput, input.isReadyForMoreMediaData else {
+      appBuffersDroppedNotReady += 1
+      return
+    }
+
+    if input.append(sampleBuffer) {
+      appBuffersAppended += 1
+    } else {
+      appBuffersAppendFailed += 1
+      Log.recorder.warning("app audio append failed for \(self.appName, privacy: .public)")
+    }
+
+    trackPeakLevel(sampleBuffer, peak: &appPeakLevel)
+  }
+
+  // MARK: - Peak Level Tracking
+
+  nonisolated private func trackPeakLevel(
+    _ sampleBuffer: CMSampleBuffer, peak: inout Float
+  ) {
+    guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    var length = 0
+    var dataPointer: UnsafeMutablePointer<Int8>?
+    guard
+      CMBlockBufferGetDataPointer(
+        blockBuffer, atOffset: 0, lengthAtOffsetOut: nil,
+        totalLengthOut: &length, dataPointerOut: &dataPointer) == noErr,
+      let dataPointer, length > 0
+    else { return }
+    let floatCount = length / MemoryLayout<Float>.size
+    guard floatCount > 0 else { return }
+    let samples = UnsafeBufferPointer(
+      start: UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self),
+      count: floatCount)
+    for s in samples {
+      let abs = Swift.abs(s)
+      if abs > peak { peak = abs }
     }
   }
 
@@ -738,16 +884,29 @@ extension AudioRecorder: SCStreamOutput {
 extension AudioRecorder: SCStreamDelegate {
   nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
     let code = (error as NSError).code
-    let failure: RecorderFailure
-    switch code {
-    case -3801: failure = .permissionDenied
-    case -3802, -3821: failure = .systemStopped
-    default: failure = .other(error.localizedDescription)
+
+    if stream === displayStream {
+      // Display stream died - CRITICAL
+      let failure: RecorderFailure
+      switch code {
+      case -3801: failure = .permissionDenied
+      case -3802, -3821: failure = .systemStopped
+      default: failure = .other(error.localizedDescription)
+      }
+      Log.error(
+        Log.recorder, "recorder",
+        "display stream stopped for \(appName) (code=\(code)): \(error.localizedDescription)")
+      onFailure?(failure)
+    } else if stream === appStream {
+      // App stream died - non-critical, display continues
+      Log.error(
+        Log.recorder, "recorder",
+        "app stream stopped for \(appName) (code=\(code)): \(error.localizedDescription) [non-critical]"
+      )
+      audioQueue.async { [weak self] in
+        self?.appStreamFailed = true
+      }
     }
-    Log.error(
-      Log.recorder, "recorder",
-      "stream stopped for \(appName) (code=\(code)): \(error.localizedDescription)")
-    onFailure?(failure)
   }
 }
 
