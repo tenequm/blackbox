@@ -94,7 +94,7 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 ## Key Architecture Decisions
 
 - **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio per-process APIs enumerate processes with BOTH `IsRunningInput` AND `IsRunningOutput` (filtering out own PID and ScreenCaptureKit helpers). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code. Requires macOS 14.2+.
-- **Dual-SCStream capture**: Two SCStreams run simultaneously. Display-wide stream (critical path) captures all system audio, guaranteeing completeness. Per-app stream (best-effort) captures only the calling app's audio for cleaner AEC reference. If per-app fails or delivers silence, display-wide has the audio. Nothing changes mid-recording. Each stream uses its own sample handler queue, both dispatch to `audioQueue` for writer operations.
+- **Dual-SCStream capture**: Two SCStreams run simultaneously. Display-wide stream (critical path) captures all system audio, guaranteeing completeness. Per-app stream (best-effort) captures only the calling app's audio for cleaner AEC reference. If per-app fails or delivers silence, display-wide has the audio. Nothing changes mid-recording. Both streams use `audioQueue` as their sample handler queue; callbacks route by stream identity.
 - **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file).
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
 - **Multi-track M4A (2 or 3 tracks)**: Track 0 = display-wide audio (always). Track 1 = per-app audio (when single caller detected). Last track = mic. Session starts on first display-wide sample; per-app and mic samples before that are dropped.
@@ -109,7 +109,7 @@ With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
 - AudioMonitor is purely MainActor-isolated (no `@unchecked Sendable` needed - polling-only, no C callbacks)
 - AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state on `audioQueue`
-- SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called on per-stream sample queues, dispatch to `audioQueue`)
+- SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called directly on `audioQueue`)
 - SCStreamOutput routes by stream identity (`stream === displayStream` vs `appStream`)
 - AVAudioEngine tap callback dispatches to `audioQueue` via `audioQueue.async` to serialize with SCStream callbacks
 - AVAudioEngine config change observer is `nonisolated` (fires on NotificationCenter delivery thread, dispatches to `audioQueue` for thread safety)

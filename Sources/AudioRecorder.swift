@@ -473,23 +473,13 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       micBuffersDroppedNotReady += 1
       return
     }
-    // Track mic peak level to detect silence
-    if let floatData = buffer.floatChannelData, buffer.frameLength > 0 {
-      let samples = UnsafeBufferPointer(
-        start: floatData[0], count: Int(buffer.frameLength))
-      for s in samples {
-        let abs = Swift.abs(s)
-        if abs > micPeakLevel { micPeakLevel = abs }
-      }
-    }
-
     if input.append(sampleBuffer) {
       micBuffersAppended += 1
     } else {
       micBuffersAppendFailed += 1
       Log.recorder.warning("mic append failed for \(self.appName, privacy: .public)")
     }
-    publishAudioLevel(sampleBuffer)
+    publishAudioLevel(sampleBuffer, peak: &micPeakLevel)
   }
 
   /// Debounces rapid config change notifications (e.g. Krisp device switching).
@@ -787,8 +777,7 @@ extension AudioRecorder: SCStreamOutput {
       }
     }
 
-    trackPeakLevel(sampleBuffer, peak: &displayPeakLevel)
-    publishAudioLevel(sampleBuffer)
+    publishAudioLevel(sampleBuffer, peak: &displayPeakLevel)
   }
 
   // MARK: - Per-App Audio (best-effort)
@@ -844,9 +833,10 @@ extension AudioRecorder: SCStreamOutput {
   /// Compute RMS audio level from a sample buffer and publish via callback.
   /// Both system audio and mic call this. Max level is accumulated between
   /// publishes so neither source drowns out the other. Throttled to ~4Hz.
-  nonisolated private func publishAudioLevel(_ sampleBuffer: CMSampleBuffer) {
-    guard let onAudioLevel else { return }
-
+  /// Optionally tracks peak level in a single pass (avoids double buffer scan).
+  nonisolated private func publishAudioLevel(
+    _ sampleBuffer: CMSampleBuffer, peak: inout Float
+  ) {
     guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
     var length = 0
     var dataPointer: UnsafeMutablePointer<Int8>?
@@ -865,8 +855,12 @@ extension AudioRecorder: SCStreamOutput {
     )
     var sumOfSquares: Float = 0
     for sample in samples {
+      let abs = Swift.abs(sample)
+      if abs > peak { peak = abs }
       sumOfSquares += sample * sample
     }
+
+    guard onAudioLevel != nil else { return }
     let rms = (sumOfSquares / Float(floatCount)).squareRoot()
     if rms > pendingMaxLevel { pendingMaxLevel = rms }
 
@@ -875,7 +869,7 @@ extension AudioRecorder: SCStreamOutput {
     lastLevelTime = now
     let level = pendingMaxLevel
     pendingMaxLevel = 0
-    onAudioLevel(level)
+    onAudioLevel?(level)
   }
 }
 
