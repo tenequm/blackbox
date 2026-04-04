@@ -333,7 +333,7 @@ struct RecordingDetailView: View {
   @State private var isDragging = false
   @State private var playerError: String?
   @State private var waveformSamples: [Float] = []
-  @State private var trackSelection: TrackSelection = .both
+  @State private var trackSelection: TrackSelection = .all
   @State private var useProcessed: Bool = true
 
   // UI
@@ -513,12 +513,12 @@ struct RecordingDetailView: View {
           }
         }
         Picker("", selection: $trackSelection) {
-          ForEach(TrackSelection.allCases) { t in
+          ForEach(availableTrackSelections) { t in
             Text(t.label).tag(t)
           }
         }
         .pickerStyle(.segmented)
-        .frame(width: 180)
+        .frame(width: (metadata?.trackCount ?? 2) >= 3 ? 240 : 180)
         .onChange(of: trackSelection) { _, newValue in
           applyTrackSelection(newValue)
         }
@@ -576,7 +576,7 @@ struct RecordingDetailView: View {
       player?.play()
       isPlaying = true
     }
-    trackSelection = .both
+    trackSelection = .all
   }
 
   private func setupPlayer() {
@@ -659,15 +659,26 @@ struct RecordingDetailView: View {
     currentTime = time
   }
 
+  private var availableTrackSelections: [TrackSelection] {
+    let count = metadata?.trackCount ?? 2
+    if count >= 3 {
+      return [.all, .displayWide, .perApp, .mic]
+    } else {
+      return [.all, .displayWide, .mic]
+    }
+  }
+
   private func applyTrackSelection(_ selection: TrackSelection) {
     guard let tracks = player?.currentItem?.tracks else { return }
     let audioTracks = tracks.filter { $0.assetTrack?.mediaType == .audio }
-    // Track 0 = system audio, Track 1 = mic (if present)
+    let trackCount = audioTracks.count
     for (i, track) in audioTracks.enumerated() {
+      let isLast = (i == trackCount - 1)
       switch selection {
-      case .both: track.isEnabled = true
-      case .system: track.isEnabled = (i == 0)
-      case .mic: track.isEnabled = (i != 0)
+      case .all: track.isEnabled = true
+      case .displayWide: track.isEnabled = (i == 0)
+      case .perApp: track.isEnabled = (trackCount >= 3 && i == 1)
+      case .mic: track.isEnabled = isLast
       }
     }
   }
@@ -1017,13 +1028,14 @@ private struct TranscriptSegmentView: View {
 
 // MARK: - Track Selection
 
-enum TrackSelection: String, CaseIterable, Identifiable {
-  case both, system, mic
+enum TrackSelection: String, Identifiable {
+  case all, displayWide, perApp, mic
   var id: String { rawValue }
   var label: String {
     switch self {
-    case .both: "Both"
-    case .system: "System"
+    case .all: "All"
+    case .displayWide: "Display"
+    case .perApp: "App"
     case .mic: "Mic"
     }
   }

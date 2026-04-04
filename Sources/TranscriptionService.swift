@@ -8,6 +8,9 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   var createdAt: Date
   var appName: String
   var speakers: [String: String]
+  var perAppBundleID: String?
+  var perAppName: String?
+  var trackCount: Int?
 
   static let fileName = "metadata.json"
 
@@ -174,7 +177,11 @@ final class TranscriptionService {
     let composition = AVMutableComposition()
     let duration = try await asset.load(.duration)
 
-    for sourceTrack in tracks {
+    // For 3-track recordings (display-wide + per-app + mic), skip display-wide (track 0)
+    // to avoid doubling call audio. Use per-app + mic only.
+    let tracksToMix = tracks.count >= 3 ? Array(tracks.dropFirst()) : tracks
+
+    for sourceTrack in tracksToMix {
       guard
         let compositionTrack = composition.addMutableTrack(
           withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
