@@ -22,7 +22,6 @@ final class AudioMonitor {
   private var autoRecorder: AudioRecorder?
   private var autoRecordingAppName: String?
   private var autoRecordingBundleID: String?
-  private var previousCallers: Set<String> = []
   // Manual recording triggered by user
   private var manualRecorder: AudioRecorder?
 
@@ -433,9 +432,6 @@ final class AudioMonitor {
   private func evaluateCallState() {
     let callers = Self.findActiveCallingProcesses()
     let running = !callers.isEmpty
-    let resolvedCallers = Set(callers.compactMap { $0.map { Self.resolveParentBundleID($0) } })
-
-    defer { previousCallers = resolvedCallers }
 
     if running != lastKnownMicRunning {
       Log.info(
@@ -443,36 +439,11 @@ final class AudioMonitor {
         "call state changed: activeCallers=\(callers.count), running=\(running)")
       lastKnownMicRunning = running
       if running {
-        // Single caller: per-app capture. Multiple callers: nil → display-wide fallback.
+        // Single caller: per-app capture. Multiple callers: nil → display-wide only.
         let bundleID = callers.count == 1 ? callers.first ?? nil : nil
         handleMicBecameActive(appBundleID: bundleID)
       } else {
         handleMicBecameInactive()
-      }
-    } else if running, isRecording {
-      if resolvedCallers.count < previousCallers.count, resolvedCallers.count == 1,
-        autoRecordingBundleID == nil
-      {
-        // Callers decreased to 1 during display-wide capture. Restart with per-app capture
-        // for the remaining caller. This correctly handles both cases:
-        // - Call ended, processor lingers (Krisp): per-app for Krisp, Krisp drops soon → stop.
-        // - User closed processor, call continues: per-app for Chrome, call continues normally.
-        let remainingBundleID = callers.first ?? nil
-        Log.info(
-          Log.monitor, "monitor",
-          "callers decreased to 1 during display-wide, switching to per-app: \(remainingBundleID ?? "nil")"
-        )
-        stopAutoRecording()
-        handleMicBecameActive(appBundleID: remainingBundleID)
-      } else if resolvedCallers.count == 1, let currentCaller = resolvedCallers.first,
-        !previousCallers.contains(currentCaller), currentCaller != autoRecordingBundleID
-      {
-        // Single caller identity changed (e.g., Chrome → Zoom). Restart for the new caller.
-        Log.info(
-          Log.monitor, "monitor",
-          "new caller detected: \(currentCaller), restarting recording")
-        stopAutoRecording()
-        handleMicBecameActive(appBundleID: callers.first ?? nil)
       }
     } else if running, autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
       // Recovery: callers active but no recording running (e.g., start() failed previously).

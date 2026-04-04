@@ -44,6 +44,18 @@ enum AECProcessor {
       return
     }
 
+    // Track layout:
+    // 2-track (legacy): [0]=display-wide, [1]=mic
+    // 3-track: [0]=display-wide, [1]=per-app, [2]=mic
+    let micTrack = tracks[tracks.count - 1]
+    let referenceTrack: AVAssetTrack
+    if tracks.count >= 3 {
+      referenceTrack = tracks[1]
+      Log.info(Log.recorder, "aec", "using per-app track as AEC reference (3-track)")
+    } else {
+      referenceTrack = tracks[0]
+    }
+
     let pcmSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatLinearPCM,
       AVSampleRateKey: sampleRate,
@@ -56,12 +68,13 @@ enum AECProcessor {
 
     // Two readers (one per track) for independent interleaved reading
     let sysReader = try AVAssetReader(asset: asset)
-    let sysOutput = AVAssetReaderTrackOutput(track: tracks[0], outputSettings: pcmSettings)
+    let sysOutput = AVAssetReaderTrackOutput(
+      track: referenceTrack, outputSettings: pcmSettings)
     sysOutput.alwaysCopiesSampleData = false
     sysReader.add(sysOutput)
 
     let micReader = try AVAssetReader(asset: asset)
-    let micOutput = AVAssetReaderTrackOutput(track: tracks[1], outputSettings: pcmSettings)
+    let micOutput = AVAssetReaderTrackOutput(track: micTrack, outputSettings: pcmSettings)
     micOutput.alwaysCopiesSampleData = false
     micReader.add(micOutput)
 

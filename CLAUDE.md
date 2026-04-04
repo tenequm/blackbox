@@ -94,11 +94,11 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 ## Key Architecture Decisions
 
 - **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio per-process APIs enumerate processes with BOTH `IsRunningInput` AND `IsRunningOutput` (filtering out own PID and ScreenCaptureKit helpers). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code. Requires macOS 14.2+.
-- **Two independent capture pipelines**: SCStream captures system audio only (`captureMicrophone = false`). AVAudioEngine captures mic independently via `inputNode.installTap()`. Either can fail without affecting the other. No virtual audio exclusion list needed.
-- **AVAudioEngine device following**: On hardware change, `AVAudioEngineConfigurationChange` notification fires. Handler reinstalls tap and restarts engine (sub-second gap, same file). Replaces manual CoreAudio device listener + `updateConfiguration()`.
+- **Dual-SCStream capture**: Two SCStreams run simultaneously. Display-wide stream (critical path) captures all system audio, guaranteeing completeness. Per-app stream (best-effort) captures only the calling app's audio for cleaner AEC reference. If per-app fails or delivers silence, display-wide has the audio. Nothing changes mid-recording. Both streams use `audioQueue` as their sample handler queue; callbacks route by stream identity.
+- **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file).
 - **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
-- **Dual-track M4A, no mixing**: system audio + mic written as separate AVAssetWriterInputs. No real-time processing. Session starts on first system audio sample; mic samples before that are dropped.
-- **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using system audio as far-end reference. Reads both tracks from `audio.m4a`, resamples to 16kHz mono, runs AEC, writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified. Playback and transcription prefer the processed file.
+- **Multi-track M4A (2 or 3 tracks)**: Track 0 = display-wide audio (always). Track 1 = per-app audio (when single caller detected). Last track = mic. Session starts on first display-wide sample; per-app and mic samples before that are dropped.
+- **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using the best available reference: per-app (track 1) for 3-track files (cleaner signal), display-wide (track 0) for 2-track files. Writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
@@ -109,6 +109,7 @@ With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
 - AudioMonitor is purely MainActor-isolated (no `@unchecked Sendable` needed - polling-only, no C callbacks)
 - AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state on `audioQueue`
-- SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called on background queues)
+- SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called directly on `audioQueue`)
+- SCStreamOutput routes by stream identity (`stream === displayStream` vs `appStream`)
 - AVAudioEngine tap callback dispatches to `audioQueue` via `audioQueue.async` to serialize with SCStream callbacks
 - AVAudioEngine config change observer is `nonisolated` (fires on NotificationCenter delivery thread, dispatches to `audioQueue` for thread safety)

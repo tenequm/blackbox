@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-04
+
+### Added
+
+- Dual-SCStream recording: display-wide stream (guaranteed completeness) runs alongside per-app stream (cleaner AEC reference) simultaneously
+- Per-app audio track in recordings when single caller detected (3-track M4A: display-wide + per-app + mic)
+- Display and per-app audio buffer stats logging (received, appended, dropped, peak level)
+- Track selector shows App option for 3-track recordings
+
+### Changed
+
+- AEC post-processing uses per-app track as reference when available (cleaner than display-wide)
+- Transcription skips display-wide track in 3-track files to avoid doubling call audio
+- Removed mid-recording restart logic (no more interrupted recordings from caller detection churn)
+
+### Fixed
+
+- Chrome/WebRTC calls producing silent system audio track (per-app SCStream of Chrome captures silence, display-wide now always present as fallback)
+
 ## [0.5.1] - 2026-03-16
 
 ### Fixed
@@ -186,7 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.5.1...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/tenequm/blackbox/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/tenequm/blackbox/compare/v0.4.2...v0.4.3
