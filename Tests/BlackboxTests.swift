@@ -294,42 +294,12 @@ struct AECProcessingTests {
 @Suite("Gap Filling")
 struct GapFillingTests {
 
-  /// Create a format description for testing.
-  private func makeFormatDescription(
-    sampleRate: Double = 48000, channels: UInt32 = 1
-  ) -> CMFormatDescription? {
-    var asbd = AudioStreamBasicDescription(
-      mSampleRate: sampleRate,
-      mFormatID: kAudioFormatLinearPCM,
-      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-      mBytesPerPacket: UInt32(MemoryLayout<Float>.size) * channels,
-      mFramesPerPacket: 1,
-      mBytesPerFrame: UInt32(MemoryLayout<Float>.size) * channels,
-      mChannelsPerFrame: channels,
-      mBitsPerChannel: 32,
-      mReserved: 0
-    )
-    var formatDesc: CMFormatDescription?
-    let status = CMAudioFormatDescriptionCreate(
-      allocator: kCFAllocatorDefault,
-      asbd: &asbd,
-      layoutSize: 0, layout: nil,
-      magicCookieSize: 0, magicCookie: nil,
-      extensions: nil,
-      formatDescriptionOut: &formatDesc
-    )
-    return status == noErr ? formatDesc : nil
-  }
-
   /// Create a CMSampleBuffer with known PTS and sample count for testing.
   private func makeSampleBuffer(
-    pts: CMTime, sampleCount: Int, sampleRate: Double = 48000, channels: UInt32 = 1
+    pts: CMTime, sampleCount: Int, sampleRate: Double = 48000, channels: Int = 1
   ) -> CMSampleBuffer? {
-    guard let fd = makeFormatDescription(sampleRate: sampleRate, channels: channels)
-    else { return nil }
-    return AudioRecorder.makeSilentSampleBuffer(
-      formatDescription: fd,
-      channelCount: Int(channels),
+    AudioRecorder.makeSilentSampleBuffer(
+      channelCount: channels,
       sampleCount: sampleCount,
       sampleRate: sampleRate,
       presentationTimeStamp: pts
@@ -338,13 +308,11 @@ struct GapFillingTests {
 
   @Test("makeSilentSampleBuffer creates valid buffer with correct properties")
   func silentBufferProperties() {
-    let fd = makeFormatDescription(sampleRate: 48000, channels: 2)!
     let pts = CMTime(value: 48000, timescale: 48000)  // 1.0s
 
     let sb = AudioRecorder.makeSilentSampleBuffer(
-      formatDescription: fd, channelCount: 2,
-      sampleCount: 1024, sampleRate: 48000,
-      presentationTimeStamp: pts
+      channelCount: 2, sampleCount: 1024,
+      sampleRate: 48000, presentationTimeStamp: pts
     )
     #expect(sb != nil)
     let buffer = sb!
@@ -369,16 +337,14 @@ struct GapFillingTests {
 
   @Test("makeSilentSampleBuffer works for mono and stereo")
   func silentBufferChannels() {
-    let monoFd = makeFormatDescription(sampleRate: 48000, channels: 1)!
-    let stereoFd = makeFormatDescription(sampleRate: 48000, channels: 2)!
     let pts = CMTime(value: 0, timescale: 48000)
 
     let mono = AudioRecorder.makeSilentSampleBuffer(
-      formatDescription: monoFd, channelCount: 1,
-      sampleCount: 512, sampleRate: 48000, presentationTimeStamp: pts)
+      channelCount: 1, sampleCount: 512,
+      sampleRate: 48000, presentationTimeStamp: pts)
     let stereo = AudioRecorder.makeSilentSampleBuffer(
-      formatDescription: stereoFd, channelCount: 2,
-      sampleCount: 512, sampleRate: 48000, presentationTimeStamp: pts)
+      channelCount: 2, sampleCount: 512,
+      sampleRate: 48000, presentationTimeStamp: pts)
 
     #expect(mono != nil)
     #expect(stereo != nil)
@@ -425,4 +391,120 @@ struct GapFillingTests {
     let end = AudioRecorder.bufferEndTime(sb)
     #expect(end.isValid)
   }
+
+  // MARK: - Silent Buffer Format Correctness
+
+  @Test("silent buffer has clean LPCM ASBD with no extensions")
+  func silentBufferCleanASBD() {
+    let sb = AudioRecorder.makeSilentSampleBuffer(
+      channelCount: 2, sampleCount: 1024,
+      sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
+    )!
+    let fd = CMSampleBufferGetFormatDescription(sb)!
+    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)!.pointee
+
+    #expect(asbd.mFormatID == kAudioFormatLinearPCM)
+    #expect(asbd.mSampleRate == 48000)
+    #expect(asbd.mChannelsPerFrame == 2)
+    #expect(asbd.mBitsPerChannel == 32)
+    #expect(asbd.mBytesPerFrame == UInt32(MemoryLayout<Float>.size * 2))
+    #expect(asbd.mBytesPerPacket == UInt32(MemoryLayout<Float>.size * 2))
+    #expect(asbd.mFramesPerPacket == 1)
+    #expect(asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0)
+    #expect(asbd.mFormatFlags & kAudioFormatFlagIsPacked != 0)
+  }
+
+  @Test("silent buffer mono ASBD matches mic pipeline format")
+  func silentBufferMonoASBD() {
+    let sb = AudioRecorder.makeSilentSampleBuffer(
+      channelCount: 1, sampleCount: 512,
+      sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
+    )!
+    let fd = CMSampleBufferGetFormatDescription(sb)!
+    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)!.pointee
+
+    #expect(asbd.mChannelsPerFrame == 1)
+    #expect(asbd.mBytesPerFrame == UInt32(MemoryLayout<Float>.size))
+    #expect(asbd.mBytesPerPacket == UInt32(MemoryLayout<Float>.size))
+  }
+
+  // MARK: - Silence Buffer Boundary Conditions
+
+  @Test("makeSilentSampleBuffer handles minimum sample count")
+  func silentBufferMinSamples() {
+    let sb = AudioRecorder.makeSilentSampleBuffer(
+      channelCount: 1, sampleCount: 1,
+      sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
+    )
+    #expect(sb != nil)
+    #expect(CMSampleBufferGetNumSamples(sb!) == 1)
+    let length = CMBlockBufferGetDataLength(CMSampleBufferGetDataBuffer(sb!)!)
+    #expect(length == MemoryLayout<Float>.size)
+  }
+
+  @Test("makeSilentSampleBuffer handles large chunk (2048 samples)")
+  func silentBufferLargeChunk() {
+    let sb = AudioRecorder.makeSilentSampleBuffer(
+      channelCount: 2, sampleCount: 2048,
+      sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
+    )
+    #expect(sb != nil)
+    #expect(CMSampleBufferGetNumSamples(sb!) == 2048)
+  }
+
+  @Test("makeSilentSampleBuffer preserves PTS across range of timestamps")
+  func silentBufferPTSPreserved() {
+    let timestamps: [CMTime] = [
+      .zero,
+      CMTime(value: 48000, timescale: 48000),  // 1s
+      CMTime(value: 48000 * 3600, timescale: 48000),  // 1 hour
+      CMTime(value: 48000 * 7200, timescale: 48000),  // 2 hours
+    ]
+    for pts in timestamps {
+      let sb = AudioRecorder.makeSilentSampleBuffer(
+        channelCount: 1, sampleCount: 1024,
+        sampleRate: 48000, presentationTimeStamp: pts
+      )!
+      #expect(
+        CMSampleBufferGetPresentationTimeStamp(sb) == pts,
+        "PTS mismatch at \(pts.seconds)s")
+    }
+  }
+
+  // MARK: - bufferEndTime Continuity
+
+  @Test("consecutive buffers have continuous timeline")
+  func bufferEndTimeContinuity() {
+    // Simulate 5 consecutive 1024-sample buffers, verify no gaps in timeline
+    var currentPts = CMTime(value: 0, timescale: 48000)
+    for i in 0..<5 {
+      let sb = makeSampleBuffer(pts: currentPts, sampleCount: 1024)!
+      let endTime = AudioRecorder.bufferEndTime(sb)
+      #expect(endTime.isValid, "Buffer \(i) endTime should be valid")
+
+      let expectedEnd = CMTimeAdd(
+        currentPts, CMTime(value: 1024, timescale: 48000))
+      #expect(
+        abs(endTime.seconds - expectedEnd.seconds) < 0.00001,
+        "Buffer \(i): end \(endTime.seconds) != expected \(expectedEnd.seconds)")
+
+      currentPts = endTime
+    }
+    // After 5 buffers of 1024 samples at 48kHz: 5*1024/48000 = 0.10667s
+    #expect(abs(currentPts.seconds - 5.0 * 1024.0 / 48000.0) < 0.00001)
+  }
+
+  @Test("bufferEndTime at 2-hour mark has sub-sample precision")
+  func bufferEndTimeLongRecording() {
+    // Simulate buffer at 2h mark - verify no precision loss
+    let twoHours = CMTime(value: Int64(48000 * 7200), timescale: 48000)
+    let sb = makeSampleBuffer(pts: twoHours, sampleCount: 1024)!
+    let end = AudioRecorder.bufferEndTime(sb)
+
+    let expected = 7200.0 + 1024.0 / 48000.0
+    #expect(
+      abs(end.seconds - expected) < 0.00001,
+      "Precision loss at 2h: expected \(expected), got \(end.seconds)")
+  }
+
 }

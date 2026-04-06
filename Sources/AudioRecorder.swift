@@ -74,13 +74,10 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
 
   // Gap filling state - per pipeline (D8: silence gap filling)
   nonisolated(unsafe) private var displayNextExpected: CMTime = .invalid
-  nonisolated(unsafe) private var displayFormatDesc: CMFormatDescription?
   nonisolated(unsafe) private var displayGapsFilled: Int = 0
   nonisolated(unsafe) private var appNextExpected: CMTime = .invalid
-  nonisolated(unsafe) private var appFormatDesc: CMFormatDescription?
   nonisolated(unsafe) private var appGapsFilled: Int = 0
   nonisolated(unsafe) private var micNextExpected: CMTime = .invalid
-  nonisolated(unsafe) private var micFormatDesc: CMFormatDescription?
   nonisolated(unsafe) private var micGapsFilled: Int = 0
 
   init(
@@ -481,19 +478,14 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       return
     }
 
-    if micFormatDesc == nil {
-      micFormatDesc = sampleBuffer.formatDescription
-    }
-
     let pts = sampleBuffer.presentationTimeStamp
     let endTime = Self.bufferEndTime(sampleBuffer)
-    if micNextExpected.isValid, let fd = micFormatDesc {
+    if micNextExpected.isValid {
       let gap = CMTimeGetSeconds(pts - micNextExpected)
       if gap > 0.01, let input = micInput {
         let filled = fillGap(
           from: micNextExpected, to: pts,
-          formatDescription: fd, channelCount: 1,
-          sampleRate: 48000, input: input)
+          channelCount: 1, sampleRate: 48000, input: input)
         if filled > 0 {
           micGapsFilled += filled
           Log.info(
@@ -742,13 +734,10 @@ final class AudioRecorder: NSObject, @unchecked Sendable {
       self.appBuffersAppendFailed = 0
       self.appPeakLevel = 0
       self.displayNextExpected = .invalid
-      self.displayFormatDesc = nil
       self.displayGapsFilled = 0
       self.appNextExpected = .invalid
-      self.appFormatDesc = nil
       self.appGapsFilled = 0
       self.micNextExpected = .invalid
-      self.micFormatDesc = nil
       self.micGapsFilled = 0
     }
   }
@@ -789,10 +778,10 @@ extension AudioRecorder {
   }
 
   /// Fills a PTS gap with silence buffers to prevent AVAssetWriter from collapsing the timeline.
+  /// Best-effort: logs and stops on failure without affecting the real audio pipeline.
   /// Returns number of silence buffers written.
   nonisolated private func fillGap(
     from start: CMTime, to end: CMTime,
-    formatDescription: CMFormatDescription,
     channelCount: Int,
     sampleRate: Double,
     input: AVAssetWriterInput
@@ -811,18 +800,31 @@ extension AudioRecorder {
 
       guard
         let sb = Self.makeSilentSampleBuffer(
-          formatDescription: formatDescription,
           channelCount: channelCount,
           sampleCount: count,
           sampleRate: sampleRate,
           presentationTimeStamp: pts
         )
-      else { break }
+      else {
+        Log.error(
+          Log.recorder, "recorder",
+          "silence buffer creation failed at offset \(offset)/\(gapSamples)")
+        break
+      }
 
-      guard input.isReadyForMoreMediaData else { break }
+      guard input.isReadyForMoreMediaData else {
+        Log.info(
+          Log.recorder, "recorder",
+          "silence fill interrupted by back-pressure at \(written)/\(gapSamples / chunkSize) chunks"
+        )
+        break
+      }
       if input.append(sb) {
         written += 1
       } else {
+        Log.error(
+          Log.recorder, "recorder",
+          "silence append failed at offset \(offset)/\(gapSamples)")
         break
       }
       offset += count
@@ -831,9 +833,10 @@ extension AudioRecorder {
     return written
   }
 
-  /// Creates a zero-filled (silent) CMSampleBuffer matching the given format.
+  /// Creates a zero-filled (silent) CMSampleBuffer with a clean LPCM format description.
+  /// Builds its own ASBD from scratch rather than reusing pipeline format descriptions,
+  /// which may carry extensions that cause AVAssetWriter failures (D8).
   nonisolated static func makeSilentSampleBuffer(
-    formatDescription: CMFormatDescription,
     channelCount: Int,
     sampleCount: Int,
     sampleRate: Double,
@@ -841,6 +844,30 @@ extension AudioRecorder {
   ) -> CMSampleBuffer? {
     let bytesPerSample = MemoryLayout<Float>.size * channelCount
     let dataSize = sampleCount * bytesPerSample
+
+    // Build clean LPCM format description - Float32, packed, interleaved, no extensions
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: sampleRate,
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+      mBytesPerPacket: UInt32(bytesPerSample),
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(bytesPerSample),
+      mChannelsPerFrame: UInt32(channelCount),
+      mBitsPerChannel: 32,
+      mReserved: 0
+    )
+    var formatDescription: CMFormatDescription?
+    guard
+      CMAudioFormatDescriptionCreate(
+        allocator: kCFAllocatorDefault,
+        asbd: &asbd,
+        layoutSize: 0, layout: nil,
+        magicCookieSize: 0, magicCookie: nil,
+        extensions: nil,
+        formatDescriptionOut: &formatDescription
+      ) == noErr, let formatDescription
+    else { return nil }
 
     var blockBuffer: CMBlockBuffer?
     guard
@@ -922,19 +949,14 @@ extension AudioRecorder: SCStreamOutput {
       sessionStarted = true
     }
 
-    if displayFormatDesc == nil {
-      displayFormatDesc = sampleBuffer.formatDescription
-    }
-
     let pts = sampleBuffer.presentationTimeStamp
     let endTime = Self.bufferEndTime(sampleBuffer)
-    if displayNextExpected.isValid, let fd = displayFormatDesc {
+    if displayNextExpected.isValid {
       let gap = CMTimeGetSeconds(pts - displayNextExpected)
       if gap > 0.01, let input = displayAudioInput {
         let filled = fillGap(
           from: displayNextExpected, to: pts,
-          formatDescription: fd, channelCount: 2,
-          sampleRate: 48000, input: input)
+          channelCount: 2, sampleRate: 48000, input: input)
         if filled > 0 {
           displayGapsFilled += filled
           Log.info(
@@ -976,19 +998,14 @@ extension AudioRecorder: SCStreamOutput {
       return
     }
 
-    if appFormatDesc == nil {
-      appFormatDesc = sampleBuffer.formatDescription
-    }
-
     let pts = sampleBuffer.presentationTimeStamp
     let endTime = Self.bufferEndTime(sampleBuffer)
-    if appNextExpected.isValid, let fd = appFormatDesc {
+    if appNextExpected.isValid {
       let gap = CMTimeGetSeconds(pts - appNextExpected)
       if gap > 0.01, let input = appAudioInput {
         let filled = fillGap(
           from: appNextExpected, to: pts,
-          formatDescription: fd, channelCount: 2,
-          sampleRate: 48000, input: input)
+          channelCount: 2, sampleRate: 48000, input: input)
         if filled > 0 {
           appGapsFilled += filled
           Log.info(
