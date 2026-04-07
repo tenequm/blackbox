@@ -13,7 +13,7 @@ struct OnboardingView: View {
         case 0: welcomeStep
         case 1: microphoneStep
         case 2: notificationsStep
-        case 3: screenRecordingStep
+        case 3: systemAudioStep
         default: EmptyView()
         }
       }
@@ -31,15 +31,9 @@ struct OnboardingView: View {
           Button("Continue") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         } else {
-          // Screen Recording step: two options
-          VStack(alignment: .trailing, spacing: 6) {
-            Button("Open System Settings") { grantScreenRecording() }
-              .keyboardShortcut(.defaultAction)
-            Button("I'll do this later") { complete() }
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .buttonStyle(.plain)
-          }
+          // System Audio step: permission granted on first recording
+          Button("Complete Setup") { completeOnboarding() }
+            .keyboardShortcut(.defaultAction)
         }
       }
       .padding(16)
@@ -97,37 +91,27 @@ struct OnboardingView: View {
     }
   }
 
-  private var screenRecordingStep: some View {
+  private var systemAudioStep: some View {
     VStack(spacing: 16) {
-      Image(systemName: "rectangle.dashed.badge.record")
+      Image(systemName: "speaker.wave.2.fill")
         .font(.system(size: 48))
         .foregroundStyle(.blue)
-      Text("Screen Recording")
+      Text("System Audio Recording")
         .font(.title2.bold())
       Text(
-        "Blackbox uses Screen Recording to capture app audio via ScreenCaptureKit. It never records your screen - only audio."
+        "Blackbox captures system audio to record both sides of your calls. It never records your screen - only audio."
       )
       .multilineTextAlignment(.center)
       .foregroundStyle(.secondary)
       .frame(maxWidth: 360)
 
-      if CGPreflightScreenCaptureAccess() {
-        HStack(spacing: 8) {
-          Image(systemName: "checkmark.circle.fill")
-            .foregroundStyle(.green)
-          Text("Permission granted")
-            .foregroundStyle(.secondary)
-        }
-        .font(.caption)
-      } else {
-        Text(
-          "After you enable Screen Recording, macOS will ask to restart Blackbox. Go ahead - that completes setup and you're ready to go!"
-        )
-        .font(.caption)
-        .multilineTextAlignment(.center)
-        .foregroundStyle(.tertiary)
-        .frame(maxWidth: 360)
-      }
+      Text(
+        "macOS will ask for permission when your first recording starts. Click Allow when prompted."
+      )
+      .font(.caption)
+      .multilineTextAlignment(.center)
+      .foregroundStyle(.tertiary)
+      .frame(maxWidth: 360)
     }
   }
 
@@ -151,20 +135,11 @@ struct OnboardingView: View {
     }
   }
 
-  private func grantScreenRecording() {
-    // Mark onboarding complete before the restart. Mic and notifications
-    // are already granted from earlier steps. After the user enables Screen
-    // Recording in System Settings, macOS will offer "Quit & Reopen" which
-    // restarts the app with everything configured.
+  private func completeOnboarding() {
+    // CATap permission prompt appears automatically on first recording attempt.
+    // No manual pre-authorization needed, no app restart required.
     UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-
-    if CGPreflightScreenCaptureAccess() {
-      // Already granted (e.g. existing user) - just close
-      onComplete?()
-    } else {
-      CGRequestScreenCaptureAccess()
-      onComplete?()
-    }
+    onComplete?()
   }
 
   private func complete() {

@@ -65,10 +65,8 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    if !CGPreflightScreenCaptureAccess() {
-      Log.info(Log.monitor, "monitor", "screen recording permission not granted")
-      permissionNeeded = true
-    }
+    // CATap has no preflight API - permission is checked on first AudioHardwareCreateProcessTap call.
+    // permissionNeeded will be set to true if recording fails with .permissionDenied.
 
     if !skipPermissionRequests {
       Task {
@@ -205,6 +203,8 @@ final class AudioMonitor {
     Task {
       do {
         try await recorder.start()
+        UserDefaults.standard.set(true, forKey: "audioRecordingGranted")
+        permissionNeeded = false
         manualRestartCount = 0
         manualRestartWindowStart = nil
         recordingStartTime = Date()
@@ -398,7 +398,7 @@ final class AudioMonitor {
   }
 
   /// Returns external processes with both active mic input AND audio output (i.e. calls).
-  /// Filters out our own PID and ScreenCaptureKit XPC helpers.
+  /// Filters out our own PID.
   nonisolated private static func findActiveCallingProcesses() -> [String?] {
     let myPID = ProcessInfo.processInfo.processIdentifier
     var result: [String?] = []
@@ -410,17 +410,7 @@ final class AudioMonitor {
       // Filter out our own process
       if pid == myPID { continue }
 
-      // Filter out ScreenCaptureKit XPC helpers (they open the mic on our behalf)
-      let bundleID = processBundleID(for: objectID)
-      if let bid = bundleID,
-        bid.hasPrefix("com.apple.screencapturekit")
-          || bid.hasPrefix("com.apple.ScreenCaptureKit")
-          || bid.hasPrefix("com.apple.replayd")
-      {
-        continue
-      }
-
-      result.append(bundleID)
+      result.append(processBundleID(for: objectID))
     }
     return result
   }
@@ -499,14 +489,8 @@ final class AudioMonitor {
       return
     }
 
-    // Check screen recording permission
-    if !CGPreflightScreenCaptureAccess() {
-      Log.info(
-        Log.monitor, "monitor", "handleMicBecameActive blocked: screen recording permission denied")
-      permissionNeeded = true
-      return
-    }
-    permissionNeeded = false
+    // CATap permission is checked when AudioRecorder.start() creates the process tap.
+    // If denied, the failure callback sets permissionNeeded = true.
 
     autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
@@ -560,6 +544,8 @@ final class AudioMonitor {
     Task {
       do {
         try await recorder.start()
+        UserDefaults.standard.set(true, forKey: "audioRecordingGranted")
+        permissionNeeded = false
         autoRestartCount = 0
         autoRestartWindowStart = nil
         isRecording = true
@@ -569,8 +555,8 @@ final class AudioMonitor {
         notifyRecordingStarted(appName: appName)
       } catch {
         setError("Failed to start recording: \(error.localizedDescription)")
-        if (error as NSError).domain == "com.apple.ScreenCaptureKit.SCStreamError",
-          (error as NSError).code == -3801
+        if let recError = error as? RecorderError,
+          case .permissionDenied = recError
         {
           permissionNeeded = true
         }
@@ -738,16 +724,16 @@ final class AudioMonitor {
     hud.showError(message: message)
   }
 
-  /// Send system notification when Screen Recording permission is revoked.
+  /// Send system notification when audio recording permission is revoked.
   /// Used because the user may be focused on their call app and not see the menu bar.
   private func notifyPermissionLost() {
     let content = UNMutableNotificationContent()
     content.title = "Recording stopped"
     content.body =
-      "Screen Recording permission was revoked. Re-authorize in System Settings to resume."
+      "System Audio Recording permission was revoked. Re-authorize in System Settings > Privacy & Security to resume."
     content.sound = .default
     let request = UNNotificationRequest(
-      identifier: "screenRecordingPermissionLost",
+      identifier: "audioRecordingPermissionLost",
       content: content,
       trigger: nil
     )

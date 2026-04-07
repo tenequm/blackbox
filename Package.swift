@@ -41,7 +41,6 @@ let package = Package(
                 .treatAllWarnings(as: .error),
             ],
             linkerSettings: [
-                .linkedFramework("ScreenCaptureKit"),
             ]
         ),
         .testTarget(

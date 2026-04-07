@@ -45,8 +45,8 @@ enum AECProcessor {
     }
 
     // Track layout:
-    // 2-track (legacy): [0]=display-wide, [1]=mic
-    // 3-track: [0]=display-wide, [1]=per-app, [2]=mic
+    // 2-track (current): [0]=system audio, [1]=mic
+    // 3-track (legacy, pre-v0.7.0): [0]=display-wide, [1]=per-app, [2]=mic
     let micTrack = tracks[tracks.count - 1]
     let referenceTrack: AVAssetTrack
     if tracks.count >= 3 {

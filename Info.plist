@@ -20,6 +20,8 @@
     <string>15.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Blackbox captures system audio to record both sides of your calls.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Blackbox records your microphone alongside call audio to capture both sides of the conversation.</string>
     <key>SUFeedURL</key>

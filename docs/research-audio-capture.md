@@ -65,7 +65,7 @@ Original assessment (March 2026) dismissed CATap as undocumented with unclear pe
 ### Advantages Over SCStream
 
 - **Better permission model**: `NSAudioCaptureUsageDescription` (audio-only, one-click grant) vs Screen Recording (broad, app restart required)
-- **No Chrome/WebRTC silence bug**: CaTap captures at HAL level, below any private audio paths
+- **No Chrome/WebRTC silence bug**: CATap captures at HAL level, below any private audio paths
 - **Lower latency**: IO proc callback vs SCStream's higher-level buffering
 - **Built-in drift compensation**: `kAudioSubTapDriftCompensationKey: true` on aggregate device
 
@@ -79,13 +79,13 @@ Original assessment (March 2026) dismissed CATap as undocumented with unclear pe
 
 ### Production Usage
 
-- **RecordKit (Nonstrict)**: Made CaTap default backend in v0.82.0, moving away from SCStream for audio. Fixed "audio drift caused by clock domain mismatch" in v0.78.0.
+- **RecordKit (Nonstrict)**: Made CATap default backend in v0.82.0, moving away from SCStream for audio. Fixed "audio drift caused by clock domain mismatch" in v0.78.0.
 - **Chromium**: Added `CatapAudioInputStream` in 2025 behind feature flag
-- **Muesli**: Uses CaTap + real-time WebRTC AEC3 pipeline
+- **Muesli**: Uses CATap + real-time WebRTC AEC3 pipeline
 
-### Critical Finding: CaTap Does NOT Solve Mic-System Sync
+### Critical Finding: CATap Does NOT Solve Mic-System Sync
 
-**No one puts mic in the CaTap aggregate device.** Every implementation (AudioCap, audiotap, AudioCaptureKit, Muesli, RecordKit, Chromium) captures system audio via CaTap and mic separately. The drift compensation key only handles system-audio-internal drift, not mic-vs-system drift.
+**No one puts mic in the CATap aggregate device.** Every implementation (AudioCap, audiotap, AudioCaptureKit, Muesli, RecordKit, Chromium) captures system audio via CATap and mic separately. The drift compensation key only handles system-audio-internal drift, not mic-vs-system drift.
 
 RecordKit still needed:
 - `audioDelay` constant offset compensation (v0.51.0)
@@ -95,7 +95,7 @@ RecordKit still needed:
 ## Reference Implementations
 
 ### insidegui/AudioCap (490 stars, BSD-2)
-- Cleanest CaTap reference (~180 lines)
+- Cleanest CATap reference (~180 lines)
 - System audio only, no mic
 - Uses `kAudioSubTapDriftCompensationKey: true`
 - By Guilherme Rambo (well-known macOS developer)
@@ -110,25 +110,25 @@ RecordKit still needed:
 ### dburkhardt/muesli (macOS meeting recorder)
 - Most sophisticated sync pipeline (AudioSynchronizer + DriftTracker + CoarseDelayController)
 - ~3000 lines of sync code for real-time AEC - overkill without real-time AEC
-- CaTap for system, separate IO proc for mic (NOT in same aggregate)
+- CATap for system, separate IO proc for mic (NOT in same aggregate)
 - AEC non-convergence is biggest open issue (#41)
 - Drift is measured but NOT corrected in audio path
 
 ### Nonstrict RecordKit (commercial SDK)
-- Migrated SCStream -> CaTap (v0.50.0 beta, v0.82.0 default)
+- Migrated SCStream -> CATap (v0.50.0 beta, v0.82.0 default)
 - `audioDelay` offset compensation
 - Post-recording audio stretching for drift
 - WebRTC AEC3 (balanced and aggressive presets)
 - Blog posts: gap handling, audio stretching techniques
 
 ### pablo-health/AudioCaptureKit (AGPL-3.0)
-- Swift 6, CaTap system + AVAudioEngine mic
+- Swift 6, CATap system + AVAudioEngine mic
 - Ring buffer mixing (Left = mic + system L, Right = mic + system R)
 - AGPL license blocks closed-source use
 
-## Apple's Official CaTap Sample Code
+## Apple's Official CATap Sample Code
 - Published for macOS 26.0+ (WWDC 2026)
-- Covers: CaTapDescription, aggregate device, tap setup
+- Covers: CATapDescription, aggregate device, tap setup
 - Does NOT cover: mic capture, synchronization, drift correction, device changes
 
 ## Approaches to Fix Mic-System Alignment
@@ -146,8 +146,8 @@ RecordKit still needed:
 - Apple engineers confirmed: "no way to get accurately timed information from input relative to output without manual calibration"
 - Hardware-dependent, not perfect
 
-### 3. CaTap Migration + audioDelay (Medium-Term)
-- Replace SCStream with CaTap for system audio
+### 3. CATap Migration + audioDelay (Medium-Term)
+- Replace SCStream with CATap for system audio
 - Keep AVAudioEngine for mic
 - Add constant audioDelay compensation
 - Benefits: better permissions, no Chrome silence bug, lower latency
@@ -165,4 +165,4 @@ The sync problem has two independent components:
 1. **PTS gap collapse** (device switches) - SOLVED in v0.6.1 with silence gap filling
 2. **Constant latency offset** (pipeline processing delays) - NOT yet solved
 
-Component 2 is inherent to any dual-pipeline architecture. Even CaTap doesn't solve it because mic is always a separate stream. The practical solutions are post-recording alignment or constant offset compensation.
+Component 2 is inherent to any dual-pipeline architecture. Even CATap doesn't solve it because mic is always a separate stream. The practical solutions are post-recording alignment or constant offset compensation.

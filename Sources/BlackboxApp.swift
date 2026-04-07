@@ -66,8 +66,8 @@ struct BlackboxApp: App {
       installCrashHandler()
       launchWatchdog()
 
-      // Existing users who already granted screen recording don't need onboarding
-      if CGPreflightScreenCaptureAccess() {
+      // Existing users who already granted audio recording don't need onboarding
+      if UserDefaults.standard.bool(forKey: "audioRecordingGranted") {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
       }
 
@@ -197,16 +197,15 @@ struct MenuContent: View {
 
     // Status
     if monitor.permissionNeeded {
-      Text("Screen Recording permission required")
+      Text("System Audio Recording permission required")
         .foregroundStyle(.red)
       Button("Open System Settings") {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+              "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!
         )
       }
-      Button("Restart Blackbox") { restartApp() }
     } else if monitor.micPermissionNeeded {
       Text("Microphone permission needed for manual recordings")
         .foregroundStyle(.orange)
@@ -312,7 +311,7 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
 // MARK: - Helpers
 
 /// Maps audio RMS level to a waveform SF Symbol.
-/// Thresholds tuned for typical call audio captured via ScreenCaptureKit.
+/// Thresholds tuned for typical call audio captured via CATap.
 private func recordingWaveformIcon(level: Float) -> String {
   if level > 0.05 {
     return "waveform"
