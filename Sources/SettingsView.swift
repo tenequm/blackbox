@@ -174,8 +174,48 @@ struct SettingsView: View {
 
   // MARK: - Transcription
 
+  @AppStorage(TranscriptionProvider.defaultsKey) private var defaultProvider = "local"
+  @State private var isDownloadingModels = false
+  @State private var localModelsReady = LocalTranscriptionService.modelsReady
+
   private var transcriptionSection: some View {
     Section("Transcription") {
+      Picker("Default provider", selection: $defaultProvider) {
+        Text("Local (on-device)").tag("local")
+        Text("Soniox (cloud)").tag("soniox")
+      }
+
+      if localModelsReady {
+        Label("Models downloaded", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+          .font(.caption)
+      } else {
+        HStack {
+          Button("Download Models") {
+            isDownloadingModels = true
+            Task {
+              do {
+                try await LocalTranscriptionService.prepareModels { _ in }
+                localModelsReady = true
+              } catch {
+                Log.error(
+                  Log.transcription, "settings",
+                  "model download failed: \(error.localizedDescription)")
+              }
+              isDownloadingModels = false
+            }
+          }
+          .disabled(isDownloadingModels)
+          if isDownloadingModels {
+            ProgressView()
+              .controlSize(.small)
+          }
+        }
+        Text("Required for local transcription. Downloads ~300 MB of speech models.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+
       SecureField("Soniox API Key", text: $sonioxAPIKey)
       Text(
         "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."

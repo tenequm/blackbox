@@ -155,7 +155,21 @@ struct RecordingsView: View {
         let processedSize =
           hasProcessed
           ? ((try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) : 0
-        let sidecar = TranscriptDocument.sidecarURL(for: url)
+        TranscriptDocument.migrateLegacyTranscript(in: url)
+        var available = Set<TranscriptionProvider>()
+        for provider in TranscriptionProvider.allCases {
+          let sidecar = TranscriptDocument.sidecarURL(for: url, provider: provider)
+          if FileManager.default.fileExists(atPath: sidecar.path) {
+            available.insert(provider)
+          }
+        }
+        // Fallback: unmigrated legacy transcript counts as soniox
+        if !available.contains(.soniox),
+          FileManager.default.fileExists(
+            atPath: url.appendingPathComponent("transcript.json").path)
+        {
+          available.insert(.soniox)
+        }
         results.append(
           RecordingFile(
             url: url,
@@ -167,7 +181,7 @@ struct RecordingsView: View {
               ).contentModificationDate) ?? .distantPast,
             size: originalSize + processedSize,
             hasProcessed: hasProcessed,
-            hasTranscript: FileManager.default.fileExists(atPath: sidecar.path)
+            availableTranscripts: available
           ))
       }
 
@@ -296,7 +310,7 @@ private struct RecordingRow: View {
             .foregroundStyle(.secondary)
             .help("Echo cancellation applied")
         }
-        if recording.hasTranscript {
+        if !recording.availableTranscripts.isEmpty {
           Image(systemName: "text.quote")
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -346,8 +360,15 @@ struct RecordingDetailView: View {
   @State private var editedTitle = ""
 
   // Transcription
-  @State private var transcript: TranscriptDocument?
-  @State private var transcriptionStatus: TranscriptionStatus = .idle
+  @State private var activeProvider: TranscriptionProvider = {
+    TranscriptionProvider(
+      rawValue: UserDefaults.standard.string(forKey: TranscriptionProvider.defaultsKey) ?? "local"
+    ) ?? .local
+  }()
+  @State private var localTranscript: TranscriptDocument?
+  @State private var sonioxTranscript: TranscriptDocument?
+  @State private var localTranscriptionStatus: TranscriptionStatus = .idle
+  @State private var sonioxTranscriptionStatus: TranscriptionStatus = .idle
   @State private var transcriptionTask: Task<Void, Never>?
 
   var body: some View {
@@ -434,7 +455,7 @@ struct RecordingDetailView: View {
       }
       Spacer()
       HStack(spacing: 8) {
-        if transcript != nil {
+        if activeTranscript != nil {
           Button {
             exportTranscript()
           } label: {
@@ -721,7 +742,24 @@ struct RecordingDetailView: View {
     onTitleChanged()
   }
 
+  private var activeTranscript: TranscriptDocument? {
+    switch activeProvider {
+    case .local: localTranscript
+    case .soniox: sonioxTranscript
+    }
+  }
+
+  private var activeTranscriptionStatus: TranscriptionStatus {
+    switch activeProvider {
+    case .local: localTranscriptionStatus
+    case .soniox: sonioxTranscriptionStatus
+    }
+  }
+
   private func speakerName(for speakerID: Int) -> String {
+    if let name = activeTranscript?.speakers?[String(speakerID)], !name.isEmpty {
+      return name
+    }
     if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
       return name
     }
@@ -729,67 +767,94 @@ struct RecordingDetailView: View {
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
-    var meta =
-      metadata
-      ?? RecordingMetadata(
-        title: recording.title,
-        createdAt: recording.date,
-        appName: recording.title,
-        speakers: [:]
-      )
-    meta.speakers[String(speakerID)] = name
-    try? meta.save(in: recording.url)
-    metadata = meta
+    switch activeProvider {
+    case .local:
+      if localTranscript?.speakers == nil { localTranscript?.speakers = [:] }
+      localTranscript?.speakers?[String(speakerID)] = name
+      if let doc = localTranscript {
+        try? doc.save(for: recording.url, provider: .local)
+      }
+    case .soniox:
+      if sonioxTranscript?.speakers == nil { sonioxTranscript?.speakers = [:] }
+      sonioxTranscript?.speakers?[String(speakerID)] = name
+      if let doc = sonioxTranscript {
+        try? doc.save(for: recording.url, provider: .soniox)
+      }
+    }
   }
 
   // MARK: - Transcript
 
   private var transcriptArea: some View {
-    Group {
-      if let transcript, !transcript.segments.isEmpty {
-        transcriptView(transcript)
-      } else if case .error(let msg) = transcriptionStatus {
-        VStack(spacing: 12) {
-          Image(systemName: "exclamationmark.triangle")
-            .font(.title)
-            .foregroundStyle(.secondary)
-          Text(msg)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-          Button("Retry") { startTranscription() }
-            .buttonStyle(.bordered)
+    VStack(spacing: 0) {
+      Picker("", selection: $activeProvider) {
+        ForEach(TranscriptionProvider.allCases) { p in
+          Text(p.label).tag(p)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if transcriptionStatus != .idle {
-        VStack(spacing: 12) {
-          ProgressView()
-          Text(transcriptionStatusText)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-          Button("Cancel") { cancelTranscription() }
-            .buttonStyle(.bordered)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else {
-        VStack(spacing: 12) {
-          if sonioxAPIKey.isEmpty {
-            Text("Add your Soniox API key in Settings to enable transcription")
+      }
+      .pickerStyle(.segmented)
+      .frame(width: 180)
+      .padding(.vertical, 8)
+
+      Divider()
+
+      Group {
+        if let transcript = activeTranscript, !transcript.segments.isEmpty {
+          transcriptView(transcript)
+        } else if case .error(let msg) = activeTranscriptionStatus {
+          VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+              .font(.title)
+              .foregroundStyle(.secondary)
+            Text(msg)
               .font(.caption)
               .foregroundStyle(.secondary)
               .multilineTextAlignment(.center)
-          } else {
-            Button("Transcribe") { startTranscription() }
-              .buttonStyle(.borderedProminent)
+            Button("Retry") { startActiveTranscription() }
+              .buttonStyle(.bordered)
           }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if activeTranscriptionStatus != .idle {
+          VStack(spacing: 12) {
+            ProgressView()
+            Text(transcriptionStatusText)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            Button("Cancel") { cancelTranscription() }
+              .buttonStyle(.bordered)
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          providerIdleView
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
     }
   }
 
+  private var providerIdleView: some View {
+    VStack(spacing: 12) {
+      switch activeProvider {
+      case .local:
+        Button("Transcribe") { startLocalTranscription() }
+          .buttonStyle(.borderedProminent)
+      case .soniox:
+        if sonioxAPIKey.isEmpty {
+          Text("Add your Soniox API key in Settings to enable cloud transcription")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+        } else {
+          Button("Transcribe") { startSonioxTranscription() }
+            .buttonStyle(.borderedProminent)
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
   private var transcriptionStatusText: String {
-    switch transcriptionStatus {
+    switch activeTranscriptionStatus {
+    case .preparing: "Loading models..."
     case .uploading: "Uploading audio..."
     case .queued: "Queued for transcription..."
     case .transcribing: "Transcribing..."
@@ -840,49 +905,93 @@ struct RecordingDetailView: View {
   // MARK: - Transcription Lifecycle
 
   private func loadTranscript() {
-    transcript = TranscriptDocument.load(for: recording.url)
-    transcriptionStatus = .idle
+    localTranscript = TranscriptDocument.load(for: recording.url, provider: .local)
+    sonioxTranscript =
+      TranscriptDocument.load(for: recording.url, provider: .soniox)
+      ?? TranscriptDocument.loadLegacy(in: recording.url)
+    localTranscriptionStatus = .idle
+    sonioxTranscriptionStatus = .idle
   }
 
-  private func startTranscription() {
+  private func startActiveTranscription() {
+    switch activeProvider {
+    case .local: startLocalTranscription()
+    case .soniox: startSonioxTranscription()
+    }
+  }
+
+  private func startLocalTranscription() {
+    transcriptionTask = Task {
+      localTranscriptionStatus = .preparing
+      do {
+        let doc = try await LocalTranscriptionService.transcribe(
+          recordingDirectory: recording.url
+        ) { status in
+          Task { @MainActor in
+            localTranscriptionStatus = status
+          }
+        }
+        localTranscript = doc
+        localTranscriptionStatus = .completed
+        onTranscriptChanged()
+        do {
+          try doc.save(for: recording.url, provider: .local)
+        } catch {
+          Log.error(
+            Log.transcription, "local",
+            "failed to save transcript: \(error.localizedDescription)")
+        }
+      } catch is CancellationError {
+        localTranscriptionStatus = .idle
+      } catch {
+        if Task.isCancelled {
+          localTranscriptionStatus = .idle
+        } else {
+          localTranscriptionStatus = .error(error.localizedDescription)
+          Log.error(
+            Log.transcription, "local", "failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func startSonioxTranscription() {
     guard !sonioxAPIKey.isEmpty else { return }
 
     transcriptionTask = Task {
       let service = TranscriptionService(apiKey: sonioxAPIKey)
-      transcriptionStatus = .uploading
+      sonioxTranscriptionStatus = .uploading
 
       do {
         let doc = try await service.transcribe(
           fileURL: recording.audioURL,
           onStatus: { status in
-            transcriptionStatus = status
+            sonioxTranscriptionStatus = status
           }
         )
-        // Show transcript immediately, then persist
-        transcript = doc
-        transcriptionStatus = .completed
+        sonioxTranscript = doc
+        sonioxTranscriptionStatus = .completed
         onTranscriptChanged()
         do {
-          try doc.save(for: recording.url)
+          try doc.save(for: recording.url, provider: .soniox)
         } catch {
           Log.error(
             Log.transcription, "transcription",
             "failed to save transcript: \(error.localizedDescription)")
         }
       } catch is CancellationError {
-        transcriptionStatus = .idle
+        sonioxTranscriptionStatus = .idle
       } catch let error as URLError where error.code == .cancelled {
-        // URLSession throws URLError.cancelled when Task is cancelled
         if Task.isCancelled {
-          transcriptionStatus = .idle
+          sonioxTranscriptionStatus = .idle
         } else {
-          transcriptionStatus = .error(error.localizedDescription)
+          sonioxTranscriptionStatus = .error(error.localizedDescription)
         }
       } catch {
         if Task.isCancelled {
-          transcriptionStatus = .idle
+          sonioxTranscriptionStatus = .idle
         } else {
-          transcriptionStatus = .error(error.localizedDescription)
+          sonioxTranscriptionStatus = .error(error.localizedDescription)
           Log.error(
             Log.transcription, "transcription",
             "failed: \(error.localizedDescription)")
@@ -894,14 +1003,20 @@ struct RecordingDetailView: View {
   private func cancelTranscription() {
     transcriptionTask?.cancel()
     transcriptionTask = nil
-    if case .error = transcriptionStatus { return }
-    transcriptionStatus = .idle
+    switch activeProvider {
+    case .local:
+      if case .error = localTranscriptionStatus { return }
+      localTranscriptionStatus = .idle
+    case .soniox:
+      if case .error = sonioxTranscriptionStatus { return }
+      sonioxTranscriptionStatus = .idle
+    }
   }
 
   // MARK: - Transcript Export
 
   private func exportTranscript() {
-    guard let transcript, !transcript.segments.isEmpty else { return }
+    guard let transcript = activeTranscript, !transcript.segments.isEmpty else { return }
 
     let panel = NSSavePanel()
     panel.nameFieldStringValue = "\(recording.title).json"
@@ -1051,7 +1166,7 @@ struct RecordingFile: Identifiable {
   let date: Date  // from metadata.createdAt
   let size: Int
   let hasProcessed: Bool
-  let hasTranscript: Bool
+  let availableTranscripts: Set<TranscriptionProvider>
 
   var sizeFormatted: String {
     ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)

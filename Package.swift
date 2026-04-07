@@ -7,6 +7,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
         .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
     ],
     targets: [
         .target(
@@ -32,6 +33,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "DTLNAecCoreML", package: "dtln-aec-coreml"),
                 .product(name: "DTLNAec256", package: "dtln-aec-coreml"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Sources",
             exclude: ["ObjCExceptionCatcher", "Watchdog"],
