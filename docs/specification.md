@@ -91,7 +91,7 @@ These are non-obvious constraints discovered during implementation that future c
 
 - **CoreAudio per-process APIs require macOS 14.2+.** `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`, `kAudioProcessPropertyIsRunningOutput`. CATap (`AudioHardwareCreateProcessTap`) also requires macOS 14.2+.
 
-- **CATapDescription is ObjC-only.** The `CATapDescription` class has no Swift equivalent. Requires an ObjC bridging file to create and configure tap descriptions from Swift.
+- **CATapDescription imports directly in Swift.** `import AudioToolbox` exposes `CATapDescription` in Swift on macOS 14.4+. No ObjC bridging header needed. Confirmed by Apple's own WWDC 2026 sample code and insidegui/AudioCap (490 stars).
 
 ---
 
@@ -110,17 +110,17 @@ Architectural decisions with reasoning and alternatives considered.
 
 ### D1: AVAudioEngine for mic instead of SCStream .microphone
 
-**Decision:** Use AVAudioEngine tap on inputNode for mic capture. Set `captureMicrophone = false` on SCStream.
+**Decision:** Use AVAudioEngine tap on inputNode for mic capture, independent from system audio capture.
 
 **Alternatives considered:**
-- **SCStream `.microphone`** (previous implementation): requires manual device following via CoreAudio listener + `updateConfiguration()`. On failure, recording splits into separate files. Tied to SCStream lifecycle.
-- **AVCaptureSession + AVCaptureAudioDataOutput**: gives CMSampleBuffer natively (no conversion), structured interruption notifications. But requires manual device switching similar to the SCStream approach - doesn't solve the core problem.
+- **SCStream `.microphone`** (macOS 15+): requires manual device following via CoreAudio listener + `updateConfiguration()`. On failure, recording splits into separate files. Tied to SCStream lifecycle. Documented bugs with corrupted files and XPC PID uncertainty.
+- **AVCaptureSession + AVCaptureAudioDataOutput**: gives CMSampleBuffer natively (no conversion), structured interruption notifications. But requires manual device switching - doesn't solve the core problem.
 
-**Why AVAudioEngine wins:** Automatic device following via inputNode. One `AVAudioEngineConfigurationChange` notification handler replaces ~140 lines of CoreAudio listener management. Device switches cause a sub-second gap in the same file instead of a recording split. Independent from SCStream - mic survives SCStream death.
+**Why AVAudioEngine wins:** Automatic device following via inputNode. One `AVAudioEngineConfigurationChange` notification handler replaces ~140 lines of CoreAudio listener management. Device switches cause a sub-second gap in the same file instead of a recording split. Independent from CATap system audio pipeline - mic survives CATap aggregate device rebuild.
 
 **Device switch gap is unavoidable.** When `AVAudioEngineConfigurationChange` fires, the engine has already stopped itself internally. The tap must be removed and reinstalled with the new device's format. This is a platform limitation - the engine cannot survive a sample rate or channel count change without a restart. The 300ms debounce (for Krisp's rapid-fire config changes) dominates the gap duration; the actual reinstall takes <10ms. See D8 for how these gaps are filled with silence to prevent track desync.
 
-**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate. Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits`, then adjusted by the device latency offset (D9) for alignment with CATap system audio.
+**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate (existing `asSampleBuffer()` extension). Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits`, then adjusted by the device latency offset (D9) for alignment with CATap system audio.
 
 ### D2: Remove post-recording audio mixing
 
@@ -167,9 +167,29 @@ Architectural decisions with reasoning and alternatives considered.
 5. Create IO proc via `AudioDeviceCreateIOProcIDWithBlock` on the aggregate device
 6. Start with `AudioDeviceStart` (must respect ordering constraint - see constraints section)
 
-**IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation). Convert to `CMSampleBuffer` and dispatch to `audioQueue` for writing.
+**IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation).
+
+**AudioBufferList-to-CMSampleBuffer conversion:** The IO proc receives raw `AudioBufferList`. To write via AVAssetWriter, convert on `audioQueue`:
+1. Wrap the `AudioBufferList` data in a `CMBlockBuffer` via `CMBlockBufferCreateWithMemoryBlock` (copy the data - the IO proc buffer is only valid during the callback)
+2. Build `CMSampleTimingInfo` from `inTimeStamp.mHostTime` converted via `CMClockMakeHostTimeFromSystemUnits`
+3. Create `CMSampleBuffer` via `CMSampleBufferCreateReady` with a clean Float32 interleaved LPCM `CMAudioFormatDescription` (same approach as `makeSilentSampleBuffer`)
+4. Dispatch to `audioQueue` for gap detection and writing
+
+Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)` for zero-copy wrapping of the `AudioBufferList`, then convert to `CMSampleBuffer` via the existing `asSampleBuffer()` extension. The zero-copy path avoids a memcpy but requires the format to match exactly (Float32, interleaved, matching channel count).
 
 **Output device change:** When the system default output device changes, the tap's aggregate device must be torn down and rebuilt. This causes a gap in system audio (~0.5-1.5s), handled by silence gap filling (D8). Listen for `kAudioHardwarePropertyDefaultOutputDevice` changes.
+
+**Teardown sequence (on recording stop):**
+1. Stop IO proc: `AudioDeviceStop(aggregateDeviceID, ioProcID)`
+2. Destroy IO proc: `AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)`
+3. Destroy aggregate device: `AudioHardwareDestroyAggregateDevice(aggregateDeviceID)`
+4. Destroy process tap: `AudioHardwareDestroyProcessTap(tapID)`
+5. Remove output device change listener
+6. Order matters - destroying the aggregate before stopping the IO proc can crash
+
+**CATap permission denial behavior:** If `NSAudioCaptureUsageDescription` is missing from Info.plist, `AudioHardwareCreateProcessTap` succeeds but the tap delivers silence with NO error. The recording appears to work but contains no audio. Always verify the Info.plist key exists. If the user denies the permission prompt, `AudioHardwareCreateProcessTap` returns `kAudioHardwareBadObjectError` (-66580).
+
+**Aggregate device mic list filtering:** The CATap aggregate device may appear in the system's input device list (`kAudioHardwarePropertyDevices` with input scope). Filter it out when displaying available mics or when `AVAudioEngine` is selecting a default input device. RecordKit fixed this in v0.84.0 ("Filter out aggregate device from available microphone list").
 
 **Track layout (fixed at writer setup):**
 - Track 0: system audio (2ch stereo)
@@ -191,7 +211,7 @@ Architectural decisions with reasoning and alternatives considered.
 
 **The problem:** Without AEC, the mic track picks up the remote person's voice through speakers. Playing both tracks simultaneously produces audible echo/doubling. The track selector (Both/System/Mic) lets users isolate tracks during playback.
 
-**Why VPIO was rejected:** VPIO hooks into the system audio output path to create an aggregate device for its AEC reference signal. This conflicts with system audio capture - tested and confirmed with SCStream, and the conflict likely extends to CATap since both tap the same output path. The alona project independently confirmed: "When capturing system audio, voice processing causes audio quality issues."
+**Why VPIO was rejected:** VPIO hooks into the system audio output path to create an aggregate device for its AEC reference signal. This conflicts with CATap's aggregate device - both compete for the output path. Originally confirmed with SCStream, independently confirmed by the alona project: "When capturing system audio, voice processing causes audio quality issues."
 
 **Current mitigation:** DTLN-aec CoreML post-processing uses the system audio track (track 0) as the AEC reference to cancel echo from the mic track. Device latency offset compensation (D9) improves AEC quality by reducing the initial misalignment between the reference and mic tracks.
 
@@ -205,13 +225,13 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Why not just use correct timestamps:** The mic tap already uses `AVAudioTime.hostTime` (wall clock) for PTS, so timestamps correctly reflect the gap. But AVAssetWriter's AAC encoder ignores timestamp discontinuities and concatenates samples. There is no AVAssetWriter property or setting to change this behavior.
 
-**Clock domain alignment:** SCStream PTS and AVAudioEngine mic PTS are both on the host time clock (`mach_absolute_time`). Apple documents `AVAudioTime.hostTime` as `mach_absolute_time`. SCStream's `synchronizationClock` is the host clock in practice (confirmed by Nonstrict/RecordKit using `CMClock.hostTimeClock.time` for session start). `AVAssetWriter` performs no clock normalization - it assumes all inputs share the same timeline, which they do. Cross-correlation of a 2-hour recording confirmed both clocks run at the same rate (0.049s variation over 7233s).
+**Clock domain alignment:** CATap IO proc timestamps and AVAudioEngine mic PTS are both on the host time clock (`mach_absolute_time`). Apple documents `AVAudioTime.hostTime` as `mach_absolute_time`. CATap's IO proc receives `AudioTimeStamp` with `mHostTime` in the same clock domain. `AVAssetWriter` performs no clock normalization - it assumes all inputs share the same timeline, which they do. Cross-correlation of a 2-hour recording confirmed both clocks run at the same rate (0.049s variation over 7233s).
 
 **AAC priming is not a concern:** Each AVAssetWriterInput gets its own AAC encoder with identical 2112-sample priming (Apple TN2258). AVAssetWriter writes per-track edit lists to trim priming on playback. Since all tracks use the same Apple AAC encoder, priming is consistent across tracks and does not cause inter-track offset.
 
 **Implementation constraints:**
 - Silence buffers must be written in small chunks (~1024 samples matching normal buffer cadence). One large silent buffer spanning the entire gap causes `kCMSampleBufferError_ArrayTooSmall` (-12737) or crashes the AAC encoder (confirmed by darrarski/macOS-audio-gap-demo and SO reports).
-- Silence buffers must use a clean LPCM format description built from scratch (Float32, packed, interleaved, no extensions). Do NOT reuse the format description captured from SCStream or AVAudioEngine buffers - those may include channel layout extensions or non-interleaved flags that don't match the flat zero-filled block buffer, causing `input.append()` to reject or the writer to enter `.failed` state.
+- Silence buffers must use a clean LPCM format description built from scratch (Float32, packed, interleaved, no extensions). Do NOT reuse format descriptions from pipeline buffers - those may include channel layout extensions or non-interleaved flags that don't match the flat zero-filled block buffer, causing `input.append()` to reject or the writer to enter `.failed` state.
 - Gap detection threshold: >10ms (480 samples at 48kHz) to avoid false positives from normal PTS jitter.
 - Gap filling runs on `audioQueue`, same as all other writer state mutations.
 - `nextExpectedTime` is updated BEFORE the `isReadyForMoreMediaData` guard, so dropped buffers don't create false gaps on the next buffer.
@@ -219,7 +239,7 @@ Architectural decisions with reasoning and alternatives considered.
 **Safety: never risk the recording for sync.**
 - If silence `input.append()` returns false, break out of the fill loop and proceed to write the real buffer. Accept partial desync over data loss.
 - If `isReadyForMoreMediaData` is false during filling, break immediately - don't block `audioQueue` waiting.
-- The real buffer is always attempted regardless of gap fill outcome. Existing error handling in `handleDisplaySample` catches writer `.failed` state.
+- The real buffer is always attempted regardless of gap fill outcome. Existing error handling in the system audio sample handler catches writer `.failed` state.
 - With a clean LPCM ASBD, the risk of silence causing writer failure is essentially zero - it's the same format that `asSampleBuffer()` produces for mic audio.
 - Log all gap fills (real-time) and partial fill interruptions for diagnostics. Summarize `gapsFilled` count per pipeline in stop() stats.
 
@@ -233,7 +253,7 @@ Architectural decisions with reasoning and alternatives considered.
 - *Post-processing gap repair:* Cannot detect gaps after the fact - AVAssetWriter already collapsed them and rewrote timestamps to be contiguous.
 - *Keep AVAudioEngine tap alive through device switch:* Not possible. AVAudioEngine stops and uninitializes itself on config change (`AVAudioEngineConfigurationChangeNotification` fires after the engine is already stopped). Platform limitation, no workaround.
 - *Low-level AUHAL AudioUnit for mic:* Reduces gap duration (~50ms vs ~300ms debounce) but doesn't eliminate it. Still needs silence filling. 200+ lines of C-level CoreAudio code for marginal improvement.
-- *AVCaptureSession for mic:* Still a separate pipeline from SCStream, same cross-clock issue. No advantage over AVAudioEngine for this problem.
+- *AVCaptureSession for mic:* Still a separate pipeline from CATap, same cross-clock issue. No advantage over AVAudioEngine for this problem.
 
 **Scope:** Both pipelines (system audio, mic). Mic device switches are the most common source of gaps. CATap aggregate device rebuilds on output device change can gap the system audio pipeline.
 
