@@ -203,7 +203,8 @@ struct MenuContent: View {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+          )!
         )
       }
     } else if monitor.micPermissionNeeded {

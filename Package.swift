@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Blackbox",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS("26.1")],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
         .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
@@ -39,8 +39,6 @@ let package = Package(
                 .swiftLanguageMode(.v6),
                 .defaultIsolation(MainActor.self),
                 .treatAllWarnings(as: .error),
-            ],
-            linkerSettings: [
             ]
         ),
         .testTarget(

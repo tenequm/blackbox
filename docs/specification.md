@@ -85,7 +85,7 @@ This document records architectural decisions and their reasoning. Implementatio
 
 **v0.6.1 (Apr 2026):** Smoke testing revealed 8.64s desync over a 2-hour recording - AVAssetWriter collapses PTS gaps from mic device switches. Implemented silence gap filling (D8) to preserve timeline integrity across both pipelines.
 
-**v0.7.0 (planned):** Post-gap-fix testing revealed a separate constant latency offset (~20-70ms) between mic and system audio. Research led to CATap migration (D5): better permissions (audio-only vs Screen Recording), no Chrome silence bug, lower latency, simpler pipeline. Dual SCStream replaced by single CATap. Per-app track dropped entirely - added complexity without real-world benefit. Device latency offset compensation (D9) addresses the constant offset. Output simplified to fixed 2-track M4A.
+**v0.7.0 (Apr 2026):** CATap migration (D5) replaces dual SCStream. Per-app track dropped. Fixed 2-track M4A. Device latency offset compensation (D9). Requires macOS 26.1+. Adopted CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, `AudioHardwareAggregateDevice`, `AudioHardwareProcess`) eliminating ~170 lines of C-level CoreAudio boilerplate. Converted AudioRecorder from class to Swift 6.2 actor with custom `DispatchSerialQueue` executor, replacing all `nonisolated(unsafe)` declarations with compile-time actor isolation safety. Fixed mic latency offset to use actual device sample rate and `AudioConvertNanosToHostTime` for correct Mach time conversion.
 
 ---
 
@@ -103,9 +103,9 @@ These are non-obvious constraints discovered during implementation that future c
 
 - **AudioDeviceStart hang.** Starting a physical input device (mic) via `AudioDeviceCreateIOProcID` while a CATap aggregate device is already running blocks the calling thread indefinitely. Workaround: stop aggregate device, start mic, restart aggregate device. Documented in graphaelli/audiotap.
 
-- **CoreAudio per-process APIs require macOS 14.2+.** `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`, `kAudioProcessPropertyIsRunningOutput`. CATap (`AudioHardwareCreateProcessTap`) also requires macOS 14.2+.
+- **CoreAudio per-process APIs require macOS 14.2+.** `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`, `kAudioProcessPropertyIsRunningOutput`. CATap (`AudioHardwareCreateProcessTap`) also requires macOS 14.2+. All available at the current macOS 26.1+ deployment target.
 
-- **CATapDescription imports directly in Swift.** `import AudioToolbox` exposes `CATapDescription` in Swift on macOS 14.4+. No ObjC bridging header needed. Confirmed by Apple's own WWDC 2026 sample code and insidegui/AudioCap (490 stars).
+- **CATapDescription imports directly in Swift.** `import AudioToolbox` exposes `CATapDescription` in Swift on macOS 14.4+. No ObjC bridging header needed. CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, etc.) available since macOS 15.0 via `import CoreAudio`.
 
 ---
 
@@ -115,6 +115,8 @@ Two TCC permissions required:
 
 - **System Audio Recording** - for CATap system audio capture. Requires `NSAudioCaptureUsageDescription` in Info.plist. One-click grant in System Settings (no app restart required). On macOS 26+, an existing Screen Recording permission also grants this access.
 - **Microphone** - for AVAudioEngine mic capture. Requires `NSMicrophoneUsageDescription` in Info.plist. If denied, system audio still records.
+
+macOS 26+ uses the `com.apple.settings.PrivacySecurity.extension` URL scheme for System Settings deep links (replaces `com.apple.preference.security`).
 
 ---
 
@@ -162,7 +164,7 @@ Architectural decisions with reasoning and alternatives considered.
 
 ### D5: CATap for system audio (replaces dual SCStream)
 
-**Decision:** Use CoreAudio Process Tap (`AudioHardwareCreateProcessTap`) via an aggregate device for all system audio capture. Replaces the previous dual-SCStream architecture (display-wide + per-app).
+**Decision:** Use CoreAudio Process Tap via Swift wrappers (`AudioHardwareSystem.shared.makeProcessTap`) and an aggregate device for all system audio capture. Replaces the previous dual-SCStream architecture (display-wide + per-app).
 
 **Previous implementation:** Two SCStream instances - display-wide (critical) + per-app (best-effort) writing to 2-3 track M4A. Per-app track existed to provide a cleaner AEC reference, but was unreliable (Chrome/WebRTC silence bug) and added complexity without real-world benefit.
 
@@ -174,12 +176,12 @@ Architectural decisions with reasoning and alternatives considered.
 - **Simpler pipeline.** One capture stream instead of two SCStreams. Fixed 2-track output (system + mic) instead of variable 2-3 tracks.
 
 **Setup sequence:**
-1. Translate own PID to AudioObjectID via `kAudioHardwarePropertyTranslatePIDToProcessObject`
+1. Get own process via `AudioHardwareSystem.shared.process(for: pid)`
 2. Create `CATapDescription(stereoGlobalTapButExcludeProcesses:)` excluding own PID
-3. Call `AudioHardwareCreateProcessTap` to get tap ID
-4. Create private aggregate device via `AudioHardwareCreateAggregateDevice` with tap in `kAudioAggregateDeviceTapListKey` and `kAudioSubTapDriftCompensationKey: true`
-5. Create IO proc via `AudioDeviceCreateIOProcIDWithBlock` on the aggregate device
-6. Start with `AudioDeviceStart` (must respect ordering constraint - see constraints section)
+3. Create tap via `system.makeProcessTap(description:)` - returns `AudioHardwareTap`
+4. Create private aggregate device via `system.makeAggregateDevice(description:)` with tap in `kAudioAggregateDeviceTapListKey` and `kAudioSubTapDriftCompensationKey: true`
+5. Create IO proc via `AudioDeviceCreateIOProcIDWithBlock` on `aggregate.id` (no Swift wrapper for IO proc creation)
+6. Start with `aggregate.start(IOProcID:)`
 
 **IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation).
 
@@ -194,12 +196,12 @@ Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)
 **Output device change:** When the system default output device changes, the tap's aggregate device must be torn down and rebuilt. This causes a gap in system audio (~0.5-1.5s), handled by silence gap filling (D8). Listen for `kAudioHardwarePropertyDefaultOutputDevice` changes.
 
 **Teardown sequence (on recording stop):**
-1. Stop IO proc: `AudioDeviceStop(aggregateDeviceID, ioProcID)`
-2. Destroy IO proc: `AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)`
-3. Destroy aggregate device: `AudioHardwareDestroyAggregateDevice(aggregateDeviceID)`
-4. Destroy process tap: `AudioHardwareDestroyProcessTap(tapID)`
+1. Stop IO proc: `aggregate.stop(IOProcID:)`
+2. Destroy IO proc: `AudioDeviceDestroyIOProcID(aggregate.id, ioProcID)` (no Swift wrapper)
+3. Destroy aggregate device: `system.destroyAggregateDevice(aggregate)`
+4. Destroy process tap: `system.destroyProcessTap(tap)`
 5. Remove output device change listener
-6. Order matters - destroying the aggregate before stopping the IO proc can crash
+6. Order matters - destroying the aggregate before stopping the IO proc can crash. Wrappers have explicit lifecycle (not RAII) - must call destroy before nilling the reference
 
 **CATap permission denial behavior:** If `NSAudioCaptureUsageDescription` is missing from Info.plist, `AudioHardwareCreateProcessTap` succeeds but the tap delivers silence with NO error. The recording appears to work but contains no audio. Always verify the Info.plist key exists. If the user denies the permission prompt, `AudioHardwareCreateProcessTap` returns `kAudioHardwareBadObjectError` (-66580).
 
@@ -279,15 +281,15 @@ Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)
 
 **Why this wasn't a problem before (but was):** The previous SCStream architecture had the same offset issue, but it was masked by SCStream's higher internal buffering latency which happened to partially cancel out the mic's hardware latency. With CATap's lower-latency IO proc delivery, the offset is more pronounced and consistent.
 
-**How offset is computed:** Query the input device's total latency in frames at recording start:
+**How offset is computed:** Query the input device's total latency in frames at recording start using CoreAudio Swift wrappers:
 
 ```
-Input latency (frames) = kAudioDevicePropertyLatency (input scope)
-                       + kAudioStreamPropertyLatency (input scope)
-                       + kAudioDevicePropertySafetyOffset (input scope)
+Input latency (frames) = device.inputLatency
+                       + stream.latency (first input stream)
+                       + device.inputSafetyOffset
 ```
 
-Convert to seconds: `offsetSeconds = inputLatencyFrames / sampleRate`. Apply as a constant PTS shift to all mic samples: `adjustedPTS = originalPTS - offset`.
+Convert to seconds: `offsetSeconds = inputLatencyFrames / device.nominalSampleRate` (uses actual device sample rate, not hardcoded 48kHz). Apply as a constant PTS shift to all mic samples: `adjustedPTS = originalPTS - offset`. The PTS shift uses `AudioConvertNanosToHostTime` for correct Mach time conversion (timebase ratio is not always 1:1).
 
 **When to re-query:** On `AVAudioEngineConfigurationChange` notification (device switch), query the new device's latency properties and update the offset. The offset changes because different devices have different hardware latencies (e.g., built-in mic ~70ms, AirPods ~30ms, USB mic varies).
 

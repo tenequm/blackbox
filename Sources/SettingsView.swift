@@ -98,7 +98,8 @@ struct SettingsView: View {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!)
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+          )!)
       }
       permissionRow(
         "Microphone",
@@ -114,7 +115,8 @@ struct SettingsView: View {
           NSWorkspace.shared.open(
             URL(
               string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
+            )!)
         }
       }
       permissionRow(

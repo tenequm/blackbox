@@ -312,107 +312,19 @@ final class AudioMonitor {
 
   // MARK: - Process Query Functions
 
-  /// Enumerate all audio process objects registered with CoreAudio.
-  nonisolated private static func allAudioProcessObjects() -> [AudioObjectID] {
-    var propSize: UInt32 = 0
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyProcessObjectList,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    guard
-      AudioObjectGetPropertyDataSize(
-        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize) == noErr,
-      propSize > 0
-    else { return [] }
-
-    let count = Int(propSize) / MemoryLayout<AudioObjectID>.size
-    var objects = [AudioObjectID](repeating: 0, count: count)
-    guard
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize, &objects) == noErr
-    else { return [] }
-    return objects
-  }
-
-  /// Get the PID for an AudioProcess object.
-  nonisolated private static func processPID(for objectID: AudioObjectID) -> pid_t? {
-    var pid: pid_t = 0
-    var size = UInt32(MemoryLayout<pid_t>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyPID,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &pid) == noErr else {
-      return nil
-    }
-    return pid
-  }
-
-  /// Get the bundle ID for an AudioProcess object.
-  nonisolated private static func processBundleID(for objectID: AudioObjectID) -> String? {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyBundleID,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    // CFString is a reference type - can't form UnsafeMutableRawPointer to it directly.
-    // Allocate a raw buffer for the CFStringRef pointer instead.
-    let buf = UnsafeMutablePointer<UnsafeRawPointer?>.allocate(capacity: 1)
-    defer { buf.deallocate() }
-    buf.initialize(to: nil)
-    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
-    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, buf) == noErr,
-      let raw = buf.pointee
-    else {
-      return nil
-    }
-    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-  }
-
-  /// Check if an AudioProcess object has active microphone input.
-  nonisolated private static func isProcessUsingMicInput(_ objectID: AudioObjectID) -> Bool {
-    var isRunning: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyIsRunningInput,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &isRunning)
-    return isRunning != 0
-  }
-
-  /// Check if an AudioProcess object has active audio output.
-  nonisolated private static func isProcessUsingOutput(_ objectID: AudioObjectID) -> Bool {
-    var isRunning: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyIsRunningOutput,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &isRunning)
-    return isRunning != 0
-  }
-
   /// Returns external processes with both active mic input AND audio output (i.e. calls).
   /// Filters out our own PID.
   nonisolated private static func findActiveCallingProcesses() -> [String?] {
     let myPID = ProcessInfo.processInfo.processIdentifier
-    var result: [String?] = []
-
-    for objectID in allAudioProcessObjects() {
-      guard isProcessUsingMicInput(objectID) && isProcessUsingOutput(objectID) else { continue }
-      guard let pid = processPID(for: objectID) else { continue }
-
-      // Filter out our own process
-      if pid == myPID { continue }
-
-      result.append(processBundleID(for: objectID))
-    }
-    return result
+    guard let processes = try? AudioHardwareSystem.shared.processes else { return [] }
+    return
+      processes
+      .filter { (try? $0.isRunningInput) == true && (try? $0.isRunningOutput) == true }
+      .filter {
+        guard let pid = try? $0.pid else { return false }
+        return pid != myPID
+      }
+      .map { try? $0.bundleID }
   }
 
   // MARK: - Call State Evaluation

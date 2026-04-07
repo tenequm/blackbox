@@ -141,9 +141,4 @@ struct OnboardingView: View {
     UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
     onComplete?()
   }
-
-  private func complete() {
-    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-    onComplete?()
-  }
 }

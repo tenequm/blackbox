@@ -5,7 +5,7 @@ macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per
 ## Project Structure
 
 ```
-Package.swift              - SPM manifest, macOS 15+, Swift 6.2
+Package.swift              - SPM manifest, macOS 26.1+, Swift 6.2
 Sources/
   BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
   AudioMonitor.swift       - @Observable: call detection (polling), auto/manual recording lifecycle
@@ -93,10 +93,10 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 ## Key Architecture Decisions
 
-- **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio per-process APIs enumerate processes with BOTH `IsRunningInput` AND `IsRunningOutput` (filtering out own PID). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code. Requires macOS 14.2+.
-- **CATap system audio capture**: CoreAudio Process Tap (`AudioHardwareCreateProcessTap`) via private aggregate device captures all system audio, excluding own PID via `CATapDescription(stereoGlobalTapButExcludeProcesses:)`. IO proc callback on aggregate device delivers interleaved Float32 AudioBufferList, converted to CMSampleBuffer and dispatched to `audioQueue` for writing. Drift compensation enabled via `kAudioSubTapDriftCompensationKey`. Output device changes trigger aggregate rebuild with silence gap filling (D8). Requires `NSAudioCaptureUsageDescription` in Info.plist.
+- **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio Swift wrappers (`AudioHardwareSystem.shared.processes`) enumerate processes with BOTH `isRunningInput` AND `isRunningOutput` (filtering out own PID). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code.
+- **CATap system audio capture**: CoreAudio Process Tap via Swift wrappers (`system.makeProcessTap`, `system.makeAggregateDevice`) captures all system audio, excluding own PID via `CATapDescription(stereoGlobalTapButExcludeProcesses:)`. IO proc callback on aggregate device delivers interleaved Float32 AudioBufferList, converted to CMSampleBuffer and dispatched to `audioQueue` for writing. Drift compensation enabled via `kAudioSubTapDriftCompensationKey`. Output device changes trigger aggregate rebuild with silence gap filling (D8). Requires `NSAudioCaptureUsageDescription` in Info.plist.
 - **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file). Device latency offset (D9) applied as PTS shift to align mic with system audio.
-- **`nonisolated(unsafe)`** on AudioRecorder state because CATap IO proc callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
+- **AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor.** All actor-isolated state runs on `audioQueue`. CATap IO proc and AVAudioEngine tap callbacks dispatch to `audioQueue` and use `assumeIsolated` to bridge into actor isolation. No `nonisolated(unsafe)` needed.
 - **2-track M4A**: Track 0 = system audio (2ch stereo). Track 1 = mic (1ch mono, when mic enabled). Session starts on first system audio sample; mic samples before that are dropped. Legacy 3-track recordings (pre-v0.7.0) remain playable.
 - **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using the system audio track (track 0) as the AEC reference. Writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, destroy CATap aggregate/tap, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
@@ -107,9 +107,42 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
-- AudioMonitor is purely MainActor-isolated (no `@unchecked Sendable` needed - polling-only, no C callbacks)
-- AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state on `audioQueue`
-- CATap IO proc callback copies audio data and dispatches to `audioQueue` for CMSampleBuffer conversion and writing
-- Output device change listener dispatches to `audioQueue` for aggregate device rebuild
-- AVAudioEngine tap callback dispatches to `audioQueue` via `audioQueue.async` to serialize with CATap callbacks
-- AVAudioEngine config change observer is `nonisolated` (fires on NotificationCenter delivery thread, dispatches to `audioQueue` for thread safety)
+- AudioMonitor is purely MainActor-isolated (polling-only, no C callbacks)
+- AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor (`audioQueue`). All actor-isolated state accessed on `audioQueue` - same runtime behavior as the previous `nonisolated(unsafe)` approach, but with compile-time safety
+- CATap IO proc callback copies audio data and dispatches to `audioQueue.async` with `assumeIsolated` for CMSampleBuffer conversion and writing
+- Output device change listener dispatches to `audioQueue.async` with `assumeIsolated` for aggregate device rebuild
+- AVAudioEngine tap callback dispatches to `audioQueue.async` with `assumeIsolated` to serialize with CATap callbacks
+- AVAudioEngine config change observer fires via `Task { await ... }`, actor-isolated `debounceConfigChange` uses `asyncAfter` with `assumeIsolated` for the delayed handler
+
+## Cross-Model Collaboration (Codex)
+
+Claude Code can delegate work to OpenAI Codex via `.claude/bin/codex-bridge.sh`.
+Both run on subscriptions - no API keys. The bridge script unsets `OPENAI_API_KEY`
+so Codex never accidentally uses your project's API key for billing.
+
+**Commands:**
+
+| Command | Purpose |
+|---------|---------|
+| `/collab <task>` | Full collaboration: think, build, or debug with Codex |
+| `/collab-review` | Quick second opinion from Codex on current changes |
+
+**How it works:** Claude calls `codex exec` via bash. Codex's response streams
+directly into Claude's context. Claude reads it, reasons about it, synthesizes.
+No tmux, no file polling, no third-party tools. Build tasks run asynchronously
+in the background so the user can keep talking to Claude while Codex works.
+
+**Bridge modes:**
+- `codex-bridge.sh think "prompt"` - read-only, for debate and review (sync)
+- `codex-bridge.sh build "prompt"` - workspace-write, for implementation (async)
+- `codex-bridge.sh build "prompt" path/to/spec.md` - build from spec file (async)
+
+**Build specs** go in `.collab/specs/`. **Reports** go in `.collab/reports/`.
+
+**Rules:**
+- Never assign overlapping files to both Claude subagents and Codex
+- Always run your test suite after Codex builds - never trust the self-report
+- Keep Codex prompts concise (500 words max) - it has no session memory
+- Synthesize Codex output for the user, don't relay it raw
+- Compact context before starting a collab workflow
+- Break large builds into 2-3 small focused Codex calls (max 3 files each)
