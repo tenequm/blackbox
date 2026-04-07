@@ -75,6 +75,20 @@ This document records architectural decisions and their reasoning. Implementatio
 
 ---
 
+## Architecture Evolution
+
+**v0.1-v0.4 (Feb 2026):** Single SCStream for system audio, AVAudioEngine for mic. CoreAudio listeners for call detection. Post-recording mixing to single-track. Basic but functional.
+
+**v0.5 (Mar 2026):** Simplified call detection to polling-only (D3), added input+output check (D4), removed post-recording mixing (D2). Chose AVAudioEngine over SCStream `.microphone` for mic (D1) - automatic device following eliminated ~140 lines of listener code.
+
+**v0.6.0 (Mar 2026):** Chrome/WebRTC silence bug discovered - per-app SCStream delivers silence for Chrome calls due to private audio routing. Added display-wide SCStream as safety net, keeping per-app as best-effort AEC reference. Output became variable 2-3 track M4A. Added DTLN-aec CoreML post-processing for echo cancellation (D7).
+
+**v0.6.1 (Apr 2026):** Smoke testing revealed 8.64s desync over a 2-hour recording - AVAssetWriter collapses PTS gaps from mic device switches. Implemented silence gap filling (D8) to preserve timeline integrity across both pipelines.
+
+**v0.7.0 (planned):** Post-gap-fix testing revealed a separate constant latency offset (~20-70ms) between mic and system audio. Research led to CATap migration (D5): better permissions (audio-only vs Screen Recording), no Chrome silence bug, lower latency, simpler pipeline. Dual SCStream replaced by single CATap. Per-app track dropped entirely - added complexity without real-world benefit. Device latency offset compensation (D9) addresses the constant offset. Output simplified to fixed 2-track M4A.
+
+---
+
 ## Key Architectural Constraints
 
 These are non-obvious constraints discovered during implementation that future changes must respect.
