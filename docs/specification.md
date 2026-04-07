@@ -20,7 +20,7 @@ This document records architectural decisions and their reasoning. Implementatio
 │  Poll every 3 seconds:                                              │
 │    Scan CoreAudio process list                                      │
 │    Find processes with BOTH IsRunningInput AND IsRunningOutput      │
-│    Filter out: own PID, ScreenCaptureKit helpers                    │
+│    Filter out: own PID                                              │
 │    If found → call detected → start recording                      │
 │    If none  → grace period  → stop recording                       │
 │                                                                     │
@@ -30,22 +30,27 @@ This document records architectural decisions and their reasoning. Implementatio
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        CAPTURE                                      │
 │                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │  SCStream #1  │  │  SCStream #2  │  │     AVAudioEngine        │  │
-│  │               │  │               │  │                          │  │
-│  │  Display-wide │  │  Per-app      │  │  Mic via inputNode tap   │  │
-│  │  (critical)   │  │  (best-effort)│  │  Follows system default  │  │
-│  │  Always runs  │  │  When single  │  │                          │  │
-│  │               │  │  caller known │  │                          │  │
-│  └───────┬───────┘  └───────┬───────┘  └────────────┬─────────────┘  │
-│          │                  │                        │               │
-│          ▼                  ▼                        ▼               │
-│     CMSampleBuffer    CMSampleBuffer          CMSampleBuffer        │
-│     (native)          (native)                (from PCM + hostTime) │
-│          │                  │                        │               │
-└──────────┼──────────────────┼────────────────────────┼───────────────┘
-           │                  │                        │
-           ▼                  ▼                        ▼
+│  ┌────────────────────────┐       ┌──────────────────────────────┐  │
+│  │  CATap (CoreAudio Tap) │       │     AVAudioEngine            │  │
+│  │                        │       │                              │  │
+│  │  Global system audio   │       │  Mic via inputNode tap       │  │
+│  │  via aggregate device  │       │  Follows system default      │  │
+│  │  Excludes own PID      │       │                              │  │
+│  │  Drift compensation on │       │  PTS offset-compensated      │  │
+│  │                        │       │  via device latency query    │  │
+│  └───────────┬────────────┘       └──────────────┬───────────────┘  │
+│              │                                   │                  │
+│              ▼                                   ▼                  │
+│         AudioBufferList                    CMSampleBuffer           │
+│         (IO proc callback)                 (from PCM + hostTime     │
+│              │                              - latency offset)       │
+│              ▼                                   │                  │
+│         CMSampleBuffer                           │                  │
+│         (manual conversion)                      │                  │
+│              │                                   │                  │
+└──────────────┼───────────────────────────────────┼──────────────────┘
+               │                                   │
+               ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     GAP DETECTION & FILL                            │
 │                                                                     │
@@ -59,10 +64,9 @@ This document records architectural decisions and their reasoning. Implementatio
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        WRITING                                      │
 │                                                                     │
-│  AVAssetWriter → 2 or 3 track M4A (AAC, 48kHz)                     │
-│    Track 0: display-wide audio (always, 2ch 128kbps)                │
-│    Track 1: per-app audio (when single caller, 2ch 128kbps)         │
-│    Track N: mic audio (when mic enabled, 1ch 64kbps)                │
+│  AVAssetWriter → 2 track M4A (AAC, 48kHz)                          │
+│    Track 0: system audio (2ch stereo, 128kbps)                      │
+│    Track 1: mic audio (1ch mono, 64kbps)                            │
 │  movieFragmentInterval = 10s (crash safety)                         │
 │  No post-processing, no mixing                                      │
 │                                                                     │
@@ -79,15 +83,15 @@ These are non-obvious constraints discovered during implementation that future c
 
 - **AVAssetWriter collapses PTS gaps.** When audio buffers have a timestamp discontinuity (gap between last buffer's end and next buffer's start), the writer concatenates samples back-to-back, making the track shorter. Gaps must be filled with explicit zero-filled silence buffers to preserve timeline integrity. No AVAssetWriter setting changes this behavior. The writer also performs no clock domain normalization - it assumes all inputs share the same timeline.
 
-- **SCStream and AVAudioEngine share the host time clock.** `AVAudioTime.hostTime` is documented as `mach_absolute_time`. SCStream's `synchronizationClock` is the host clock in practice. Timestamps from both pipelines are directly comparable and can be fed to the same AVAssetWriter session without clock conversion.
+- **CATap and AVAudioEngine use different clock domains.** CATap's aggregate device runs on the system output device's clock. AVAudioEngine's mic runs on the input device's clock. Both map to `mach_absolute_time` (host time) but the underlying hardware clocks can drift at ~50 PPM. For a 1-hour recording this is ~180ms worst case. Drift compensation (`kAudioSubTapDriftCompensationKey`) handles system-audio-internal drift, but mic-vs-system drift requires device latency offset compensation (see D9).
 
-- **SCStream requires a `.screen` output** even for audio-only capture. Minimum video config (2x2, max frame interval) minimizes overhead.
+- **CATap requires an aggregate device.** `AudioHardwareCreateProcessTap` returns a tap ID that must be added to an aggregate device via `kAudioAggregateDeviceTapListKey`. Audio flows through the aggregate device's IO proc callback as interleaved Float32 `AudioBufferList`, not `CMSampleBuffer`. Manual conversion is required for AVAssetWriter.
 
-- **SCRecordingOutput stops on config update.** Confirmed in `SCStream.h` header: "In case client update the stream configuration during recording, recording will be stopped as well." Also lacks crash safety (no movieFragmentInterval). Not viable for our use case.
+- **AudioDeviceStart hang.** Starting a physical input device (mic) via `AudioDeviceCreateIOProcID` while a CATap aggregate device is already running blocks the calling thread indefinitely. Workaround: stop aggregate device, start mic, restart aggregate device. Documented in graphaelli/audiotap.
 
-- **CoreAudio per-process APIs require macOS 14.2+.** `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`, `kAudioProcessPropertyIsRunningOutput`.
+- **CoreAudio per-process APIs require macOS 14.2+.** `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyIsRunningInput`, `kAudioProcessPropertyIsRunningOutput`. CATap (`AudioHardwareCreateProcessTap`) also requires macOS 14.2+.
 
-- **macOS 15+ monthly re-authorization.** Screen Recording permission can be revoked at any time. SCStream dies with error -3801. AVAudioEngine mic capture is unaffected and continues independently.
+- **CATapDescription is ObjC-only.** The `CATapDescription` class has no Swift equivalent. Requires an ObjC bridging file to create and configure tap descriptions from Swift.
 
 ---
 
@@ -95,7 +99,7 @@ These are non-obvious constraints discovered during implementation that future c
 
 Two TCC permissions required:
 
-- **Screen Recording** - for SCStream system audio capture. No entitlement, runtime-only. Check via `CGPreflightScreenCaptureAccess()`. Subject to monthly re-authorization on macOS 15+.
+- **System Audio Recording** - for CATap system audio capture. Requires `NSAudioCaptureUsageDescription` in Info.plist. One-click grant in System Settings (no app restart required). On macOS 26+, an existing Screen Recording permission also grants this access.
 - **Microphone** - for AVAudioEngine mic capture. Requires `NSMicrophoneUsageDescription` in Info.plist. If denied, system audio still records.
 
 ---
@@ -116,11 +120,11 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Device switch gap is unavoidable.** When `AVAudioEngineConfigurationChange` fires, the engine has already stopped itself internally. The tap must be removed and reinstalled with the new device's format. This is a platform limitation - the engine cannot survive a sample rate or channel count change without a restart. The 300ms debounce (for Krisp's rapid-fire config changes) dominates the gap duration; the actual reinstall takes <10ms. See D8 for how these gaps are filled with silence to prevent track desync.
 
-**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate. Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits` - same clock domain as SCStream's PTS, enabling direct multi-track alignment.
+**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate. Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits`, then adjusted by the device latency offset (D9) for alignment with CATap system audio.
 
 ### D2: Remove post-recording audio mixing
 
-**Decision:** Keep multi-track M4A as final output. No mixing step. Typically 3 tracks (display-wide + per-app + mic). Falls to 2 tracks when per-app is unavailable (multiple simultaneous callers, or unresolvable bundle ID).
+**Decision:** Keep multi-track M4A as final output. No mixing step. Always 2 tracks (system audio + mic).
 
 **Previous implementation:** AVMutableComposition + AVAssetExportSession mixed dual-track to single-track after recording stopped.
 
@@ -136,53 +140,60 @@ Architectural decisions with reasoning and alternatives considered.
 
 ### D4: Input AND output check for call detection
 
-**Decision:** A call is detected when a process has both `IsRunningInput` (mic active) AND `IsRunningOutput` (audio playing), excluding our own PID and ScreenCaptureKit helpers.
+**Decision:** A call is detected when a process has both `IsRunningInput` (mic active) AND `IsRunningOutput` (audio playing), excluding our own PID.
 
 **Previous implementation:** Input-only check, which triggered on dictation, Siri, voice memos, voice search.
 
 **Why both:** Input+output together identifies processes that are both capturing mic and playing audio - the defining characteristic of a call. Filters out most false positives without maintaining a hardcoded list of known call apps.
 
-### D5: Dual-SCStream capture (display-wide + per-app)
+### D5: CATap for system audio (replaces dual SCStream)
 
-**Decision:** Run two SCStream instances simultaneously. Display-wide captures all system audio (critical path, always runs). Per-app captures only the calling app's audio (best-effort, when single caller detected). Both write to the same AVAssetWriter as separate tracks.
+**Decision:** Use CoreAudio Process Tap (`AudioHardwareCreateProcessTap`) via an aggregate device for all system audio capture. Replaces the previous dual-SCStream architecture (display-wide + per-app).
 
-**Previous implementation:** Single SCStream with per-app filter, falling back to display-wide when conditions were uncertain.
+**Previous implementation:** Two SCStream instances - display-wide (critical) + per-app (best-effort) writing to 2-3 track M4A. Per-app track existed to provide a cleaner AEC reference, but was unreliable (Chrome/WebRTC silence bug) and added complexity without real-world benefit.
 
-**Why dual:** Single per-app capture failed silently for Chrome/WebRTC (silence bug - Chrome's WebRTC audio bypasses CoreAudio per-process output). Display-wide guarantees completeness. Per-app provides a cleaner reference for AEC post-processing (just call audio, no notifications/music). Running both means nothing changes mid-recording - track layout is fixed at writer setup.
+**Why CATap over SCStream:**
+- **Better permission model.** `NSAudioCaptureUsageDescription` grants audio-only permission with a one-click grant. SCStream required Screen Recording permission (broad, confusing for users, requires app restart, subject to macOS 15+ monthly re-auth). RecordKit (Nonstrict) made CATap their default backend in v0.82.0 for this reason.
+- **No Chrome/WebRTC silence bug.** CATap captures at the HAL level, below any private audio routing that caused per-app SCStream to deliver silence for Chrome/WebRTC apps.
+- **Lower latency.** IO proc callback runs on a real-time thread, delivering audio with less buffering than SCStream's sample handler queue.
+- **Built-in drift compensation.** `kAudioSubTapDriftCompensationKey: true` on the aggregate device tap list enables CoreAudio's hardware-level clock synchronization for the system audio tap.
+- **Simpler pipeline.** One capture stream instead of two SCStreams. Fixed 2-track output (system + mic) instead of variable 2-3 tracks.
+
+**Setup sequence:**
+1. Translate own PID to AudioObjectID via `kAudioHardwarePropertyTranslatePIDToProcessObject`
+2. Create `CATapDescription(stereoGlobalTapButExcludeProcesses:)` excluding own PID
+3. Call `AudioHardwareCreateProcessTap` to get tap ID
+4. Create private aggregate device via `AudioHardwareCreateAggregateDevice` with tap in `kAudioAggregateDeviceTapListKey` and `kAudioSubTapDriftCompensationKey: true`
+5. Create IO proc via `AudioDeviceCreateIOProcIDWithBlock` on the aggregate device
+6. Start with `AudioDeviceStart` (must respect ordering constraint - see constraints section)
+
+**IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation). Convert to `CMSampleBuffer` and dispatch to `audioQueue` for writing.
+
+**Output device change:** When the system default output device changes, the tap's aggregate device must be torn down and rebuilt. This causes a gap in system audio (~0.5-1.5s), handled by silence gap filling (D8). Listen for `kAudioHardwarePropertyDefaultOutputDevice` changes.
 
 **Track layout (fixed at writer setup):**
-- Track 0: display-wide audio (always, 2ch stereo)
-- Track 1: per-app audio (when `bundleID != nil`, 2ch stereo)
-- Track N (last): mic audio (when mic enabled, 1ch mono)
+- Track 0: system audio (2ch stereo)
+- Track 1: mic audio (when mic enabled, 1ch mono)
 
-If per-app stream fails to start, Track 1 exists but is empty - file format stays consistent.
+**Production validation:** CATap is used in production by RecordKit (Nonstrict, commercial SDK, default since v0.82.0), Chromium (behind feature flag since 2025), and audiotee (powers talat.app, commercial meeting transcription).
 
-**Helper bundle ID resolution:** CoreAudio reports Chrome/Electron helper processes (e.g., `com.google.Chrome.helper.renderer`) as the audio client, not the main app. The `.helper` suffix is stripped to resolve to the parent app's bundle ID for SCContentFilter lookup.
+**Reference implementations:** insidegui/AudioCap (490 stars, cleanest CATap pattern), graphaelli/audiotap (documents AudioDeviceStart hang and mic device following).
 
-**Per-app stream failure handling:** Log and continue. Set `appStreamFailed = true`. Do NOT call `onFailure` (non-critical). Display-wide has the audio regardless.
+### D6: System notification for permission loss
 
-**Tradeoff accepted:** Per-app track may be empty (WebRTC apps) or contain only partial audio. Display-wide is the reliability backstop.
-
-### D6: System notification for permission re-authorization
-
-**Decision:** When Screen Recording permission is revoked (macOS 15+ monthly re-auth), send a system notification in addition to the menu bar indicator.
+**Decision:** When audio capture permission is lost, send a system notification in addition to the menu bar indicator.
 
 **Why:** During a call, the user is focused on the call app and may not notice the menu bar state change. System notifications appear in Notification Center regardless of focus. The notification informs the user that mic is still recording and guides them to re-authorize.
 
-### D7: No Voice Processing (VPIO incompatible with SCStream)
+### D7: No Voice Processing (VPIO) - echo handled by post-processing AEC
 
-**Decision:** Do not enable `setVoiceProcessingEnabled(true)` on AVAudioEngine's inputNode. Accept mic-side echo in dual-track recordings.
+**Decision:** Do not enable `setVoiceProcessingEnabled(true)` on AVAudioEngine's inputNode. Handle echo cancellation via post-recording DTLN-aec CoreML processing.
 
 **The problem:** Without AEC, the mic track picks up the remote person's voice through speakers. Playing both tracks simultaneously produces audible echo/doubling. The track selector (Both/System/Mic) lets users isolate tracks during playback.
 
-**Why VPIO was rejected:** Tested and confirmed that VPIO's aggregate device silences SCStream's system audio capture. VPIO hooks into the system audio output path to get its AEC reference signal, which interferes with SCStream's display-wide capture. The alona project independently confirmed: "When capturing system audio, voice processing causes audio quality issues." This is a fundamental incompatibility - VPIO and SCStream system audio cannot coexist.
+**Why VPIO was rejected:** VPIO hooks into the system audio output path to create an aggregate device for its AEC reference signal. This conflicts with system audio capture - tested and confirmed with SCStream, and the conflict likely extends to CATap since both tap the same output path. The alona project independently confirmed: "When capturing system audio, voice processing causes audio quality issues."
 
-**Alternatives considered:**
-- **SCStream `.microphone`** (macOS 15+): Avoids VPIO conflict but delivers raw mic audio (no AEC). Loses automatic device following (the main reason we use AVAudioEngine - see D1).
-- **Post-processing DSP**: No reliable open-source macOS implementation for echo cancellation.
-- **CoreAudio Process Taps for system audio**: Different capture mechanism that might not conflict with VPIO, but major architectural change with uncertain benefit.
-
-**Tradeoff accepted:** Mic track contains echo of remote audio. Mitigated by track selector in playback UI and TranscriptionService mixing tracks before upload to Soniox.
+**Current mitigation:** DTLN-aec CoreML post-processing uses the system audio track (track 0) as the AEC reference to cancel echo from the mic track. Device latency offset compensation (D9) improves AEC quality by reducing the initial misalignment between the reference and mic tracks.
 
 ### D8: Silence gap filling for multi-track timeline integrity
 
@@ -190,7 +201,7 @@ If per-app stream fails to start, Track 1 exists but is empty - file format stay
 
 **The problem:** AVAssetWriter does not preserve PTS gaps. When a buffer arrives at t=12.5s after the last buffer ended at t=10.0s, the writer concatenates them back-to-back, making the track 2.5s shorter. Over a multi-hour recording with device switches, one track can become seconds shorter than the others, causing growing desync between tracks. Confirmed by Apple behavior, third-party production apps (RecordKit/Nonstrict), and empirical testing with a 2-hour recording where 4 mic device switches caused 8.64s of collapsed gaps.
 
-**Why this affects Blackbox specifically:** Three independent capture pipelines (display-wide SCStream, per-app SCStream, AVAudioEngine mic) can each independently experience gaps. Mic device switches (Bluetooth connect/disconnect, Krisp activation) cause AVAudioEngine tap teardown/reinstall. SCStream can restart on permission revocation. Any gap in any track makes that track shorter, desynchronizing all tracks in the final M4A.
+**Why this affects Blackbox specifically:** Two independent capture pipelines (CATap system audio, AVAudioEngine mic) can each independently experience gaps. Mic device switches (Bluetooth connect/disconnect, Krisp activation) cause AVAudioEngine tap teardown/reinstall. CATap aggregate device rebuilds on output device change create system audio gaps. Any gap in either track makes that track shorter, desynchronizing both tracks in the final M4A.
 
 **Why not just use correct timestamps:** The mic tap already uses `AVAudioTime.hostTime` (wall clock) for PTS, so timestamps correctly reflect the gap. But AVAssetWriter's AAC encoder ignores timestamp discontinuities and concatenates samples. There is no AVAssetWriter property or setting to change this behavior.
 
@@ -224,4 +235,30 @@ If per-app stream fails to start, Track 1 exists but is empty - file format stay
 - *Low-level AUHAL AudioUnit for mic:* Reduces gap duration (~50ms vs ~300ms debounce) but doesn't eliminate it. Still needs silence filling. 200+ lines of C-level CoreAudio code for marginal improvement.
 - *AVCaptureSession for mic:* Still a separate pipeline from SCStream, same cross-clock issue. No advantage over AVAudioEngine for this problem.
 
-**Scope:** All three pipelines (display-wide, per-app, mic). While mic device switches are the most common source of gaps, SCStream restarts and permission revocations can gap any pipeline.
+**Scope:** Both pipelines (system audio, mic). Mic device switches are the most common source of gaps. CATap aggregate device rebuilds on output device change can gap the system audio pipeline.
+
+### D9: Device latency offset compensation for mic-system alignment
+
+**Decision:** At recording start and on each mic device change, query CoreAudio device latency properties for the current input device and apply a constant PTS offset to mic samples. This compensates for the pipeline processing delay difference between CATap system audio and AVAudioEngine mic audio.
+
+**The problem:** CATap system audio and AVAudioEngine mic audio traverse different processing pipelines with different internal latencies. Even though both ultimately use `mach_absolute_time` for timestamps, the mic track arrives with a different offset than the system audio track. In practice, the mic track appears ~20-70ms ahead of system audio, depending on hardware. Without compensation, this causes audible echo/doubling when playing both tracks.
+
+**Why this wasn't a problem before (but was):** The previous SCStream architecture had the same offset issue, but it was masked by SCStream's higher internal buffering latency which happened to partially cancel out the mic's hardware latency. With CATap's lower-latency IO proc delivery, the offset is more pronounced and consistent.
+
+**How offset is computed:** Query the input device's total latency in frames at recording start:
+
+```
+Input latency (frames) = kAudioDevicePropertyLatency (input scope)
+                       + kAudioStreamPropertyLatency (input scope)
+                       + kAudioDevicePropertySafetyOffset (input scope)
+```
+
+Convert to seconds: `offsetSeconds = inputLatencyFrames / sampleRate`. Apply as a constant PTS shift to all mic samples: `adjustedPTS = originalPTS - offset`.
+
+**When to re-query:** On `AVAudioEngineConfigurationChange` notification (device switch), query the new device's latency properties and update the offset. The offset changes because different devices have different hardware latencies (e.g., built-in mic ~70ms, AirPods ~30ms, USB mic varies).
+
+**Limitations:** Apple engineers confirmed there is "no way to get accurately timed information from the input relative to the output without a manual calibration process." Even Logic Pro gets this wrong. The queried latencies get within a few ms of correct, which is imperceptible for call recording. For sample-perfect alignment, post-recording cross-correlation would be needed (available via `Scripts/align-and-process.py`).
+
+**Production validation:** RecordKit (Nonstrict) uses a configurable `audioDelay` parameter (v0.51.0) for the same purpose. They added "additional audio delay logging for debugging" (v0.51.1) to help determine the right value per hardware configuration.
+
+**Reference:** CoreAudio latency formula from Apple engineer Dan Klingler (CoreAudio mailing list, July 2017) and sbooth's SO answer verified experimentally on MacBook Pro. Typical values at 48kHz: input = 114 + 2404 + 40 + 512 = 3070 frames (~64ms), output = 71 + 424 + 11 + 512 = 1018 frames (~21ms).
