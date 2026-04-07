@@ -652,13 +652,24 @@ actor AudioRecorder {
     }
   }
 
-  /// Handles mic audio buffer on audioQueue. Drops samples until system audio session starts.
+  /// Handles mic audio buffer on audioQueue.
   private func handleMicBuffer(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
     micBuffersReceived += 1
     guard !stopped else { return }
-    guard sessionStarted else {
-      micBuffersDroppedPreSession += 1
-      return
+    if !sessionStarted {
+      guard let w = writer else { return }
+      let adjustedTime: AVAudioTime
+      if micLatencyOffset > 0, time.isHostTimeValid {
+        let offsetTicks = AudioConvertNanosToHostTime(UInt64(micLatencyOffset * 1e9))
+        let adjustedHostTime =
+          time.hostTime > offsetTicks ? time.hostTime - offsetTicks : time.hostTime
+        adjustedTime = AVAudioTime(hostTime: adjustedHostTime)
+      } else {
+        adjustedTime = time
+      }
+      let pts = CMClockMakeHostTimeFromSystemUnits(adjustedTime.hostTime)
+      w.startSession(atSourceTime: pts)
+      sessionStarted = true
     }
     // Resample to 48kHz if device rate differs (e.g. 24kHz AirPods).
     // Linear interpolation - adequate for voice audio, avoids AVAudioConverter @Sendable issues.
