@@ -13,6 +13,7 @@ build:
 	swift build -c release
 
 bundle: build
+	@[ -d "$(APP_BUNDLE)" ] && chmod -R u+rw "$(APP_BUNDLE)" || true
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS"
 	mkdir -p "$(APP_BUNDLE)/Contents/Frameworks"
 	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
@@ -42,6 +43,7 @@ bundle: build
 install: bundle
 	rm -rf "/Applications/$(APP_NAME).app"
 	cp -R "$(APP_BUNDLE)" "/Applications/$(APP_NAME).app"
+	chmod -R u+rw "/Applications/$(APP_NAME).app"
 	xattr -rc "/Applications/$(APP_NAME).app"
 
 run:
