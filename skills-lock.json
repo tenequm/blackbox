@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "swift-macos": {
+      "source": "tenequm/skills",
+      "sourceType": "github",
+      "computedHash": "3f71a61e43fb1ce6a09318d47d6db6f580f5f6524e12cf5caa4400e9c3487822"
+    }
+  }
+}
