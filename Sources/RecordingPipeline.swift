@@ -16,7 +16,7 @@ enum RecordingTrackKind: String, Sendable {
 ///
 /// - `.waitForAllTracks` (auto recordings): defer the session until every
 ///   enabled track has delivered at least one sample, then start at
-///   `max(firstSystemPTS, firstMicPTS)`. Early-track head content (samples
+///   `max(systemTrack.firstPTS, micTrack.firstPTS)`. Early-track head content (samples
 ///   from before the second track arrived) is dropped. A 500ms timeout (PTS
 ///   span **or** wall-clock elapsed since first sample) guards against a
 ///   second track that never arrives. Produces cleaner output with no silent
@@ -28,34 +28,68 @@ enum SessionAlignmentMode: String, Sendable {
   case waitForAllTracks
 }
 
-struct RecordingDiagnostics: Sendable {
+nonisolated struct TrackDiagnostics: Sendable {
+  var buffersReceived = 0
+  var buffersAppended = 0
+  var buffersDroppedNotReady = 0
+  var buffersDroppedBeforeSession = 0
+  var buffersAppendFailed = 0
+  var gapsFilled = 0
+  var leadingSilenceBuffers = 0
+  var leadingSilenceSeconds = 0.0
+  var tailPaddingBuffers = 0
+  var tailPaddingSeconds = 0.0
+}
+
+nonisolated struct RecordingDiagnostics: Sendable {
   var sessionStartTrack: RecordingTrackKind?
   var sessionStartPTS: Double?
-  var systemBuffersReceived = 0
-  var systemBuffersAppended = 0
-  var systemBuffersDroppedNotReady = 0
-  var systemBuffersDroppedBeforeSession = 0
-  var systemBuffersAppendFailed = 0
-  var systemGapsFilled = 0
-  var systemLeadingSilenceBuffers = 0
-  var systemLeadingSilenceSeconds = 0.0
-  var systemTailPaddingBuffers = 0
-  var systemTailPaddingSeconds = 0.0
-  var micBuffersReceived = 0
-  var micBuffersAppended = 0
-  var micBuffersDroppedNotReady = 0
-  var micBuffersDroppedBeforeSession = 0
-  var micBuffersAppendFailed = 0
-  var micGapsFilled = 0
-  var micLeadingSilenceBuffers = 0
-  var micLeadingSilenceSeconds = 0.0
-  var micTailPaddingBuffers = 0
-  var micTailPaddingSeconds = 0.0
+  var system = TrackDiagnostics()
+  var mic = TrackDiagnostics()
   var sessionStartTimedOut = false
+
+  subscript(track: RecordingTrackKind) -> TrackDiagnostics {
+    get {
+      switch track {
+      case .system: return system
+      case .mic: return mic
+      }
+    }
+    set {
+      switch track {
+      case .system: system = newValue
+      case .mic: mic = newValue
+      }
+    }
+  }
+}
+
+/// Per-track live state maintained inside `RecordingPipeline`. All mutation
+/// happens on AudioRecorder's `audioQueue`, same as the pipeline itself, so
+/// the fact that `AVAssetWriterInput` is not `Sendable` is handled by the
+/// enclosing `nonisolated(unsafe)` storage. Marked `nonisolated` explicitly
+/// because the package-wide `defaultIsolation(MainActor.self)` setting would
+/// otherwise pin it to the main actor, which conflicts with being stored in a
+/// `nonisolated(unsafe)` field inside a non-MainActor class.
+nonisolated struct TrackState {
+  var input: AVAssetWriterInput?
+  var firstPTS: CMTime = .invalid
+  var lastSeenPTS: CMTime = .invalid
+  var nextExpected: CMTime = .invalid
 }
 
 final class RecordingPipeline: @unchecked Sendable {
   nonisolated static let writerSampleRate: Double = 48_000
+
+  /// Output format for the writer pipeline: mono 48 kHz interleaved Float32.
+  /// Hoisted so `resampleToMono48k` does not allocate a fresh `AVAudioFormat`
+  /// on every buffer (~200/s combined across system + mic tracks).
+  nonisolated static let monoFormat48k: AVAudioFormat = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32,
+    sampleRate: 48_000,
+    channels: 1,
+    interleaved: true
+  )!
 
   nonisolated let bundleID: String?
   nonisolated let appName: String
@@ -66,16 +100,19 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
   nonisolated let onAudioLevel: (@Sendable (Float) -> Void)?
 
+  /// Invoked once per `start()`, when the first sample arrives under
+  /// `.waitForAllTracks`. AudioRecorder uses this to schedule a one-shot
+  /// `tryStartSessionFromTimeout()` call ~500ms later, so that the wall-clock
+  /// timeout fires even if the second track stops delivering samples entirely
+  /// (i.e. no later `appendSample` calls to drive the PTS-based check).
+  nonisolated let armSessionStartTimeout: (@Sendable () -> Void)?
+
   nonisolated(unsafe) private var writer: AVAssetWriter?
-  nonisolated(unsafe) private var systemAudioInput: AVAssetWriterInput?
-  nonisolated(unsafe) private var micInput: AVAssetWriterInput?
+  nonisolated(unsafe) private var systemTrack = TrackState()
+  nonisolated(unsafe) private var micTrack = TrackState()
   nonisolated(unsafe) private var sessionStarted = false
   nonisolated(unsafe) private var sessionStartTime: CMTime = .invalid
   nonisolated(unsafe) private var sessionPending = true
-  nonisolated(unsafe) private var firstSystemPTS: CMTime = .invalid
-  nonisolated(unsafe) private var firstMicPTS: CMTime = .invalid
-  nonisolated(unsafe) private var lastSeenSystemPTS: CMTime = .invalid
-  nonisolated(unsafe) private var lastSeenMicPTS: CMTime = .invalid
   nonisolated(unsafe) private var firstSampleWallClock: DispatchTime?
   nonisolated(unsafe) private var stopped = false
 
@@ -87,9 +124,22 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated(unsafe) private var lastLevelTime: UInt64 = 0
   nonisolated(unsafe) private var pendingMaxLevel: Float = 0
   nonisolated(unsafe) private var writerFailureReported = false
-  nonisolated(unsafe) private var systemNextExpected: CMTime = .invalid
-  nonisolated(unsafe) private var micNextExpected: CMTime = .invalid
   nonisolated(unsafe) private var diagnostics = RecordingDiagnostics()
+
+  nonisolated private subscript(track: RecordingTrackKind) -> TrackState {
+    get {
+      switch track {
+      case .system: return systemTrack
+      case .mic: return micTrack
+      }
+    }
+    set {
+      switch track {
+      case .system: systemTrack = newValue
+      case .mic: micTrack = newValue
+      }
+    }
+  }
 
   nonisolated init(
     bundleID: String? = nil,
@@ -98,7 +148,8 @@ final class RecordingPipeline: @unchecked Sendable {
     saveDirectory: URL,
     alignmentMode: SessionAlignmentMode,
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
-    onAudioLevel: (@Sendable (Float) -> Void)? = nil
+    onAudioLevel: (@Sendable (Float) -> Void)? = nil,
+    armSessionStartTimeout: (@Sendable () -> Void)? = nil
   ) {
     self.bundleID = bundleID
     self.appName = appName
@@ -107,6 +158,7 @@ final class RecordingPipeline: @unchecked Sendable {
     self.alignmentMode = alignmentMode
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
+    self.armSessionStartTimeout = armSessionStartTimeout
   }
 
   nonisolated var isSessionStarted: Bool { sessionStarted }
@@ -178,21 +230,15 @@ final class RecordingPipeline: @unchecked Sendable {
     }
 
     writer = newWriter
-    systemAudioInput = systemInput
-    micInput = newMicInput
+    systemTrack = TrackState(input: systemInput)
+    micTrack = TrackState(input: newMicInput)
     fileURL = dirURL
     sessionStarted = false
     sessionStartTime = .invalid
     sessionPending = true
-    firstSystemPTS = .invalid
-    firstMicPTS = .invalid
-    lastSeenSystemPTS = .invalid
-    lastSeenMicPTS = .invalid
     firstSampleWallClock = nil
     stopped = false
     writerFailureReported = false
-    systemNextExpected = .invalid
-    micNextExpected = .invalid
     diagnostics = RecordingDiagnostics()
   }
 
@@ -211,7 +257,7 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated func stop() async -> URL? {
     stopped = true
 
-    let finalEndTime = [systemNextExpected, micNextExpected]
+    let finalEndTime = [systemTrack.nextExpected, micTrack.nextExpected]
       .filter(\.isValid)
       .max { $0.seconds < $1.seconds }
 
@@ -220,24 +266,20 @@ final class RecordingPipeline: @unchecked Sendable {
       padTailIfNeeded(for: .mic, to: finalEndTime)
     }
 
-    systemAudioInput?.markAsFinished()
-    micInput?.markAsFinished()
+    systemTrack.input?.markAsFinished()
+    micTrack.input?.markAsFinished()
 
     let wasStarted = sessionStarted
     let capturedWriter = writer
     let capturedFileURL = fileURL
 
-    systemAudioInput = nil
-    micInput = nil
+    systemTrack = TrackState()
+    micTrack = TrackState()
     writer = nil
     fileURL = nil
     sessionStarted = false
     sessionStartTime = .invalid
     sessionPending = true
-    firstSystemPTS = .invalid
-    firstMicPTS = .invalid
-    lastSeenSystemPTS = .invalid
-    lastSeenMicPTS = .invalid
     firstSampleWallClock = nil
 
     guard let capturedWriter else { return nil }
@@ -291,6 +333,8 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated private func tryStartSession() {
     guard sessionPending, !stopped else { return }
 
+    let firstSystemPTS = systemTrack.firstPTS
+    let firstMicPTS = micTrack.firstPTS
     let systemReady = firstSystemPTS.isValid
     let micReady = !micEnabled || firstMicPTS.isValid
 
@@ -315,21 +359,21 @@ final class RecordingPipeline: @unchecked Sendable {
     }
 
     // Timeout path: one track has fired but the other has not. Start the session
-    // on the track we have so we do not drop the whole recording waiting.
-    let waitingTrack: RecordingTrackKind?
+    // on whichever track is firing so we do not drop the whole recording waiting.
+    let firingTrack: RecordingTrackKind?
     if systemReady && !micReady {
-      waitingTrack = .system
+      firingTrack = .system
     } else if !systemReady && micReady {
-      waitingTrack = .mic
+      firingTrack = .mic
     } else {
-      waitingTrack = nil
+      firingTrack = nil
     }
-    guard let waitingTrack else { return }
-    let waitingFirst = firstPTS(for: waitingTrack)
-    let waitingLatest = lastSeenPTS(for: waitingTrack)
-    guard waitingFirst.isValid, waitingLatest.isValid else { return }
+    guard let firingTrack else { return }
+    let firingFirst = self[firingTrack].firstPTS
+    let firingLatest = self[firingTrack].lastSeenPTS
+    guard firingFirst.isValid, firingLatest.isValid else { return }
 
-    let ptsElapsed = CMTimeGetSeconds(waitingLatest - waitingFirst)
+    let ptsElapsed = CMTimeGetSeconds(firingLatest - firingFirst)
     let wallClockElapsed: Double
     if let firstSampleWallClock {
       wallClockElapsed =
@@ -343,34 +387,46 @@ final class RecordingPipeline: @unchecked Sendable {
     {
       Log.info(
         Log.recorder, "recorder",
-        "session start timed out waiting for \(waitingTrack == .system ? "mic" : "system") (pts_elapsed=\(String(format: "%.3f", ptsElapsed))s wall=\(String(format: "%.3f", wallClockElapsed))s), starting on \(waitingTrack.rawValue) alone"
+        "session start timed out waiting for \(firingTrack == .system ? "mic" : "system") (pts_elapsed=\(String(format: "%.3f", ptsElapsed))s wall=\(String(format: "%.3f", wallClockElapsed))s), starting on \(firingTrack.rawValue) alone"
       )
-      startSessionIfNeeded(at: waitingFirst, track: waitingTrack)
+      startSessionIfNeeded(at: firingFirst, track: firingTrack)
       diagnostics.sessionStartTimedOut = true
       sessionPending = false
     }
+  }
+
+  /// External entry point for the delayed timeout poke scheduled by
+  /// `armSessionStartTimeout`. Must be called on the same serial queue that
+  /// drives `appendSample` so the unsafe state remains single-threaded.
+  nonisolated func tryStartSessionFromTimeout() {
+    tryStartSession()
   }
 
   nonisolated private func appendSample(
     _ sampleBuffer: CMSampleBuffer,
     to track: RecordingTrackKind
   ) {
-    incrementReceived(for: track)
+    diagnostics[track].buffersReceived += 1
     guard !stopped else { return }
 
     let pts = sampleBuffer.presentationTimeStamp
     let endTime = Self.bufferEndTime(sampleBuffer)
 
     // Record first-seen and latest-seen PTS for the session-start gate.
-    if !firstPTS(for: track).isValid {
-      setFirstPTS(pts, for: track)
+    if !self[track].firstPTS.isValid {
+      self[track].firstPTS = pts
     }
-    setLastSeenPTS(pts, for: track)
+    self[track].lastSeenPTS = pts
     // Only .waitForAllTracks uses the wall-clock timeout fallback. Capturing
     // this under .preserveAllContent would be a dead write since that mode
     // starts the session immediately without ever consulting the timeout.
     if alignmentMode == .waitForAllTracks, firstSampleWallClock == nil {
       firstSampleWallClock = DispatchTime.now()
+      // Ask the owner (AudioRecorder) to schedule a delayed poke so that the
+      // wall-clock timeout still fires if the other track never delivers a
+      // single sample. Without this, `tryStartSession` would only be re-run on
+      // further sample arrivals on the already-firing track.
+      armSessionStartTimeout?()
     }
 
     if sessionPending {
@@ -392,7 +448,7 @@ final class RecordingPipeline: @unchecked Sendable {
       // discarded. Content loss is limited to the pre-alignment window of the
       // early track (first sample up to sessionStart) - content which has no
       // counterpart on the other track anyway.
-      incrementDroppedBeforeSession(for: track)
+      diagnostics[track].buffersDroppedBeforeSession += 1
       return
     }
 
@@ -400,14 +456,14 @@ final class RecordingPipeline: @unchecked Sendable {
     // (possible on D9 over-compensation or extreme clock skew), drop it rather
     // than letting AVAssetWriter reject it.
     if sessionStartTime.isValid, CMTimeCompare(pts, sessionStartTime) < 0 {
-      incrementDroppedBeforeSession(for: track)
+      diagnostics[track].buffersDroppedBeforeSession += 1
       return
     }
 
-    let nextExpected = nextExpected(for: track)
+    let nextExpected = self[track].nextExpected
 
     if !nextExpected.isValid, sessionStartTime.isValid,
-      let input = input(for: track),
+      let input = self[track].input,
       CMTimeCompare(pts, sessionStartTime) > 0
     {
       let leadSeconds = CMTimeGetSeconds(pts - sessionStartTime)
@@ -429,7 +485,8 @@ final class RecordingPipeline: @unchecked Sendable {
           spinInterval: 0.005
         )
         if leadingBuffers > 0 {
-          recordLeadingSilence(for: track, filled: leadingBuffers, seconds: leadSeconds)
+          diagnostics[track].leadingSilenceBuffers += leadingBuffers
+          diagnostics[track].leadingSilenceSeconds += leadSeconds
           Log.info(
             Log.recorder, "recorder",
             "\(track.rawValue): filled \(String(format: "%.3f", leadSeconds))s leading silence with \(leadingBuffers) buffers"
@@ -438,7 +495,7 @@ final class RecordingPipeline: @unchecked Sendable {
       }
     }
 
-    if let input = input(for: track), nextExpected.isValid {
+    if let input = self[track].input, nextExpected.isValid {
       let gap = CMTimeGetSeconds(pts - nextExpected)
       if gap > 0.005 {
         let (filled, _) = Self.fillGap(
@@ -449,7 +506,7 @@ final class RecordingPipeline: @unchecked Sendable {
           input: input
         )
         if filled > 0 {
-          recordGapFill(for: track, filled: filled)
+          diagnostics[track].gapsFilled += filled
           Log.info(
             Log.recorder, "recorder",
             "\(track.rawValue): filled \(String(format: "%.3f", gap))s gap with \(filled) silence buffers"
@@ -457,25 +514,25 @@ final class RecordingPipeline: @unchecked Sendable {
         }
       }
     }
-    setNextExpected(endTime, for: track)
+    self[track].nextExpected = endTime
 
-    guard let input = input(for: track), input.isReadyForMoreMediaData else {
-      incrementDroppedNotReady(for: track)
+    guard let input = self[track].input, input.isReadyForMoreMediaData else {
+      diagnostics[track].buffersDroppedNotReady += 1
       return
     }
 
     if input.append(sampleBuffer) {
-      incrementAppended(for: track)
+      diagnostics[track].buffersAppended += 1
     } else {
-      incrementAppendFailed(for: track)
+      diagnostics[track].buffersAppendFailed += 1
       Log.recorder.warning("\(track.rawValue) append failed for \(self.appName, privacy: .public)")
       reportWriterFailureIfNeeded()
     }
   }
 
   nonisolated private func padTailIfNeeded(for track: RecordingTrackKind, to finalEndTime: CMTime) {
-    let nextExpected = nextExpected(for: track)
-    guard let input = input(for: track), nextExpected.isValid,
+    let nextExpected = self[track].nextExpected
+    guard let input = self[track].input, nextExpected.isValid,
       nextExpected < finalEndTime
     else { return }
 
@@ -495,8 +552,9 @@ final class RecordingPipeline: @unchecked Sendable {
       return
     }
 
-    recordGapFill(for: track, filled: buffers)
-    recordTailPadding(for: track, filled: buffers, seconds: tailSeconds)
+    diagnostics[track].gapsFilled += buffers
+    diagnostics[track].tailPaddingBuffers += buffers
+    diagnostics[track].tailPaddingSeconds += tailSeconds
 
     let samplesExpected = Int(tailSeconds * Self.writerSampleRate)
     let residual = samplesExpected - samples
@@ -509,145 +567,6 @@ final class RecordingPipeline: @unchecked Sendable {
       Log.info(
         Log.recorder, "recorder",
         "\(track.rawValue): padded tail with \(buffers) buffers (\(samples) samples)")
-    }
-  }
-
-  nonisolated private func input(for track: RecordingTrackKind) -> AVAssetWriterInput? {
-    switch track {
-    case .system:
-      return systemAudioInput
-    case .mic:
-      return micInput
-    }
-  }
-
-  nonisolated private func nextExpected(for track: RecordingTrackKind) -> CMTime {
-    switch track {
-    case .system:
-      return systemNextExpected
-    case .mic:
-      return micNextExpected
-    }
-  }
-
-  nonisolated private func setNextExpected(_ value: CMTime, for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      systemNextExpected = value
-    case .mic:
-      micNextExpected = value
-    }
-  }
-
-  nonisolated private func firstPTS(for track: RecordingTrackKind) -> CMTime {
-    switch track {
-    case .system: return firstSystemPTS
-    case .mic: return firstMicPTS
-    }
-  }
-
-  nonisolated private func setFirstPTS(_ value: CMTime, for track: RecordingTrackKind) {
-    switch track {
-    case .system: firstSystemPTS = value
-    case .mic: firstMicPTS = value
-    }
-  }
-
-  nonisolated private func lastSeenPTS(for track: RecordingTrackKind) -> CMTime {
-    switch track {
-    case .system: return lastSeenSystemPTS
-    case .mic: return lastSeenMicPTS
-    }
-  }
-
-  nonisolated private func setLastSeenPTS(_ value: CMTime, for track: RecordingTrackKind) {
-    switch track {
-    case .system: lastSeenSystemPTS = value
-    case .mic: lastSeenMicPTS = value
-    }
-  }
-
-  nonisolated private func incrementReceived(for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      diagnostics.systemBuffersReceived += 1
-    case .mic:
-      diagnostics.micBuffersReceived += 1
-    }
-  }
-
-  nonisolated private func incrementDroppedNotReady(for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      diagnostics.systemBuffersDroppedNotReady += 1
-    case .mic:
-      diagnostics.micBuffersDroppedNotReady += 1
-    }
-  }
-
-  nonisolated private func incrementDroppedBeforeSession(for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      diagnostics.systemBuffersDroppedBeforeSession += 1
-    case .mic:
-      diagnostics.micBuffersDroppedBeforeSession += 1
-    }
-  }
-
-  nonisolated private func incrementAppended(for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      diagnostics.systemBuffersAppended += 1
-    case .mic:
-      diagnostics.micBuffersAppended += 1
-    }
-  }
-
-  nonisolated private func incrementAppendFailed(for track: RecordingTrackKind) {
-    switch track {
-    case .system:
-      diagnostics.systemBuffersAppendFailed += 1
-    case .mic:
-      diagnostics.micBuffersAppendFailed += 1
-    }
-  }
-
-  nonisolated private func recordGapFill(for track: RecordingTrackKind, filled: Int) {
-    switch track {
-    case .system:
-      diagnostics.systemGapsFilled += filled
-    case .mic:
-      diagnostics.micGapsFilled += filled
-    }
-  }
-
-  nonisolated private func recordTailPadding(
-    for track: RecordingTrackKind,
-    filled: Int,
-    seconds: Double
-  ) {
-    switch track {
-    case .system:
-      diagnostics.systemTailPaddingBuffers += filled
-      diagnostics.systemTailPaddingSeconds += seconds
-    case .mic:
-      diagnostics.micTailPaddingBuffers += filled
-      diagnostics.micTailPaddingSeconds += seconds
-    }
-  }
-
-  nonisolated private func recordLeadingSilence(
-    for track: RecordingTrackKind,
-    filled: Int,
-    seconds: Double
-  ) {
-    switch track {
-    case .system:
-      diagnostics.systemLeadingSilenceBuffers += filled
-      diagnostics.systemLeadingSilenceSeconds += seconds
-    case .mic:
-      diagnostics.micLeadingSilenceBuffers += filled
-      diagnostics.micLeadingSilenceSeconds += seconds
     }
   }
 
@@ -844,14 +763,8 @@ final class RecordingPipeline: @unchecked Sendable {
     let outFrames = needsResample ? Int(ceil(Double(inFrames) * ratio)) : inFrames
 
     guard
-      let monoFormat = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32,
-        sampleRate: writerSampleRate,
-        channels: 1,
-        interleaved: true
-      ),
       let monoBuffer = AVAudioPCMBuffer(
-        pcmFormat: monoFormat,
+        pcmFormat: monoFormat48k,
         frameCapacity: AVAudioFrameCount(outFrames)
       ),
       let outData = monoBuffer.floatChannelData?[0]

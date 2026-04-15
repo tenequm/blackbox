@@ -78,8 +78,8 @@ struct RecordingPipelineIntegrationTests {
 
     #expect(durations.count == 2)
     #expect(abs(durations[0] - durations[1]) < 0.05)
-    #expect(diagnostics.micTailPaddingBuffers > 0)
-    #expect(diagnostics.micTailPaddingSeconds > 0)
+    #expect(diagnostics.mic.tailPaddingBuffers > 0)
+    #expect(diagnostics.mic.tailPaddingSeconds > 0)
   }
 
   @Test("fills timeline gaps on the system track")
@@ -100,7 +100,7 @@ struct RecordingPipelineIntegrationTests {
     let audioURL = outputDir.appending(path: "audio.m4a")
     let durations = try await trackDurations(for: audioURL)
 
-    #expect(diagnostics.systemGapsFilled > 0)
+    #expect(diagnostics.system.gapsFilled > 0)
     #expect(durations.count == 2)
     #expect(durations[0] > 0.08)
   }
@@ -122,7 +122,7 @@ struct RecordingPipelineIntegrationTests {
     let diagnostics = pipeline.currentDiagnostics
     #expect(diagnostics.sessionStartTrack == .system)
     #expect(diagnostics.sessionStartPTS == CMTime(value: 4096, timescale: 48_000).seconds)
-    #expect(diagnostics.micBuffersDroppedBeforeSession >= 1)
+    #expect(diagnostics.mic.buffersDroppedBeforeSession >= 1)
   }
 
   @Test("writes a single-track file when mic capture is disabled")
@@ -162,14 +162,14 @@ struct RecordingPipelineIntegrationTests {
     _ = await pipeline.stop()
     let diagnostics = pipeline.currentDiagnostics
 
-    #expect(diagnostics.systemBuffersDroppedBeforeSession == 4)
+    #expect(diagnostics.system.buffersDroppedBeforeSession == 4)
     #expect(diagnostics.sessionStartTrack == .mic)
     #expect(diagnostics.sessionStartPTS == CMTime(value: 5000, timescale: 48_000).seconds)
-    #expect(diagnostics.micBuffersAppended == 2)
+    #expect(diagnostics.mic.buffersAppended == 2)
     // sys@6000 is post-session, passes the sessionStart check (6000 > 5000) and appends
     // after filling leading silence from 5000 to 6000.
-    #expect(diagnostics.systemBuffersAppended >= 1)
-    #expect(diagnostics.systemLeadingSilenceBuffers >= 1)
+    #expect(diagnostics.system.buffersAppended >= 1)
+    #expect(diagnostics.system.leadingSilenceBuffers >= 1)
   }
 
   @Test("session start times out when second track never fires")
@@ -194,8 +194,8 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.sessionStartPTS == 0.0)
     // Before the timeout, the first N system samples are dropped while the code is
     // still waiting for mic. After the timeout, subsequent samples append normally.
-    #expect(diagnostics.systemBuffersDroppedBeforeSession > 0)
-    #expect(diagnostics.systemBuffersAppended > 0)
+    #expect(diagnostics.system.buffersDroppedBeforeSession > 0)
+    #expect(diagnostics.system.buffersAppended > 0)
   }
 
   @Test("leading silence fills when late mic arrives after timeout")
@@ -218,8 +218,8 @@ struct RecordingPipelineIntegrationTests {
 
     #expect(durations.count == 2)
     #expect(diagnostics.sessionStartTimedOut == true)
-    #expect(diagnostics.micLeadingSilenceBuffers > 0)
-    #expect(diagnostics.micLeadingSilenceSeconds > 0.5)  // 30*1024/48000 = ~640ms
+    #expect(diagnostics.mic.leadingSilenceBuffers > 0)
+    #expect(diagnostics.mic.leadingSilenceSeconds > 0.5)  // 30*1024/48000 = ~640ms
   }
 
   @Test("tail padding closes gaps with partial final chunk")
@@ -246,7 +246,7 @@ struct RecordingPipelineIntegrationTests {
     #expect(durations.count == 2)
     #expect(abs(durations[0] - durations[1]) < 0.005)
     // 3 full 1024-sample chunks + 1 partial 500-sample chunk = 4 buffers
-    #expect(diagnostics.micTailPaddingBuffers == 4)
+    #expect(diagnostics.mic.tailPaddingBuffers == 4)
   }
 
   // MARK: - D9 Latency Offset
@@ -279,10 +279,10 @@ struct RecordingPipelineIntegrationTests {
     #expect(durations.count == 2)
     #expect(abs(durations[0] - durations[1]) < 0.1)
     #expect(diagnostics.sessionStartTrack == .system)
-    #expect(diagnostics.systemBuffersAppended == 10)
+    #expect(diagnostics.system.buffersAppended == 10)
     // Mic samples with pts < sessionStart are dropped. The rest append.
-    #expect(diagnostics.micBuffersDroppedBeforeSession >= 3)
-    #expect(diagnostics.micBuffersAppended >= 6)
+    #expect(diagnostics.mic.buffersDroppedBeforeSession >= 3)
+    #expect(diagnostics.mic.buffersAppended >= 6)
   }
 
   @Test("D9 offset decrease mid-recording triggers mic gap fill")
@@ -319,8 +319,8 @@ struct RecordingPipelineIntegrationTests {
     #expect(durations.count == 2)
     #expect(abs(durations[0] - durations[1]) < 0.1)
     // Mid-recording gap fills should exceed tail padding (offset change caused a real gap)
-    #expect(diagnostics.micGapsFilled > diagnostics.micTailPaddingBuffers)
-    #expect(diagnostics.systemGapsFilled == 0)
+    #expect(diagnostics.mic.gapsFilled > diagnostics.mic.tailPaddingBuffers)
+    #expect(diagnostics.system.gapsFilled == 0)
   }
 
   @Test("D9 offset increase mid-recording preserves valid output")
@@ -356,10 +356,10 @@ struct RecordingPipelineIntegrationTests {
 
     #expect(durations.count == 2)
     #expect(abs(durations[0] - durations[1]) < 0.15)
-    #expect(diagnostics.micBuffersAppendFailed <= 1)
+    #expect(diagnostics.mic.buffersAppendFailed <= 1)
     // Under the new delayed-session rule, the first D9-shifted mic sample (PTS < sys base)
     // is dropped before session starts.
-    #expect(diagnostics.micBuffersDroppedBeforeSession >= 1)
+    #expect(diagnostics.mic.buffersDroppedBeforeSession >= 1)
   }
 
   // MARK: - preserveAllContent mode (manual recordings)
@@ -387,13 +387,13 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.sessionStartTrack == .system)
     #expect(diagnostics.sessionStartPTS == 0.0)
     // No pre-session drops in this mode - every captured sample is preserved.
-    #expect(diagnostics.systemBuffersDroppedBeforeSession == 0)
-    #expect(diagnostics.micBuffersDroppedBeforeSession == 0)
-    #expect(diagnostics.systemBuffersAppended == 3)
-    #expect(diagnostics.micBuffersAppended == 2)
+    #expect(diagnostics.system.buffersDroppedBeforeSession == 0)
+    #expect(diagnostics.mic.buffersDroppedBeforeSession == 0)
+    #expect(diagnostics.system.buffersAppended == 3)
+    #expect(diagnostics.mic.buffersAppended == 2)
     // Late mic gets leading silence.
-    #expect(diagnostics.micLeadingSilenceBuffers > 0)
-    #expect(abs(diagnostics.micLeadingSilenceSeconds - (2112.0 / 48_000.0)) < 0.001)
+    #expect(diagnostics.mic.leadingSilenceBuffers > 0)
+    #expect(abs(diagnostics.mic.leadingSilenceSeconds - (2112.0 / 48_000.0)) < 0.001)
   }
 
   @Test("preserveAllContent: short recording with only one track still produces output")
@@ -419,8 +419,8 @@ struct RecordingPipelineIntegrationTests {
     // or 2 tracks (system + empty mic); either is acceptable.
     #expect(tracks.count >= 1)
     #expect(diagnostics.sessionStartTrack == .system)
-    #expect(diagnostics.systemBuffersAppended == 2)
-    #expect(diagnostics.micBuffersAppended == 0)
+    #expect(diagnostics.system.buffersAppended == 2)
+    #expect(diagnostics.mic.buffersAppended == 0)
   }
 
   @Test("preserveAllContent: mic-first session then late system gets leading silence")
@@ -445,11 +445,11 @@ struct RecordingPipelineIntegrationTests {
     #expect(abs(durations[0] - durations[1]) < 0.01)
     #expect(diagnostics.sessionStartTrack == .mic)
     #expect(diagnostics.sessionStartPTS == 0.0)
-    #expect(diagnostics.systemLeadingSilenceBuffers > 0)
-    #expect(abs(diagnostics.systemLeadingSilenceSeconds - (1500.0 / 48_000.0)) < 0.001)
-    #expect(diagnostics.micLeadingSilenceBuffers == 0)
+    #expect(diagnostics.system.leadingSilenceBuffers > 0)
+    #expect(abs(diagnostics.system.leadingSilenceSeconds - (1500.0 / 48_000.0)) < 0.001)
+    #expect(diagnostics.mic.leadingSilenceBuffers == 0)
     // All samples preserved - no drops.
-    #expect(diagnostics.systemBuffersDroppedBeforeSession == 0)
-    #expect(diagnostics.micBuffersDroppedBeforeSession == 0)
+    #expect(diagnostics.system.buffersDroppedBeforeSession == 0)
+    #expect(diagnostics.mic.buffersDroppedBeforeSession == 0)
   }
 }

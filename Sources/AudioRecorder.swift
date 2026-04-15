@@ -53,8 +53,11 @@ actor AudioRecorder {
   private var micBuffersConversionFailed: Int = 0
   private var configChangeGeneration: Int = 0
 
-  // D9: device latency offset for mic-system alignment
+  // D9: device latency offset for mic-system alignment.
+  // `micLatencyOffsetTicks` is the mach host-time equivalent of `micLatencyOffset`,
+  // cached so we do not call `AudioConvertNanosToHostTime` on every mic buffer.
   private var micLatencyOffset: Double = 0
+  private var micLatencyOffsetTicks: UInt64 = 0
 
   // Drift monitor state. Raw (pre-D9) host times from the most recent buffer
   // delivered by each path, plus a 5s log timer. Used to surface mic-vs-system
@@ -167,7 +170,22 @@ actor AudioRecorder {
         saveDirectory: saveDirectory,
         alignmentMode: isManualRecording ? .preserveAllContent : .waitForAllTracks,
         onFailure: onFailure,
-        onAudioLevel: onAudioLevel
+        onAudioLevel: onAudioLevel,
+        armSessionStartTimeout: { [weak self] in
+          guard let self else { return }
+          // Poke `tryStartSessionFromTimeout` ~500ms after the first sample
+          // arrives so the wall-clock fallback still fires even if the second
+          // track stops delivering buffers entirely. Hop through `audioQueue`
+          // so the pipeline's single-threaded access invariant is preserved.
+          let delay: DispatchTimeInterval = .milliseconds(
+            Int(RecordingPipeline.sessionStartTimeoutSeconds * 1000) + 10)
+          self.audioQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.assumeIsolated { iso in
+              iso.pipeline?.tryStartSessionFromTimeout()
+            }
+          }
+        }
       )
       try pipeline.start()
       self.pipeline = pipeline
@@ -258,14 +276,16 @@ actor AudioRecorder {
     }
 
     let diagnostics = pipeline?.currentDiagnostics
+    let systemStats = diagnostics?.system ?? TrackDiagnostics()
     Log.info(
       Log.recorder, "recorder",
-      "system stats: received=\(diagnostics?.systemBuffersReceived ?? 0) appended=\(diagnostics?.systemBuffersAppended ?? 0) notReady=\(diagnostics?.systemBuffersDroppedNotReady ?? 0) appendFail=\(diagnostics?.systemBuffersAppendFailed ?? 0) gapsFilled=\(diagnostics?.systemGapsFilled ?? 0) tailPad=\(String(format: "%.3f", diagnostics?.systemTailPaddingSeconds ?? 0))s"
+      "system stats: received=\(systemStats.buffersReceived) appended=\(systemStats.buffersAppended) notReady=\(systemStats.buffersDroppedNotReady) appendFail=\(systemStats.buffersAppendFailed) gapsFilled=\(systemStats.gapsFilled) tailPad=\(String(format: "%.3f", systemStats.tailPaddingSeconds))s"
     )
     if micEnabled {
+      let micStats = diagnostics?.mic ?? TrackDiagnostics()
       Log.info(
         Log.recorder, "recorder",
-        "mic stats: received=\(diagnostics?.micBuffersReceived ?? 0) appended=\(diagnostics?.micBuffersAppended ?? 0) notReady=\(diagnostics?.micBuffersDroppedNotReady ?? 0) convFail=\(micBuffersConversionFailed) appendFail=\(diagnostics?.micBuffersAppendFailed ?? 0) gapsFilled=\(diagnostics?.micGapsFilled ?? 0) tailPad=\(String(format: "%.3f", diagnostics?.micTailPaddingSeconds ?? 0))s"
+        "mic stats: received=\(micStats.buffersReceived) appended=\(micStats.buffersAppended) notReady=\(micStats.buffersDroppedNotReady) convFail=\(micBuffersConversionFailed) appendFail=\(micStats.buffersAppendFailed) gapsFilled=\(micStats.gapsFilled) tailPad=\(String(format: "%.3f", micStats.tailPaddingSeconds))s"
       )
     }
     diskSpaceTimer?.cancel()
@@ -279,6 +299,7 @@ actor AudioRecorder {
     micTapFormat = nil
     tapFormat = nil
     micLatencyOffset = 0
+    micLatencyOffsetTicks = 0
     let pipeline = self.pipeline
     self.pipeline = nil
     let savedURL = await pipeline?.stop()
@@ -321,11 +342,8 @@ actor AudioRecorder {
       mElement: kAudioObjectPropertyElementMain)
     let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
       guard let self else { return }
-      self.audioQueue.async { [weak self] in
-        guard let self else { return }
-        self.assumeIsolated { iso in
-          iso.handleOutputDeviceChange()
-        }
+      self.assumeIsolated { iso in
+        iso.handleOutputDeviceChange()
       }
     }
     AudioObjectAddPropertyListenerBlock(
@@ -523,8 +541,9 @@ actor AudioRecorder {
         guard let self else { return }
         self.assumeIsolated { iso in
           iso.lastSystemHostTime = hostTime
-          let actualRate = iso.tapFormat?.sampleRate ?? 48000
-          guard let monoBuf = RecordingPipeline.resampleToMono48k(copy, sourceRate: actualRate),
+          guard
+            let monoBuf = RecordingPipeline.resampleToMono48k(
+              copy, sourceRate: copy.format.sampleRate),
             let sampleBuffer = monoBuf.asSampleBuffer(timestamp: audioTime)
           else { return }
           iso.handleSystemSample(sampleBuffer)
@@ -731,12 +750,12 @@ actor AudioRecorder {
       lastMicHostTime = time.hostTime
     }
 
-    // D9: apply latency offset once, used for both session start and buffer conversion
+    // D9: apply cached latency offset (in host ticks) to the mic PTS.
     let adjustedTime: AVAudioTime
-    if micLatencyOffset > 0, time.isHostTimeValid {
-      let offsetTicks = AudioConvertNanosToHostTime(UInt64(micLatencyOffset * 1e9))
+    if micLatencyOffsetTicks > 0, time.isHostTimeValid {
       let adjustedHostTime =
-        time.hostTime > offsetTicks ? time.hostTime - offsetTicks : time.hostTime
+        time.hostTime > micLatencyOffsetTicks
+        ? time.hostTime - micLatencyOffsetTicks : time.hostTime
       adjustedTime = AVAudioTime(hostTime: adjustedHostTime)
     } else {
       adjustedTime = time
@@ -869,6 +888,8 @@ actor AudioRecorder {
 
     let totalFrames = inputLatency + streamLatency + safetyOffset
     micLatencyOffset = Double(totalFrames) / sampleRate
+    micLatencyOffsetTicks =
+      micLatencyOffset > 0 ? AudioConvertNanosToHostTime(UInt64(micLatencyOffset * 1e9)) : 0
     Log.info(
       Log.recorder, "recorder",
       "mic latency offset: \(totalFrames) frames (\(String(format: "%.1f", micLatencyOffset * 1000))ms) [device=\(inputLatency) stream=\(streamLatency) safety=\(safetyOffset)] at \(sampleRate)Hz"
