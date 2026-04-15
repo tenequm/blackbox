@@ -61,10 +61,23 @@ struct BlackboxApp: App {
   final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var monitor: AudioMonitor?
     private var onboardingWindow: NSWindow?
+    private var testController: BlackboxTestController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       installCrashHandler()
-      launchWatchdog()
+      if !BlackboxTestMode.isEnabled {
+        launchWatchdog()
+      }
+
+      if BlackboxTestMode.isEnabled {
+        monitor?.startMonitoring(skipPermissionRequests: true)
+        if let monitor {
+          let controller = BlackboxTestController(monitor: monitor)
+          controller.start()
+          testController = controller
+        }
+        return
+      }
 
       // Existing users who already granted audio recording don't need onboarding
       if UserDefaults.standard.bool(forKey: "audioRecordingGranted") {
@@ -95,6 +108,11 @@ struct BlackboxApp: App {
     }
 
     private func installCrashHandler() {
+      guard !BlackboxTestMode.isEnabled else {
+        NSSetUncaughtExceptionHandler(uncaughtExceptionHandler)
+        return
+      }
+
       // Read previous state BEFORE marking current session as running
       let previousSessionCrashed = UserDefaults.standard.bool(forKey: "processRunning")
       UserDefaults.standard.set(true, forKey: "processRunning")
@@ -142,7 +160,10 @@ struct BlackboxApp: App {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-      UserDefaults.standard.set(false, forKey: "processRunning")
+      testController?.stop()
+      if !BlackboxTestMode.isEnabled {
+        UserDefaults.standard.set(false, forKey: "processRunning")
+      }
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
         return .terminateNow
@@ -321,15 +342,4 @@ private func recordingWaveformIcon(level: Float) -> String {
   } else {
     return "waveform.low"
   }
-}
-
-private func restartApp() {
-  let url = Bundle.main.bundleURL
-  // Terminate first, then relaunch. Without createsNewApplicationInstance,
-  // open -a waits for the old process to exit before launching the new one.
-  let task = Process()
-  task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-  task.arguments = [url.path]
-  try? task.run()
-  NSApplication.shared.terminate(nil)
 }

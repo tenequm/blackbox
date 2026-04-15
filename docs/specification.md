@@ -45,17 +45,28 @@ This document records architectural decisions and their reasoning. Implementatio
 │         (IO proc callback)                 (from PCM + hostTime     │
 │              │                              - latency offset)       │
 │              ▼                                   │                  │
-│         CMSampleBuffer                           │                  │
-│         (manual conversion)                      │                  │
+│         AVAudioPCMBuffer                         │                  │
+│         (zero-copy wrap)                         │                  │
 │              │                                   │                  │
 └──────────────┼───────────────────────────────────┼──────────────────┘
                │                                   │
                ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     GAP DETECTION & FILL                            │
+│                   RESAMPLE & DOWNMIX                                │
 │                                                                     │
-│  Per-pipeline: track nextExpectedTime from PTS + duration           │
+│  resampleToMono48k(): stereo→mono downmix (L+R avg),               │
+│  sample rate conversion via linear interpolation to 48kHz           │
+│  Both pipelines output 1ch mono Float32 at 48kHz                    │
+│                                                                     │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              GAP DETECTION & FILL (RecordingPipeline)               │
+│                                                                     │
+│  Per-track: track nextExpectedTime from PTS + duration              │
 │  If incoming PTS > expected → write zero-filled silence buffers     │
+│  Tail padding: pad shorter track to common end time on stop         │
 │  Ensures AVAssetWriter receives continuous timeline (no gaps)       │
 │                                                                     │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -65,7 +76,7 @@ This document records architectural decisions and their reasoning. Implementatio
 │                        WRITING                                      │
 │                                                                     │
 │  AVAssetWriter → 2 track M4A (AAC, 48kHz)                          │
-│    Track 0: system audio (2ch stereo, 128kbps)                      │
+│    Track 0: system audio (1ch mono, 64kbps)                         │
 │    Track 1: mic audio (1ch mono, 64kbps)                            │
 │  movieFragmentInterval = 10s (crash safety)                         │
 │  No post-processing, no mixing                                      │
@@ -85,7 +96,7 @@ This document records architectural decisions and their reasoning. Implementatio
 
 **v0.6.1 (Apr 2026):** Smoke testing revealed 8.64s desync over a 2-hour recording - AVAssetWriter collapses PTS gaps from mic device switches. Implemented silence gap filling (D8) to preserve timeline integrity across both pipelines.
 
-**v0.7.0 (Apr 2026):** CATap migration (D5) replaces dual SCStream. Per-app track dropped. Fixed 2-track M4A. Device latency offset compensation (D9). Requires macOS 26.1+. Adopted CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, `AudioHardwareAggregateDevice`, `AudioHardwareProcess`) eliminating ~170 lines of C-level CoreAudio boilerplate. Converted AudioRecorder from class to Swift 6.2 actor with custom `DispatchSerialQueue` executor, replacing all `nonisolated(unsafe)` declarations with compile-time actor isolation safety. Fixed mic latency offset to use actual device sample rate and `AudioConvertNanosToHostTime` for correct Mach time conversion.
+**v0.7.0 (Apr 2026):** CATap migration (D5) replaces dual SCStream. Per-app track dropped. Fixed 2-track M4A (both tracks 1ch mono 48kHz 64kbps - system audio downmixed from stereo via `resampleToMono48k`). Device latency offset compensation (D9). Requires macOS 26.1+. Adopted CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, `AudioHardwareAggregateDevice`, `AudioHardwareProcess`) eliminating ~170 lines of C-level CoreAudio boilerplate. Converted AudioRecorder from class to Swift 6.2 actor with custom `DispatchSerialQueue` executor, replacing all `nonisolated(unsafe)` declarations with compile-time actor isolation safety. Fixed mic latency offset to use actual device sample rate and `AudioConvertNanosToHostTime` for correct Mach time conversion. Extracted `RecordingPipeline` from `AudioRecorder` (AVAssetWriter management, gap filling, tail padding, audio level metering) for testability. Introduced `AudioMonitorDependencies` for dependency injection into `AudioMonitor`, enabling deterministic integration tests with `TestClock` and `TestRecorderFactory`. Added hardware smoke tests via `BlackboxTestMode` file-based IPC - launches real app bundle, drives recording, verifies output file structure.
 
 ---
 
@@ -185,13 +196,11 @@ Architectural decisions with reasoning and alternatives considered.
 
 **IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation).
 
-**AudioBufferList-to-CMSampleBuffer conversion:** The IO proc receives raw `AudioBufferList`. To write via AVAssetWriter, convert on `audioQueue`:
-1. Wrap the `AudioBufferList` data in a `CMBlockBuffer` via `CMBlockBufferCreateWithMemoryBlock` (copy the data - the IO proc buffer is only valid during the callback)
-2. Build `CMSampleTimingInfo` from `inTimeStamp.mHostTime` converted via `CMClockMakeHostTimeFromSystemUnits`
-3. Create `CMSampleBuffer` via `CMSampleBufferCreateReady` with a clean Float32 interleaved LPCM `CMAudioFormatDescription` (same approach as `makeSilentSampleBuffer`)
-4. Dispatch to `audioQueue` for gap detection and writing
-
-Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)` for zero-copy wrapping of the `AudioBufferList`, then convert to `CMSampleBuffer` via the existing `asSampleBuffer()` extension. The zero-copy path avoids a memcpy but requires the format to match exactly (Float32, interleaved, matching channel count).
+**AudioBufferList-to-CMSampleBuffer conversion:** The IO proc receives raw interleaved Float32 `AudioBufferList`. Conversion on `audioQueue`:
+1. Zero-copy wrap via `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)`, then copy frame data (IO proc buffer only valid during callback)
+2. Resample and downmix to mono 48kHz via `RecordingPipeline.resampleToMono48k()` (stereo L+R average, linear interpolation for rate conversion)
+3. Convert to `CMSampleBuffer` via `asSampleBuffer(timestamp:)` using `AVAudioTime.hostTime` converted via `CMClockMakeHostTimeFromSystemUnits`
+4. Pass to `RecordingPipeline.appendSystemSample()` for gap detection and writing
 
 **Output device change:** When the system default output device changes, the tap's aggregate device must be torn down and rebuilt. This causes a gap in system audio (~0.5-1.5s), handled by silence gap filling (D8). Listen for `kAudioHardwarePropertyDefaultOutputDevice` changes.
 
@@ -208,7 +217,7 @@ Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)
 **Aggregate device mic list filtering:** The CATap aggregate device may appear in the system's input device list (`kAudioHardwarePropertyDevices` with input scope). Filter it out when displaying available mics or when `AVAudioEngine` is selecting a default input device. RecordKit fixed this in v0.84.0 ("Filter out aggregate device from available microphone list").
 
 **Track layout (fixed at writer setup):**
-- Track 0: system audio (2ch stereo)
+- Track 0: system audio (1ch mono, downmixed from stereo via `resampleToMono48k`)
 - Track 1: mic audio (when mic enabled, 1ch mono)
 
 **Production validation:** CATap is used in production by RecordKit (Nonstrict, commercial SDK, default since v0.82.0), Chromium (behind feature flag since 2025), and audiotee (powers talat.app, commercial meeting transcription).
@@ -248,7 +257,7 @@ Alternatively, use `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)
 **Implementation constraints:**
 - Silence buffers must be written in small chunks (~1024 samples matching normal buffer cadence). One large silent buffer spanning the entire gap causes `kCMSampleBufferError_ArrayTooSmall` (-12737) or crashes the AAC encoder (confirmed by darrarski/macOS-audio-gap-demo and SO reports).
 - Silence buffers must use a clean LPCM format description built from scratch (Float32, packed, interleaved, no extensions). Do NOT reuse format descriptions from pipeline buffers - those may include channel layout extensions or non-interleaved flags that don't match the flat zero-filled block buffer, causing `input.append()` to reject or the writer to enter `.failed` state.
-- Gap detection threshold: >10ms (480 samples at 48kHz) to avoid false positives from normal PTS jitter.
+- Gap detection threshold: >5ms (240 samples at 48kHz) to avoid false positives from normal PTS jitter.
 - Gap filling runs on `audioQueue`, same as all other writer state mutations.
 - `nextExpectedTime` is updated BEFORE the `isReadyForMoreMediaData` guard, so dropped buffers don't create false gaps on the next buffer.
 

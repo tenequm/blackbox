@@ -7,7 +7,7 @@ SPARKLE_PATH = $(shell find .build/artifacts -name "Sparkle.framework" -path "*/
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format test check dmg release
+.PHONY: build bundle install run clean format test check dmg release smoke-install smoke-test smoke
 
 build:
 	swift build -c release
@@ -74,6 +74,13 @@ release: dmg
 
 test:
 	swift test --disable-xctest
+
+smoke-install: install
+
+smoke-test: bundle
+	BLACKBOX_RUN_HARDWARE_SMOKE=1 BLACKBOX_SMOKE_APP_PATH="$(PWD)/$(APP_BUNDLE)" swift test --disable-xctest
+
+smoke: smoke-test
 
 check: format build test
 	@echo "All checks passed."

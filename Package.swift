@@ -45,6 +45,9 @@ let package = Package(
             name: "BlackboxTests",
             dependencies: ["Blackbox"],
             path: "Tests",
+            resources: [
+                .copy("Fixtures"),
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .defaultIsolation(MainActor.self),
