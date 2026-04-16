@@ -423,6 +423,75 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.mic.buffersAppended == 0)
   }
 
+  // MARK: - Edge cases
+
+  @Test("appendSample after stop is a no-op")
+  func appendSampleAfterStopIsNoop() async throws {
+    let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
+    pipeline.appendMicSample(makeSampleBuffer(startSample: 0))
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 1024))
+    pipeline.appendMicSample(makeSampleBuffer(startSample: 1024))
+
+    _ = await pipeline.stop()
+    let diagnosticsAtStop = pipeline.currentDiagnostics
+
+    // Feed more samples after stop - should be ignored
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 2048))
+    pipeline.appendMicSample(makeSampleBuffer(startSample: 2048))
+
+    let diagnosticsAfter = pipeline.currentDiagnostics
+    // buffersReceived still increments (counted before the guard), but appended must not
+    #expect(diagnosticsAfter.system.buffersAppended == diagnosticsAtStop.system.buffersAppended)
+    #expect(diagnosticsAfter.mic.buffersAppended == diagnosticsAtStop.mic.buffersAppended)
+  }
+
+  @Test("backwards PTS does not crash and produces valid output")
+  func backwardsPTSProducesValidOutput() async throws {
+    let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 1024))
+    // PTS goes backwards - should not crash or corrupt the file
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 512))
+    // Normal sample after the backwards one - triggers gap fill from 512+1024=1536 to 2048
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 2048))
+
+    let outputDir = try #require(await pipeline.stop())
+    let audioURL = outputDir.appending(path: "audio.m4a")
+    #expect(FileManager.default.fileExists(atPath: audioURL.path(percentEncoded: false)))
+    let durations = try await trackDurations(for: audioURL)
+    #expect(durations.count >= 1)
+    #expect(durations[0] > 0)
+  }
+
+  @Test("large PTS jump triggers gap fill and produces valid output")
+  func largePTSJumpTriggersGapFill() async throws {
+    let (pipeline, root) = try makePipeline(micEnabled: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
+    // 2-second jump at 48kHz
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 96_000))
+
+    let outputDir = try #require(await pipeline.stop())
+    let diagnostics = pipeline.currentDiagnostics
+    let durations = try await trackDurations(for: outputDir.appending(path: "audio.m4a"))
+
+    #expect(diagnostics.system.gapsFilled > 0)
+    #expect(durations.count >= 1)
+    // Duration should be approximately 2 seconds (the gap) + 1024 samples of real audio
+    #expect(durations[0] > 1.9)
+  }
+
+  // MARK: - preserveAllContent mode (manual recordings)
+
   @Test("preserveAllContent: mic-first session then late system gets leading silence")
   func preserveAllContentMicFirstLateSystem() async throws {
     let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)

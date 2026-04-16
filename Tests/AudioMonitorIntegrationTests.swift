@@ -115,6 +115,77 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("multiple simultaneous callers records with nil bundleID")
+  func multipleSimultaneousCallersRecordsWithNilBundleID() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    // Start monitoring with no active callers
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    // Multiple callers appear on the next poll cycle
+    harness.activeCallers = ["com.example.Zoom", "com.example.Chrome"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    // When multiple callers are active, bundleID is nil (can't attribute to one app)
+    #expect(session.configuration.bundleID == nil)
+    #expect(monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("permissionDenied failure stops without restart and flags permission needed")
+  func permissionDeniedStopsWithoutRestart() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    session.emitFailure(.permissionDenied)
+    await settle()
+
+    // No restart - session count stays at 1
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    #expect(monitor.permissionNeeded == true)
+    #expect(harness.permissionLostNotifications == 1)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("lowDiskSpace failure stops with error and no restart")
+  func lowDiskSpaceStopsWithError() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    session.emitFailure(.lowDiskSpace)
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    #expect(monitor.errorMessage != nil)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("inactive polling does not restart grace countdown forever")
   func inactivePollingDoesNotRestartGraceCountdownForever() async throws {
     let harness = MonitorHarness()
