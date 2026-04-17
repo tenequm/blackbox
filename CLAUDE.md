@@ -91,12 +91,12 @@ Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
 1. **Automated**: `make check` (format + build + test)
 2. **Hardware smoke test**: `make smoke-test` (builds bundle, launches app, records real audio, verifies output)
 3. **Manual smoke test**: `make install && open /Applications/Blackbox.app`
-3. **Verify permissions**: First recording should prompt for System Audio Recording permission
-4. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
-5. **Test manual recording**: Menu > Record Now - should record and stop cleanly
-6. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
-7. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
-8. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
+4. **Verify permissions**: First recording should prompt for System Audio Recording permission
+5. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
+6. **Test manual recording**: Menu > Record Now - should record and stop cleanly
+7. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
+8. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
+9. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
 
 ## Release Process
 

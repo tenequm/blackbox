@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Accelerate
 import CoreMedia
 
 enum RecordingTrackKind: String, Sendable {
@@ -185,7 +186,7 @@ final class RecordingPipeline: @unchecked Sendable {
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
     let audioURL = dirURL.appendingPathComponent("audio.m4a")
-    Log.recorder.info("writing to \(dirName, privacy: .public)/audio.m4a")
+    Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
 
     let metadata = RecordingMetadata(
       title: appName,
@@ -253,6 +254,16 @@ final class RecordingPipeline: @unchecked Sendable {
     publishAudioLevel(sampleBuffer)
   }
 
+  /// Finalizes the writer and returns the output URL.
+  ///
+  /// Intentionally `nonisolated` because the caller (`AudioRecorder.stop`) drains
+  /// the pipeline before invoking this: the CATap IO proc is destroyed, the
+  /// aggregate device is torn down, and the AVAudioEngine mic tap is removed.
+  /// After those teardown steps, no new buffers can enqueue onto audioQueue,
+  /// so this method has no work to serialize against.
+  ///
+  /// Do not call while any buffer source is still live - the `nonisolated(unsafe)`
+  /// state inside the pipeline assumes all writes happen on audioQueue.
   @discardableResult
   nonisolated func stop() async -> URL? {
     stopped = true
@@ -289,6 +300,8 @@ final class RecordingPipeline: @unchecked Sendable {
       return nil
     }
 
+    // Safe to capture nonisolated: finishWriting() is the terminal writer op,
+    // and the main path awaits its completion before any further access.
     nonisolated(unsafe) let writerForTimeout = capturedWriter
     let timeoutTask = Task.detached {
       try await Task.sleep(for: .seconds(5))
@@ -468,21 +481,15 @@ final class RecordingPipeline: @unchecked Sendable {
     {
       let leadSeconds = CMTimeGetSeconds(pts - sessionStartTime)
       if leadSeconds > 0.001 {
-        // Use fillGapFully with tight bounds: in the `.waitForAllTracks` timeout
-        // fallback and in `.preserveAllContent` mode while the other track is
-        // actively writing, the writer is not empty and back-pressure is possible.
-        // 20 x 5ms = 100ms max stall on audioQueue, which is short enough not to
-        // meaningfully starve live capture but retries enough to push through
-        // transient encoder back-pressure so we don't lose the real sample that
-        // follows.
+        // D8: fill as much leading silence as the writer will take in one pass;
+        // back-pressure breaks out immediately without blocking audioQueue. The
+        // residual (if any) is retried by `fillGap` on the next appendSample.
         let (leadingBuffers, _) = Self.fillGapFully(
           from: sessionStartTime,
           to: pts,
           channelCount: 1,
           sampleRate: Self.writerSampleRate,
-          input: input,
-          maxSpinAttempts: 20,
-          spinInterval: 0.005
+          input: input
         )
         if leadingBuffers > 0 {
           diagnostics[track].leadingSilenceBuffers += leadingBuffers
@@ -525,7 +532,7 @@ final class RecordingPipeline: @unchecked Sendable {
       diagnostics[track].buffersAppended += 1
     } else {
       diagnostics[track].buffersAppendFailed += 1
-      Log.recorder.warning("\(track.rawValue) append failed for \(self.appName, privacy: .public)")
+      Log.warning(Log.recorder, "recorder", "\(track.rawValue) append failed for \(appName)")
       reportWriterFailureIfNeeded()
     }
   }
@@ -599,16 +606,10 @@ final class RecordingPipeline: @unchecked Sendable {
     let floatCount = length / MemoryLayout<Float>.size
     guard floatCount > 0 else { return }
 
-    let samples = UnsafeBufferPointer(
-      start: UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self),
-      count: floatCount
-    )
-    var sumOfSquares: Float = 0
-    for sample in samples {
-      sumOfSquares += sample * sample
-    }
-
-    let rms = (sumOfSquares / Float(floatCount)).squareRoot()
+    let samplePtr = UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self)
+    var meanSquare: Float = 0
+    vDSP_measqv(samplePtr, 1, &meanSquare, vDSP_Length(floatCount))
+    let rms = meanSquare.squareRoot()
     if rms > pendingMaxLevel { pendingMaxLevel = rms }
 
     let now = DispatchTime.now().uptimeNanoseconds
@@ -689,43 +690,28 @@ final class RecordingPipeline: @unchecked Sendable {
     return (written, samplesWritten)
   }
 
-  /// Drives `fillGap` in a retry loop until `end` is reached or the writer input
-  /// refuses further samples for `maxSpinAttempts × spinInterval`.
+  /// Drives `fillGap` in a loop until `end` is reached or the writer input
+  /// refuses further samples. Never blocks `audioQueue`: if
+  /// `isReadyForMoreMediaData` is false mid-loop, breaks immediately per D8
+  /// ("Safety: never risk the recording for sync", `docs/specification.md`).
   ///
-  /// Uses `Thread.sleep` on the calling thread to wait out back-pressure. The
-  /// sleep runs on `audioQueue` and will block any other work already queued
-  /// there (CATap IO proc dispatches, AVAudioEngine tap dispatches) until it
-  /// returns. Pick bounds carefully:
-  ///
-  /// - `padTailIfNeeded` inside `stop()`: caller already torn down IO proc and
-  ///   engine tap, so blocking `audioQueue` is free. Default bounds (200 x 5ms
-  ///   = 1s) are fine.
-  /// - Leading silence during an active recording (`.waitForAllTracks` timeout
-  ///   fallback, or `.preserveAllContent` late track first-fire): live capture
-  ///   is still flowing. Use **short** bounds (20 x 5ms = 100ms max stall) so
-  ///   we retry transient encoder back-pressure without starving more than a
-  ///   handful of capture callbacks.
+  /// On early break, the leftover gap is accepted. Leading-silence callers
+  /// reattempt on the next `appendSample` invocation via `fillGap`. Tail
+  /// padding from `stop()` accepts the residual as desync rather than
+  /// re-queuing work on audioQueue.
   nonisolated static func fillGapFully(
     from start: CMTime,
     to end: CMTime,
     channelCount: Int,
     sampleRate: Double,
-    input: AVAssetWriterInput,
-    maxSpinAttempts: Int = 200,
-    spinInterval: TimeInterval = 0.005
+    input: AVAssetWriterInput
   ) -> (buffers: Int, samples: Int) {
     var cursor = start
     var totalBuffers = 0
     var totalSamples = 0
-    var attempts = 0
 
     while CMTimeCompare(cursor, end) < 0 {
-      if !input.isReadyForMoreMediaData {
-        if attempts >= maxSpinAttempts { break }
-        attempts += 1
-        Thread.sleep(forTimeInterval: spinInterval)
-        continue
-      }
+      if !input.isReadyForMoreMediaData { break }
       let (buffers, samples) = fillGap(
         from: cursor,
         to: end,
@@ -733,13 +719,7 @@ final class RecordingPipeline: @unchecked Sendable {
         sampleRate: sampleRate,
         input: input
       )
-      if samples == 0 {
-        if attempts >= maxSpinAttempts { break }
-        attempts += 1
-        Thread.sleep(forTimeInterval: spinInterval)
-        continue
-      }
-      attempts = 0
+      if samples == 0 { break }
       totalBuffers += buffers
       totalSamples += samples
       cursor = CMTimeAdd(
@@ -772,29 +752,38 @@ final class RecordingPipeline: @unchecked Sendable {
     else { return nil }
 
     if inChannels >= 2 {
-      let rightData = isInterleaved ? nil : buffer.floatChannelData?[1]
-      guard isInterleaved || rightData != nil else { return nil }
-
-      let monoSample: (Int) -> Float = { index in
-        if isInterleaved {
-          return (inData[index * 2] + inData[index * 2 + 1]) * 0.5
-        }
-        return (inData[index] + rightData![index]) * 0.5
-      }
-
-      if needsResample {
-        for i in 0..<outFrames {
-          let srcIdx = Double(i) / ratio
-          let lo = Int(srcIdx)
-          let hi = min(lo + 1, inFrames - 1)
-          let frac = Float(srcIdx - Double(lo))
-          let loMono = monoSample(lo)
-          let hiMono = monoSample(hi)
-          outData[i] = loMono * (1 - frac) + hiMono * frac
+      if isInterleaved {
+        if needsResample {
+          for i in 0..<outFrames {
+            let srcIdx = Double(i) / ratio
+            let lo = Int(srcIdx)
+            let hi = min(lo + 1, inFrames - 1)
+            let frac = Float(srcIdx - Double(lo))
+            let loMono = (inData[lo * 2] + inData[lo * 2 + 1]) * 0.5
+            let hiMono = (inData[hi * 2] + inData[hi * 2 + 1]) * 0.5
+            outData[i] = loMono * (1 - frac) + hiMono * frac
+          }
+        } else {
+          for i in 0..<inFrames {
+            outData[i] = (inData[i * 2] + inData[i * 2 + 1]) * 0.5
+          }
         }
       } else {
-        for i in 0..<inFrames {
-          outData[i] = monoSample(i)
+        guard let rightData = buffer.floatChannelData?[1] else { return nil }
+        if needsResample {
+          for i in 0..<outFrames {
+            let srcIdx = Double(i) / ratio
+            let lo = Int(srcIdx)
+            let hi = min(lo + 1, inFrames - 1)
+            let frac = Float(srcIdx - Double(lo))
+            let loMono = (inData[lo] + rightData[lo]) * 0.5
+            let hiMono = (inData[hi] + rightData[hi]) * 0.5
+            outData[i] = loMono * (1 - frac) + hiMono * frac
+          }
+        } else {
+          for i in 0..<inFrames {
+            outData[i] = (inData[i] + rightData[i]) * 0.5
+          }
         }
       }
     } else {

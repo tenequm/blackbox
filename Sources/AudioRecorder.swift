@@ -58,6 +58,19 @@ actor AudioRecorder {
   private var micLatencyOffset: Double = 0
   private var micLatencyOffsetTicks: UInt64 = 0
 
+  // Pool of pre-allocated AVAudioPCMBuffer copies for the CATap IO proc.
+  // Spec D5 mandates RT-safety on the IO proc thread - no storage allocations.
+  // The IO proc cycles through the pool by callback count (single-producer),
+  // memcpys ABL bytes into a slot's backing store, and dispatches the slot
+  // reference to audioQueue. Pool size × typical IO-period (~32 × 10ms = 320ms)
+  // gives ample slack before the IO proc could wrap and overwrite a slot still
+  // held by audioQueue. Published before the IO proc starts and released after
+  // the IO proc is destroyed, so no cross-thread races.
+  private static let ioProcBufferPoolSize = 32
+  private static let ioProcBufferMaxFrames: AVAudioFrameCount = 4096
+  nonisolated(unsafe) private var ioProcBufferPool: [AVAudioPCMBuffer] = []
+  nonisolated(unsafe) private var ioProcCallbackCount: UInt64 = 0
+
   // Drift monitor state. Raw (pre-D9) host times from the most recent buffer
   // delivered by each path, plus a 5s log timer. Used to surface mic-vs-system
   // clock skew or drift during a live recording.
@@ -97,8 +110,7 @@ actor AudioRecorder {
 
   /// Starts capturing audio and writing to file immediately.
   func start() async throws {
-    Log.recorder.info(
-      "start() for \(self.appName, privacy: .public) (\(self.bundleID ?? "all", privacy: .public))")
+    Log.info(Log.recorder, "recorder", "start() for \(appName) (\(bundleID ?? "all"))")
 
     // 1. Get own PID's AudioObjectID via Swift wrapper
     let myPID = ProcessInfo.processInfo.processIdentifier
@@ -199,7 +211,13 @@ actor AudioRecorder {
       try pipeline.start()
       self.pipeline = pipeline
 
-      // 8. Create IO proc on aggregate device
+      // 8. Pre-allocate IO proc buffer pool so the RT-thread callback does no
+      // storage allocation (spec D5). Pool is visible before IO proc starts.
+      guard allocateIOProcBufferPool(format: callbackFormat) else {
+        throw RecorderError.tapCreationFailed("IO proc buffer pool allocation failed")
+      }
+
+      // 9. Create IO proc on aggregate device
       let capturedFormat = callbackFormat
       let aggregate = self.aggregateDevice!
       let ioProcBlock = makeIOProcBlock(format: capturedFormat)
@@ -208,7 +226,7 @@ actor AudioRecorder {
         throw RecorderError.tapCreationFailed("AudioDeviceCreateIOProcIDWithBlock failed: \(err)")
       }
 
-      // 9. Start IO proc
+      // 10. Start IO proc
       activity = ProcessInfo.processInfo.beginActivity(
         options: .userInitiated,
         reason: "Recording call audio"
@@ -219,7 +237,7 @@ actor AudioRecorder {
       startDriftMonitor()
       installOutputDeviceListener()
 
-      // 10. Start mic capture independently - failure does not stop system audio
+      // 11. Start mic capture independently - failure does not stop system audio
       if micEnabled {
         do {
           try startMicCapture()
@@ -236,8 +254,8 @@ actor AudioRecorder {
       destroyIOProc()
       destroyAggregateDevice()
       destroyTap()
-      if let pipeline {
-        _ = await pipeline.stop()
+      if let existingPipeline = self.pipeline {
+        _ = await existingPipeline.stop()
         self.pipeline = nil
       }
       if let activity {
@@ -251,7 +269,7 @@ actor AudioRecorder {
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
-    Log.recorder.info("stop() for \(self.appName, privacy: .public)")
+    Log.info(Log.recorder, "recorder", "stop() for \(appName)")
 
     // Remove observer on MainActor (prevents new config change dispatches)
     if let observer = configChangeObserver {
@@ -325,6 +343,32 @@ actor AudioRecorder {
     try? aggregate.stop(IOProcID: ioProcID)
     AudioDeviceDestroyIOProcID(aggregate.id, ioProcID)
     self.ioProcID = nil
+    // IO proc is torn down - safe to release the pool (no more callbacks possible)
+    releaseIOProcBufferPool()
+  }
+
+  /// Allocates the IO proc buffer pool for the given callback format.
+  /// Must be called on audioQueue (actor-isolated) before creating the IO proc
+  /// so that pool visibility is established before any RT-thread callback fires.
+  private func allocateIOProcBufferPool(format: AVAudioFormat) -> Bool {
+    releaseIOProcBufferPool()
+    var pool: [AVAudioPCMBuffer] = []
+    pool.reserveCapacity(Self.ioProcBufferPoolSize)
+    for _ in 0..<Self.ioProcBufferPoolSize {
+      guard
+        let buf = AVAudioPCMBuffer(
+          pcmFormat: format, frameCapacity: Self.ioProcBufferMaxFrames)
+      else { return false }
+      pool.append(buf)
+    }
+    ioProcBufferPool = pool
+    ioProcCallbackCount = 0
+    return true
+  }
+
+  private func releaseIOProcBufferPool() {
+    ioProcBufferPool = []
+    ioProcCallbackCount = 0
   }
 
   private func destroyAggregateDevice() {
@@ -410,14 +454,7 @@ actor AudioRecorder {
   private func readAggregateNominalRate(
     _ aggregate: AudioHardwareAggregateDevice
   ) -> Double {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyNominalSampleRate,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    var size = UInt32(MemoryLayout<Float64>.size)
-    var rate: Float64 = 0
-    AudioObjectGetPropertyData(aggregate.id, &addr, 0, nil, &size, &rate)
-    return rate
+    (try? aggregate.nominalSampleRate) ?? 0
   }
 
   /// Builds the interleaved Float32 AVAudioFormat that wraps IO proc buffers.
@@ -453,39 +490,58 @@ actor AudioRecorder {
 
   /// Creates an IO proc callback block that copies audio data and dispatches to audioQueue.
   /// Used by both start() and handleOutputDeviceChange() to avoid duplication.
+  ///
+  /// Spec D5: the callback runs on a CoreAudio RT thread and must be RT-safe -
+  /// no storage allocations. We memcpy into a pre-allocated pool slot and dispatch
+  /// the slot reference. `frameLength` is set on audioQueue (not the RT thread).
   nonisolated private func makeIOProcBlock(format: AVAudioFormat) -> AudioDeviceIOBlock {
+    let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
+    let isInterleaved = format.isInterleaved
+    let channelCount = Int(format.channelCount)
+    let sourceRate = format.sampleRate
+    let poolSize = UInt64(Self.ioProcBufferPoolSize)
+    let maxFrames = Self.ioProcBufferMaxFrames
+
     return { [weak self] _, inInputData, inInputTime, _, _ in
       guard let self else { return }
-      guard
-        let buffer = AVAudioPCMBuffer(
-          pcmFormat: format, bufferListNoCopy: inInputData, deallocator: nil)
-      else { return }
-      let hostTime = inInputTime.pointee.mHostTime
-      let audioTime = AVAudioTime(hostTime: hostTime)
-      // Copy buffer data - IO proc buffer is only valid during callback
-      guard
-        let copy = AVAudioPCMBuffer(
-          pcmFormat: format, frameCapacity: buffer.frameLength)
-      else { return }
-      copy.frameLength = buffer.frameLength
-      if format.isInterleaved {
-        let byteCount =
-          Int(buffer.frameLength) * Int(format.channelCount)
-          * MemoryLayout<Float>.size
-        memcpy(copy.floatChannelData![0], buffer.floatChannelData![0], byteCount)
+      let mutableABL = UnsafeMutablePointer<AudioBufferList>(mutating: inInputData)
+      let abl = UnsafeMutableAudioBufferListPointer(mutableABL)
+      guard abl.count > 0, let firstSrc = abl[0].mData else { return }
+      let firstByteCount = Int(abl[0].mDataByteSize)
+      guard bytesPerFrame > 0 else { return }
+      let frameCount = AVAudioFrameCount(firstByteCount / bytesPerFrame)
+      guard frameCount > 0, frameCount <= maxFrames else { return }
+
+      // Pick next slot from pool (IO proc thread is the sole writer of the counter)
+      let pool = self.ioProcBufferPool
+      guard pool.count == Int(poolSize) else { return }
+      let slot = Int(self.ioProcCallbackCount % poolSize)
+      self.ioProcCallbackCount &+= 1
+      let copy = pool[slot]
+
+      if isInterleaved {
+        guard let dst = copy.floatChannelData?[0] else { return }
+        memcpy(dst, firstSrc, firstByteCount)
       } else {
-        for ch in 0..<Int(format.channelCount) {
-          let byteCount = Int(buffer.frameLength) * MemoryLayout<Float>.size
-          memcpy(copy.floatChannelData![ch], buffer.floatChannelData![ch], byteCount)
+        let channels = min(channelCount, abl.count)
+        for ch in 0..<channels {
+          guard let src = abl[ch].mData, let dst = copy.floatChannelData?[ch]
+          else { return }
+          memcpy(dst, src, Int(abl[ch].mDataByteSize))
         }
       }
+
+      let hostTime = inInputTime.pointee.mHostTime
+      let audioTime = AVAudioTime(hostTime: hostTime)
+
       self.audioQueue.async { [weak self] in
         guard let self else { return }
         self.assumeIsolated { iso in
           iso.lastSystemHostTime = hostTime
+          copy.frameLength = frameCount
           guard
             let monoBuf = RecordingPipeline.resampleToMono48k(
-              copy, sourceRate: copy.format.sampleRate),
+              copy, sourceRate: sourceRate),
             let sampleBuffer = monoBuf.asSampleBuffer(timestamp: audioTime)
           else { return }
           iso.handleSystemSample(sampleBuffer)
@@ -578,6 +634,18 @@ actor AudioRecorder {
       Log.recorder, "recorder",
       "rebuilt aggregate nominal rate: \(aggregateRate)Hz")
     self.tapFormat = callbackFormat
+
+    // Reallocate IO proc buffer pool for the rebuilt format (channel count or
+    // rate may have changed). destroyIOProc above already released the prior pool.
+    guard allocateIOProcBufferPool(format: callbackFormat) else {
+      Log.error(
+        Log.recorder, "recorder",
+        "IO proc buffer pool reallocation failed during device change")
+      destroyAggregateDevice()
+      destroyTap()
+      onFailure?(.systemStopped)
+      return
+    }
 
     // Recreate IO proc using the actual callback format
     let ioProcBlock = makeIOProcBlock(format: callbackFormat)
@@ -787,7 +855,7 @@ actor AudioRecorder {
 
     guard let sampleBuffer = outputBuffer.asSampleBuffer(timestamp: adjustedTime) else {
       micBuffersConversionFailed += 1
-      Log.recorder.warning("mic PCM-to-CMSampleBuffer conversion failed")
+      Log.warning(Log.recorder, "recorder", "mic PCM-to-CMSampleBuffer conversion failed")
       return
     }
     pipeline?.appendMicSample(sampleBuffer)

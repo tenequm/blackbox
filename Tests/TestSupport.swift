@@ -314,8 +314,10 @@ final class BlackboxSmokeClient {
   ) async throws -> BlackboxTestSnapshot {
     let start = Date()
     while Date().timeIntervalSince(start) < timeoutSeconds {
-      let snapshot = try await queryState()
-      if predicate(snapshot) {
+      // Transient queryState failures are recoverable while the outer deadline
+      // has not elapsed - e.g. IPC state.json briefly unreadable under parallel
+      // test load. Only the outer timeout should fail the wait.
+      if let snapshot = try? await queryState(), predicate(snapshot) {
         return snapshot
       }
       try? await Task.sleep(for: .milliseconds(250))

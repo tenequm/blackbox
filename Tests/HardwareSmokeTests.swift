@@ -301,58 +301,46 @@ struct HardwareSmokeTests {
 
 enum CoreAudioDevices {
   struct DeviceError: Error, CustomStringConvertible {
-    let status: OSStatus
-    let operation: String
-    var description: String { "\(operation) failed: OSStatus=\(status)" }
+    let message: String
+    var description: String { message }
   }
 
   static func listOutputDevices() throws -> [AudioDeviceID] {
-    try allDevices().filter { hasStreams(deviceID: $0, scope: kAudioDevicePropertyScopeOutput) }
+    try listDevices(direction: .output)
   }
 
   static func listInputDevices() throws -> [AudioDeviceID] {
-    try allDevices().filter { hasStreams(deviceID: $0, scope: kAudioDevicePropertyScopeInput) }
+    try listDevices(direction: .input)
   }
 
   static func defaultOutputDevice() throws -> AudioDeviceID {
-    try defaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice)
+    guard let device = try AudioHardwareSystem.shared.defaultOutputDevice else {
+      throw DeviceError(message: "no default output device")
+    }
+    return device.id
   }
 
   static func defaultInputDevice() throws -> AudioDeviceID {
-    try defaultDevice(selector: kAudioHardwarePropertyDefaultInputDevice)
+    guard let device = try AudioHardwareSystem.shared.defaultInputDevice else {
+      throw DeviceError(message: "no default input device")
+    }
+    return device.id
   }
 
   static func setDefaultOutputDevice(_ id: AudioDeviceID) throws {
-    try setDefaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice, deviceID: id)
+    try AudioHardwareSystem.shared.setDefaultOutputDevice(AudioHardwareDevice(id: id))
   }
 
   static func setDefaultInputDevice(_ id: AudioDeviceID) throws {
-    try setDefaultDevice(selector: kAudioHardwarePropertyDefaultInputDevice, deviceID: id)
+    try AudioHardwareSystem.shared.setDefaultInputDevice(AudioHardwareDevice(id: id))
   }
 
   static func deviceName(_ id: AudioDeviceID) -> String? {
-    var name: Unmanaged<CFString>?
-    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioObjectPropertyName,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &name)
-    guard status == noErr, let name else { return nil }
-    return name.takeRetainedValue() as String
+    try? AudioHardwareDevice(id: id).name
   }
 
   static func transportType(_ id: AudioDeviceID) -> UInt32 {
-    var transport: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyTransportType,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(id, &address, 0, nil, &size, &transport)
-    return transport
+    (try? AudioHardwareDevice(id: id).transportType) ?? 0
   }
 
   static func isBuiltIn(_ id: AudioDeviceID) -> Bool {
@@ -364,73 +352,12 @@ enum CoreAudioDevices {
     return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
   }
 
-  private static func allDevices() throws -> [AudioDeviceID] {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var dataSize: UInt32 = 0
-    var status = AudioObjectGetPropertyDataSize(
-      AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize)
-    guard status == noErr else {
-      throw DeviceError(status: status, operation: "GetPropertyDataSize(Devices)")
-    }
-    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
-    var ids = [AudioDeviceID](repeating: 0, count: count)
-    status = ids.withUnsafeMutableBufferPointer { buffer -> OSStatus in
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize,
-        buffer.baseAddress!)
-    }
-    guard status == noErr else {
-      throw DeviceError(status: status, operation: "GetPropertyData(Devices)")
-    }
-    return ids
-  }
-
-  private static func hasStreams(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Bool {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyStreams,
-      mScope: scope,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var dataSize: UInt32 = 0
-    let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize)
-    guard status == noErr else { return false }
-    return dataSize > 0
-  }
-
-  private static func defaultDevice(selector: AudioObjectPropertySelector) throws -> AudioDeviceID {
-    var deviceID = AudioDeviceID(0)
-    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    var address = AudioObjectPropertyAddress(
-      mSelector: selector,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    let status = AudioObjectGetPropertyData(
-      AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
-    guard status == noErr else {
-      throw DeviceError(status: status, operation: "GetPropertyData(DefaultDevice)")
-    }
-    return deviceID
-  }
-
-  private static func setDefaultDevice(
-    selector: AudioObjectPropertySelector, deviceID: AudioDeviceID
-  ) throws {
-    var id = deviceID
-    var address = AudioObjectPropertyAddress(
-      mSelector: selector,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    let status = AudioObjectSetPropertyData(
-      AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
-      UInt32(MemoryLayout<AudioDeviceID>.size), &id)
-    guard status == noErr else {
-      throw DeviceError(status: status, operation: "SetPropertyData(DefaultDevice)")
+  private static func listDevices(direction: AudioHardwareDirection) throws -> [AudioDeviceID] {
+    let devices = try AudioHardwareSystem.shared.devices
+    return devices.compactMap { device in
+      guard let streams = try? device.streams else { return nil }
+      let hasMatchingStream = streams.contains { (try? $0.direction) == direction }
+      return hasMatchingStream ? device.id : nil
     }
   }
 }
@@ -471,6 +398,24 @@ enum BlackboxLogProbe {
     return false
   }
 
+  /// Parses a millisecond metric from a log line.
+  ///
+  /// Expected shape: `<field>=<value>ms` (e.g. `sys_age=3016.1ms`).
+  /// Returns nil if the field is absent.
+  ///
+  /// If smoke tests start reporting "No drift logs found" unexpectedly,
+  /// compare this format against `logDrift()` in `AudioRecorder.swift` -
+  /// a rename (e.g. `sys_age_ms=`) silently breaks the regex.
+  private static func parseMillis(from line: String, field: String) -> Double? {
+    let pattern = #"(\#(field))=(\d+\.?\d*)ms"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+      let valueRange = Range(match.range(at: 2), in: line)
+    else { return nil }
+    return Double(line[valueRange])
+  }
+
   /// Extracts the maximum age for a drift-log field after `since`.
   /// Returns nil if no drift logs found. Drift logs look like:
   /// `drift: t=45.0s sys_age=3016.1ms mic_age=169.8ms ...`
@@ -485,7 +430,6 @@ enum BlackboxLogProbe {
       .appendingPathComponent("Library/Logs/Blackbox/blackbox.log")
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime]
-    let regex = try! NSRegularExpression(pattern: #"(\#(field))=(\d+\.?\d*)ms"#)
 
     while Date() < deadline {
       if let contents = try? String(contentsOf: logURL, encoding: .utf8) {
@@ -496,14 +440,8 @@ enum BlackboxLogProbe {
           guard let lineDate = formatter.date(from: timestamp), lineDate >= flooredSince else {
             continue
           }
-          let lineStr = String(line)
-          let range = NSRange(lineStr.startIndex..., in: lineStr)
-          if let match = regex.firstMatch(in: lineStr, range: range),
-            let valueRange = Range(match.range(at: 2), in: lineStr)
-          {
-            if let value = Double(lineStr[valueRange]) {
-              maxAge = max(maxAge ?? 0, value)
-            }
+          if let value = parseMillis(from: String(line), field: field) {
+            maxAge = max(maxAge ?? 0, value)
           }
         }
         if maxAge != nil { return maxAge }
