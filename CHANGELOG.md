@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-17
+
+### Added
+
+- CoreAudio Process Tap (CATap) system audio capture, replacing SCStream
+- Hardware smoke test suite with file-based IPC test mode (`--ui-test-mode`) for automated real-audio validation
+- `RecordingPipeline` type for AVAssetWriter management, gap filling, tail padding, and audio level metering (extracted from AudioRecorder for testability)
+- `AudioMonitorDependencies` dependency injection with `TestClock` / `TestRecorderFactory` for deterministic call-detection tests
+- Silence gap filling (D8) across both pipelines with clean LPCM format descriptions
+- Device latency offset compensation (D9) for mic-system alignment
+- Drift compensation via CATap `kAudioSubTapDriftCompensationKey`
+- Output device change handling with aggregate device rebuild and silence gap filling
+- Pre-allocated `AVAudioPCMBuffer` pool for CATap IO proc callback (RT-safe per spec D5)
+- `AudioHardwareSystem` Swift wrappers (switf-macos) for typed CoreAudio access
+
+### Changed
+
+- Output is now 2-track M4A: system audio (1ch mono 48kHz) + mic (1ch mono 48kHz). Legacy 3-track recordings remain playable.
+- `AudioRecorder` converted from class to `actor` with custom `DispatchSerialQueue` executor
+- Call detection simplified to polling-only, removing ~140 lines of CoreAudio listener management
+- macOS 26.1+, Swift 6.2, warnings-as-errors
+
+### Fixed
+
+- Chrome/WebRTC silent system-audio bug (eliminated by CATap architecture)
+- Mic stall recovery after output device changes (mic is recreated if stalled post-rebuild)
+- Track alignment: session starts on `max(first_sys_pts, first_mic_pts)` so both tracks begin with real content
+
+### Known Issues
+
+- Tail padding may report a short residual (up to several seconds) when macOS stalls output device routing mid-call. Tracked in #8.
+
 ## [0.6.0] - 2026-04-04
 
 ### Added
@@ -205,7 +237,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.6.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/tenequm/blackbox/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
