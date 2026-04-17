@@ -1,0 +1,466 @@
+import AVFoundation
+import CoreAudio
+import Foundation
+import Testing
+
+@testable import Blackbox
+
+extension Tag {
+  @Tag static var hardware: Self
+}
+
+@Suite("Hardware Smoke", .serialized)
+struct HardwareSmokeTests {
+  @Test(
+    "manual recording through the app bundle produces a sane dual-track file",
+    .tags(.hardware),
+    .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
+    .timeLimit(.minutes(1))
+  )
+  func manualRecordingProducesDualTrackFile() async throws {
+    let client = try BlackboxSmokeClient()
+    defer {
+      client.terminate()
+      try? FileManager.default.removeItem(at: client.saveDirectory)
+    }
+
+    try client.launch()
+
+    _ = try await client.waitUntil(description: "app test channel ready") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving
+    }
+
+    client.post(.startManualRecording)
+    _ = try await client.waitUntil(description: "manual recording started") { snapshot in
+      snapshot.isRecording && snapshot.isManualRecording
+    }
+
+    try client.playSystemAudioFixture()
+    try? await Task.sleep(for: .seconds(4))
+
+    client.post(.stopManualRecording)
+    let finalSnapshot = try await client.waitUntil(description: "recording saved") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving && snapshot.lastSavedRecordingPath != nil
+    }
+
+    let recordingDir =
+      try finalSnapshot.lastSavedRecordingPath.map(URL.init(fileURLWithPath:))
+      ?? (try client.newestRecordingDirectory())
+    let audioURL = recordingDir.appending(path: "audio.m4a")
+    try #require(
+      FileManager.default.fileExists(atPath: audioURL.path(percentEncoded: false)),
+      "Expected audio.m4a at \(audioURL.path)")
+
+    let asset = AVURLAsset(url: audioURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    #expect(tracks.count == 2, "Expected 2 audio tracks, found \(tracks.count)")
+
+    let duration = try await asset.load(.duration).seconds
+    #expect(duration > 2.5, "Expected non-trivial recording duration, got \(duration)s")
+
+    var trackDurations: [Double] = []
+    for track in tracks {
+      let timeRange = try await track.load(.timeRange)
+      trackDurations.append(timeRange.duration.seconds)
+    }
+    let minDuration = try #require(trackDurations.min())
+    let maxDuration = try #require(trackDurations.max())
+    #expect(maxDuration - minDuration < 0.02, "Track durations diverged: \(trackDurations)")
+  }
+
+  @Test(
+    "recording survives default output device round-trip mid-capture",
+    .tags(.hardware),
+    .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
+    .timeLimit(.minutes(2))
+  )
+  func outputDeviceSwitchDuringRecording() async throws {
+    let outputs = try CoreAudioDevices.listOutputDevices()
+    try #require(
+      outputs.count >= 2,
+      "Need at least 2 output devices for this test (found \(outputs.count)). Connect an external output (AirPods, USB, etc) and retry."
+    )
+    let originalOutput = try CoreAudioDevices.defaultOutputDevice()
+    // Prefer a Bluetooth alternate when available so every run exercises the
+    // HFP renegotiation path — that's where the v0.7.x rate regression lived
+    // (forcing the aggregate to 48kHz while HFP pinned 24kHz). Round-trip
+    // A→B→A catches asymmetries where only one direction rebuilds cleanly.
+    let alternateOutput = try #require(
+      outputs.first(where: { $0 != originalOutput && CoreAudioDevices.isBluetooth($0) })
+        ?? outputs.first(where: { $0 != originalOutput }),
+      "No alternate output device available"
+    )
+
+    let originalName = CoreAudioDevices.deviceName(originalOutput) ?? "<unknown>"
+    let alternateName = CoreAudioDevices.deviceName(alternateOutput) ?? "<unknown>"
+
+    let client = try BlackboxSmokeClient()
+    defer {
+      try? CoreAudioDevices.setDefaultOutputDevice(originalOutput)
+      client.terminate()
+      try? FileManager.default.removeItem(at: client.saveDirectory)
+    }
+
+    try client.launch()
+    _ = try await client.waitUntil(description: "app test channel ready") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving
+    }
+
+    let logMarker = Date()
+
+    client.post(.startManualRecording)
+    _ = try await client.waitUntil(description: "manual recording started") { snapshot in
+      snapshot.isRecording && snapshot.isManualRecording
+    }
+
+    // Phase 1: baseline on original device.
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    // Phase 2: A → B. Listener on kAudioHardwarePropertyDefaultOutputDevice
+    // tears down the CATap + aggregate, rebuilds, resumes the IO proc.
+    // D8 handles the silence gap.
+    try CoreAudioDevices.setDefaultOutputDevice(alternateOutput)
+    try await Task.sleep(for: .seconds(2))
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    // Phase 3: B → A. Second rebuild in the opposite direction.
+    try CoreAudioDevices.setDefaultOutputDevice(originalOutput)
+    try await Task.sleep(for: .seconds(2))
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    client.post(.stopManualRecording)
+    let finalSnapshot = try await client.waitUntil(description: "recording saved") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving && snapshot.lastSavedRecordingPath != nil
+    }
+
+    let recordingDir =
+      try finalSnapshot.lastSavedRecordingPath.map(URL.init(fileURLWithPath:))
+      ?? (try client.newestRecordingDirectory())
+    let audioURL = recordingDir.appending(path: "audio.m4a")
+    try #require(
+      FileManager.default.fileExists(atPath: audioURL.path(percentEncoded: false)),
+      "Expected audio.m4a at \(audioURL.path)")
+
+    let asset = AVURLAsset(url: audioURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    #expect(tracks.count == 2, "Expected 2 audio tracks, found \(tracks.count)")
+
+    let duration = try await asset.load(.duration).seconds
+    #expect(duration > 9.0, "Expected ~12s recording across A→B→A, got \(duration)s")
+
+    // HFP renegotiation can legitimately stall both streams for seconds while
+    // macOS re-plumbs through CADefaultDeviceAggregate; loosen tolerances when
+    // either endpoint is Bluetooth. The ceilings still catch truly dead IO
+    // procs / stuck AVAudioEngine (those stall indefinitely).
+    let hfpInvolved =
+      CoreAudioDevices.isBluetooth(originalOutput)
+      || CoreAudioDevices.isBluetooth(alternateOutput)
+    let ageCeilingMs: Double = hfpInvolved ? 8000 : 500
+    // Two rebuilds each add a D8 silence gap; HFP can add multi-second stalls.
+    let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
+
+    var trackDurations: [Double] = []
+    for track in tracks {
+      let timeRange = try await track.load(.timeRange)
+      trackDurations.append(timeRange.duration.seconds)
+    }
+    let minDuration = try #require(trackDurations.min())
+    let maxDuration = try #require(trackDurations.max())
+    #expect(
+      maxDuration - minDuration < divergenceCeilingS,
+      "Track durations diverged across output round-trip: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
+    )
+
+    // Belt-and-suspenders: confirm the listener actually fired.
+    #expect(
+      BlackboxLogProbe.containsAfter(
+        "output device changed", since: logMarker),
+      "Expected 'output device changed' log line after \(logMarker) - listener may not have fired"
+    )
+
+    if let maxSysAge = BlackboxLogProbe.maxSystemAgeAfter(since: logMarker) {
+      #expect(
+        maxSysAge < ageCeilingMs,
+        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). IO proc may have died."
+      )
+    } else {
+      Issue.record("No drift logs found after \(logMarker) - cannot verify sys_age")
+    }
+
+    if let maxMicAge = BlackboxLogProbe.maxMicAgeAfter(since: logMarker) {
+      #expect(
+        maxMicAge < ageCeilingMs,
+        "Mic stopped after output device round-trip: mic_age=\(maxMicAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). AVAudioEngine may have stalled."
+      )
+    } else {
+      Issue.record("No drift logs found after \(logMarker) - cannot verify mic_age")
+    }
+  }
+
+  @Test(
+    "recording survives default input device switch mid-capture",
+    .tags(.hardware),
+    .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
+    .timeLimit(.minutes(1))
+  )
+  func inputDeviceSwitchDuringRecording() async throws {
+    let inputs = try CoreAudioDevices.listInputDevices()
+    try #require(
+      inputs.count >= 2,
+      "Need at least 2 input devices for this test (found \(inputs.count)). Connect an external mic (AirPods, USB, etc) and retry."
+    )
+    let originalInput = try CoreAudioDevices.defaultInputDevice()
+    let alternateInput = try #require(
+      inputs.first { $0 != originalInput }, "No alternate input device available")
+
+    let originalName = CoreAudioDevices.deviceName(originalInput) ?? "<unknown>"
+    let alternateName = CoreAudioDevices.deviceName(alternateInput) ?? "<unknown>"
+
+    let client = try BlackboxSmokeClient()
+    defer {
+      try? CoreAudioDevices.setDefaultInputDevice(originalInput)
+      client.terminate()
+      try? FileManager.default.removeItem(at: client.saveDirectory)
+    }
+
+    try client.launch()
+    _ = try await client.waitUntil(description: "app test channel ready") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving
+    }
+
+    let logMarker = Date()
+
+    client.post(.startManualRecording)
+    _ = try await client.waitUntil(description: "manual recording started") { snapshot in
+      snapshot.isRecording && snapshot.isManualRecording
+    }
+
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    // Switch default input device mid-recording. AVAudioEngine will fire
+    // AVAudioEngineConfigurationChange; the debounced handler tears down
+    // the tap, re-queries D9 latency for the new device, and reinstalls.
+    try CoreAudioDevices.setDefaultInputDevice(alternateInput)
+    try await Task.sleep(for: .seconds(2))
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    client.post(.stopManualRecording)
+    let finalSnapshot = try await client.waitUntil(description: "recording saved") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving && snapshot.lastSavedRecordingPath != nil
+    }
+
+    let recordingDir =
+      try finalSnapshot.lastSavedRecordingPath.map(URL.init(fileURLWithPath:))
+      ?? (try client.newestRecordingDirectory())
+    let audioURL = recordingDir.appending(path: "audio.m4a")
+    try #require(
+      FileManager.default.fileExists(atPath: audioURL.path(percentEncoded: false)),
+      "Expected audio.m4a at \(audioURL.path)")
+
+    let asset = AVURLAsset(url: audioURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    #expect(tracks.count == 2, "Expected 2 audio tracks, found \(tracks.count)")
+
+    let duration = try await asset.load(.duration).seconds
+    #expect(duration > 4.0, "Expected ~6s recording across the switch, got \(duration)s")
+
+    var trackDurations: [Double] = []
+    for track in tracks {
+      let timeRange = try await track.load(.timeRange)
+      trackDurations.append(timeRange.duration.seconds)
+    }
+    let minDuration = try #require(trackDurations.min())
+    let maxDuration = try #require(trackDurations.max())
+    // Non-BT baseline: 300ms tolerance ≈ debounceConfigChange(300ms) + engine
+    // restart jitter. Bluetooth inputs can legitimately stall multi-second
+    // while HFP renegotiates; loosen accordingly.
+    let hfpInvolved =
+      CoreAudioDevices.isBluetooth(originalInput)
+      || CoreAudioDevices.isBluetooth(alternateInput)
+    let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
+    #expect(
+      maxDuration - minDuration < divergenceCeilingS,
+      "Track durations diverged across input switch: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
+    )
+
+    // Belt-and-suspenders: confirm the engine config-change path actually fired.
+    #expect(
+      BlackboxLogProbe.containsAfter(
+        "audio engine config changed, restarting mic capture", since: logMarker),
+      "Expected 'audio engine config changed' log line after \(logMarker) - handler may not have fired"
+    )
+  }
+}
+
+// MARK: - CoreAudio device helpers
+
+enum CoreAudioDevices {
+  struct DeviceError: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+  }
+
+  static func listOutputDevices() throws -> [AudioDeviceID] {
+    try listDevices(direction: .output)
+  }
+
+  static func listInputDevices() throws -> [AudioDeviceID] {
+    try listDevices(direction: .input)
+  }
+
+  static func defaultOutputDevice() throws -> AudioDeviceID {
+    guard let device = try AudioHardwareSystem.shared.defaultOutputDevice else {
+      throw DeviceError(message: "no default output device")
+    }
+    return device.id
+  }
+
+  static func defaultInputDevice() throws -> AudioDeviceID {
+    guard let device = try AudioHardwareSystem.shared.defaultInputDevice else {
+      throw DeviceError(message: "no default input device")
+    }
+    return device.id
+  }
+
+  static func setDefaultOutputDevice(_ id: AudioDeviceID) throws {
+    try AudioHardwareSystem.shared.setDefaultOutputDevice(AudioHardwareDevice(id: id))
+  }
+
+  static func setDefaultInputDevice(_ id: AudioDeviceID) throws {
+    try AudioHardwareSystem.shared.setDefaultInputDevice(AudioHardwareDevice(id: id))
+  }
+
+  static func deviceName(_ id: AudioDeviceID) -> String? {
+    try? AudioHardwareDevice(id: id).name
+  }
+
+  static func transportType(_ id: AudioDeviceID) -> UInt32 {
+    (try? AudioHardwareDevice(id: id).transportType) ?? 0
+  }
+
+  static func isBuiltIn(_ id: AudioDeviceID) -> Bool {
+    transportType(id) == kAudioDeviceTransportTypeBuiltIn
+  }
+
+  static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+    let t = transportType(id)
+    return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+  }
+
+  private static func listDevices(direction: AudioHardwareDirection) throws -> [AudioDeviceID] {
+    let devices = try AudioHardwareSystem.shared.devices
+    return devices.compactMap { device in
+      guard let streams = try? device.streams else { return nil }
+      let hasMatchingStream = streams.contains { (try? $0.direction) == direction }
+      return hasMatchingStream ? device.id : nil
+    }
+  }
+}
+
+// MARK: - Log file probe
+
+enum BlackboxLogProbe {
+  /// Polls `blackbox.log` for `pattern` on any line with a timestamp at or after
+  /// `since`. Retries for `timeoutSeconds` because `LogFile.write` is async on a
+  /// serial queue - a log call and its disk flush are not contemporaneous.
+  /// Log lines start with an ISO-8601 timestamp: `YYYY-MM-DDTHH:MM:SSZ`.
+  static func containsAfter(
+    _ pattern: String, since: Date, timeoutSeconds: TimeInterval = 2.0
+  ) -> Bool {
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    // Round `since` down to whole-second precision: the file logger writes
+    // second-resolution timestamps, so a sub-second logMarker captured right
+    // before a listener fires can legitimately land in the same second as the
+    // log line we are looking for.
+    let flooredSince = Date(timeIntervalSince1970: floor(since.timeIntervalSince1970))
+    let logURL = URL(fileURLWithPath: NSHomeDirectory())
+      .appendingPathComponent("Library/Logs/Blackbox/blackbox.log")
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+
+    while Date() < deadline {
+      if let contents = try? String(contentsOf: logURL, encoding: .utf8) {
+        for line in contents.split(separator: "\n") where line.contains(pattern) {
+          let head = line.prefix(20)
+          let timestamp = String(head).replacingOccurrences(of: " ", with: "")
+          if let lineDate = formatter.date(from: timestamp), lineDate >= flooredSince {
+            return true
+          }
+        }
+      }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+    return false
+  }
+
+  /// Parses a millisecond metric from a log line.
+  ///
+  /// Expected shape: `<field>=<value>ms` (e.g. `sys_age=3016.1ms`).
+  /// Returns nil if the field is absent.
+  ///
+  /// If smoke tests start reporting "No drift logs found" unexpectedly,
+  /// compare this format against `logDrift()` in `AudioRecorder.swift` -
+  /// a rename (e.g. `sys_age_ms=`) silently breaks the regex.
+  private static func parseMillis(from line: String, field: String) -> Double? {
+    let pattern = #"(\#(field))=(\d+\.?\d*)ms"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+      let valueRange = Range(match.range(at: 2), in: line)
+    else { return nil }
+    return Double(line[valueRange])
+  }
+
+  /// Extracts the maximum age for a drift-log field after `since`.
+  /// Returns nil if no drift logs found. Drift logs look like:
+  /// `drift: t=45.0s sys_age=3016.1ms mic_age=169.8ms ...`
+  private static func maxAgeAfter(
+    field: String,
+    since: Date,
+    timeoutSeconds: TimeInterval = 2.0
+  ) -> Double? {
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    let flooredSince = Date(timeIntervalSince1970: floor(since.timeIntervalSince1970))
+    let logURL = URL(fileURLWithPath: NSHomeDirectory())
+      .appendingPathComponent("Library/Logs/Blackbox/blackbox.log")
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+
+    while Date() < deadline {
+      if let contents = try? String(contentsOf: logURL, encoding: .utf8) {
+        var maxAge: Double?
+        for line in contents.split(separator: "\n") where line.contains("drift:") {
+          let head = line.prefix(20)
+          let timestamp = String(head).replacingOccurrences(of: " ", with: "")
+          guard let lineDate = formatter.date(from: timestamp), lineDate >= flooredSince else {
+            continue
+          }
+          if let value = parseMillis(from: String(line), field: field) {
+            maxAge = max(maxAge ?? 0, value)
+          }
+        }
+        if maxAge != nil { return maxAge }
+      }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+    return nil
+  }
+
+  /// Extracts the maximum sys_age (system audio staleness) from drift logs after `since`.
+  /// A healthy sys_age is <100ms. If IO proc stops, sys_age grows unbounded.
+  static func maxSystemAgeAfter(since: Date, timeoutSeconds: TimeInterval = 2.0) -> Double? {
+    maxAgeAfter(field: "sys_age", since: since, timeoutSeconds: timeoutSeconds)
+  }
+
+  /// Extracts the maximum mic_age (mic audio staleness) from drift logs after `since`.
+  /// Healthy mic restarts may spike briefly during device churn; sustained growth means
+  /// AVAudioEngine stopped delivering buffers.
+  static func maxMicAgeAfter(since: Date, timeoutSeconds: TimeInterval = 2.0) -> Double? {
+    maxAgeAfter(field: "mic_age", since: since, timeoutSeconds: timeoutSeconds)
+  }
+}

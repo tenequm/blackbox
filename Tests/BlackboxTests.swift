@@ -85,10 +85,6 @@ struct PCMConversionTests {
 
 @Suite("AEC Processing")
 struct AECProcessingTests {
-
-  private static let recordingsDir = FileManager.default.homeDirectoryForCurrentUser
-    .appending(path: "Library/Application Support/Blackbox/Recordings")
-
   /// Short dual-track recording (5.9s) with known-good reference processed file
   private static let testRecording = "2026-03-11-092853-2FD4"
 
@@ -104,7 +100,7 @@ struct AECProcessingTests {
 
   /// Copy audio.m4a to temp dir and run AEC processing.
   private func processInTemp(_ name: String) async throws -> (tmpDir: URL, output: URL) {
-    let sourceDir = Self.recordingsDir.appending(path: name)
+    let sourceDir = try TestFixtures.recordingDirectory(named: name)
     let audioURL = sourceDir.appending(path: "audio.m4a")
     try #require(
       FileManager.default.fileExists(atPath: audioURL.path(percentEncoded: false)),
@@ -153,8 +149,7 @@ struct AECProcessingTests {
 
   @Test("output properties match reference processed file")
   func matchesReference() async throws {
-    let refProcessedURL = Self.recordingsDir
-      .appending(path: Self.testRecording)
+    let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")
     try #require(
       FileManager.default.fileExists(atPath: refProcessedURL.path(percentEncoded: false)),
@@ -225,8 +220,7 @@ struct AECProcessingTests {
 
   @Test("per-second RMS of mic track matches reference within tolerance")
   func micRMSMatchesReference() async throws {
-    let refProcessedURL = Self.recordingsDir
-      .appending(path: Self.testRecording)
+    let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")
     try #require(
       FileManager.default.fileExists(atPath: refProcessedURL.path(percentEncoded: false)))
@@ -298,7 +292,7 @@ struct GapFillingTests {
   private func makeSampleBuffer(
     pts: CMTime, sampleCount: Int, sampleRate: Double = 48000, channels: Int = 1
   ) -> CMSampleBuffer? {
-    AudioRecorder.makeSilentSampleBuffer(
+    RecordingPipeline.makeSilentSampleBuffer(
       channelCount: channels,
       sampleCount: sampleCount,
       sampleRate: sampleRate,
@@ -310,7 +304,7 @@ struct GapFillingTests {
   func silentBufferProperties() {
     let pts = CMTime(value: 48000, timescale: 48000)  // 1.0s
 
-    let sb = AudioRecorder.makeSilentSampleBuffer(
+    let sb = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 2, sampleCount: 1024,
       sampleRate: 48000, presentationTimeStamp: pts
     )
@@ -339,10 +333,10 @@ struct GapFillingTests {
   func silentBufferChannels() {
     let pts = CMTime(value: 0, timescale: 48000)
 
-    let mono = AudioRecorder.makeSilentSampleBuffer(
+    let mono = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 1, sampleCount: 512,
       sampleRate: 48000, presentationTimeStamp: pts)
-    let stereo = AudioRecorder.makeSilentSampleBuffer(
+    let stereo = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 2, sampleCount: 512,
       sampleRate: 48000, presentationTimeStamp: pts)
 
@@ -360,7 +354,7 @@ struct GapFillingTests {
     let pts = CMTime(value: 48000, timescale: 48000)  // 1.0s
     let sb = makeSampleBuffer(pts: pts, sampleCount: 1024)!
 
-    let end = AudioRecorder.bufferEndTime(sb)
+    let end = RecordingPipeline.bufferEndTime(sb)
     #expect(end.isValid)
 
     // End should be pts + 1024/48000 = 1.0 + 0.02133... ≈ 1.02133s
@@ -374,7 +368,7 @@ struct GapFillingTests {
 
     for count in [256, 512, 1024, 2048] {
       let sb = makeSampleBuffer(pts: pts, sampleCount: count)!
-      let end = AudioRecorder.bufferEndTime(sb)
+      let end = RecordingPipeline.bufferEndTime(sb)
       let expected = Double(count) / 48000.0
       #expect(
         abs(end.seconds - expected) < 0.0001,
@@ -388,7 +382,7 @@ struct GapFillingTests {
     // This is hard to construct, so just verify the normal path works
     let sb = makeSampleBuffer(
       pts: CMTime(value: 0, timescale: 48000), sampleCount: 1024)!
-    let end = AudioRecorder.bufferEndTime(sb)
+    let end = RecordingPipeline.bufferEndTime(sb)
     #expect(end.isValid)
   }
 
@@ -396,7 +390,7 @@ struct GapFillingTests {
 
   @Test("silent buffer has clean LPCM ASBD with no extensions")
   func silentBufferCleanASBD() {
-    let sb = AudioRecorder.makeSilentSampleBuffer(
+    let sb = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 2, sampleCount: 1024,
       sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
     )!
@@ -416,7 +410,7 @@ struct GapFillingTests {
 
   @Test("silent buffer mono ASBD matches mic pipeline format")
   func silentBufferMonoASBD() {
-    let sb = AudioRecorder.makeSilentSampleBuffer(
+    let sb = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 1, sampleCount: 512,
       sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
     )!
@@ -432,7 +426,7 @@ struct GapFillingTests {
 
   @Test("makeSilentSampleBuffer handles minimum sample count")
   func silentBufferMinSamples() {
-    let sb = AudioRecorder.makeSilentSampleBuffer(
+    let sb = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 1, sampleCount: 1,
       sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
     )
@@ -444,7 +438,7 @@ struct GapFillingTests {
 
   @Test("makeSilentSampleBuffer handles large chunk (2048 samples)")
   func silentBufferLargeChunk() {
-    let sb = AudioRecorder.makeSilentSampleBuffer(
+    let sb = RecordingPipeline.makeSilentSampleBuffer(
       channelCount: 2, sampleCount: 2048,
       sampleRate: 48000, presentationTimeStamp: CMTime(value: 0, timescale: 48000)
     )
@@ -461,7 +455,7 @@ struct GapFillingTests {
       CMTime(value: 48000 * 7200, timescale: 48000),  // 2 hours
     ]
     for pts in timestamps {
-      let sb = AudioRecorder.makeSilentSampleBuffer(
+      let sb = RecordingPipeline.makeSilentSampleBuffer(
         channelCount: 1, sampleCount: 1024,
         sampleRate: 48000, presentationTimeStamp: pts
       )!
@@ -479,7 +473,7 @@ struct GapFillingTests {
     var currentPts = CMTime(value: 0, timescale: 48000)
     for i in 0..<5 {
       let sb = makeSampleBuffer(pts: currentPts, sampleCount: 1024)!
-      let endTime = AudioRecorder.bufferEndTime(sb)
+      let endTime = RecordingPipeline.bufferEndTime(sb)
       #expect(endTime.isValid, "Buffer \(i) endTime should be valid")
 
       let expectedEnd = CMTimeAdd(
@@ -499,7 +493,7 @@ struct GapFillingTests {
     // Simulate buffer at 2h mark - verify no precision loss
     let twoHours = CMTime(value: Int64(48000 * 7200), timescale: 48000)
     let sb = makeSampleBuffer(pts: twoHours, sampleCount: 1024)!
-    let end = AudioRecorder.bufferEndTime(sb)
+    let end = RecordingPipeline.bufferEndTime(sb)
 
     let expected = 7200.0 + 1024.0 / 48000.0
     #expect(
@@ -507,4 +501,232 @@ struct GapFillingTests {
       "Precision loss at 2h: expected \(expected), got \(end.seconds)")
   }
 
+}
+
+// MARK: - Resample + Downmix Tests
+
+@Suite("System Audio Resample")
+struct ResampleTests {
+
+  /// Create a stereo buffer with known L/R values.
+  private func makeStereoBuffer(
+    sampleRate: Double, frameCount: Int, left: Float, right: Float, interleaved: Bool = true
+  ) -> AVAudioPCMBuffer {
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2,
+      interleaved: interleaved)!
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frameCount))!
+    buf.frameLength = AVAudioFrameCount(frameCount)
+
+    if interleaved {
+      let data = buf.floatChannelData![0]
+      for i in 0..<frameCount {
+        data[i * 2] = left
+        data[i * 2 + 1] = right
+      }
+    } else {
+      let leftData = buf.floatChannelData![0]
+      let rightData = buf.floatChannelData![1]
+      for i in 0..<frameCount {
+        leftData[i] = left
+        rightData[i] = right
+      }
+    }
+    return buf
+  }
+
+  /// Create an interleaved mono buffer with a constant value.
+  private func makeMonoBuffer(
+    sampleRate: Double, frameCount: Int, value: Float
+  ) -> AVAudioPCMBuffer {
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: true)!
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frameCount))!
+    buf.frameLength = AVAudioFrameCount(frameCount)
+    let data = buf.floatChannelData![0]
+    for i in 0..<frameCount { data[i] = value }
+    return buf
+  }
+
+  private func assertConstantOutput(
+    _ buffer: AVAudioPCMBuffer,
+    expected: Float,
+    tolerance: Float = 0.0001,
+    context: String
+  ) {
+    let out = buffer.floatChannelData![0]
+    let frameCount = Int(buffer.frameLength)
+    var maxDeviation: Float = 0
+    for i in 0..<frameCount {
+      maxDeviation = max(maxDeviation, abs(out[i] - expected))
+    }
+    #expect(
+      maxDeviation < tolerance,
+      "\(context): expected \(expected), max deviation was \(maxDeviation)")
+  }
+
+  @Test("stereo 48kHz downmixes to mono without resampling")
+  func stereoDownmixNoResample() {
+    let input = makeStereoBuffer(sampleRate: 48000, frameCount: 1024, left: 0.6, right: 0.4)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "interleaved stereo 48kHz downmix")
+  }
+
+  @Test("stereo 24kHz resamples and downmixes to mono 48kHz")
+  func stereo24kResampleDownmix() {
+    let input = makeStereoBuffer(sampleRate: 24000, frameCount: 240, left: 0.8, right: 0.2)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 24000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    // 240 frames at 24kHz -> 480 frames at 48kHz
+    #expect(Int(result.frameLength) == 480)
+    assertConstantOutput(result, expected: 0.5, context: "interleaved stereo 24kHz resample")
+  }
+
+  @Test("deinterleaved stereo 48kHz downmixes to mono without distortion")
+  func deinterleavedStereoDownmixNoResample() {
+    let input = makeStereoBuffer(
+      sampleRate: 48000, frameCount: 1024, left: 0.6, right: 0.4, interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "deinterleaved stereo 48kHz downmix")
+  }
+
+  @Test("deinterleaved stereo 24kHz resamples and downmixes to mono 48kHz")
+  func deinterleavedStereo24kResampleDownmix() {
+    let input = makeStereoBuffer(
+      sampleRate: 24000, frameCount: 240, left: 0.8, right: 0.2, interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 24000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 480)
+    assertConstantOutput(result, expected: 0.5, context: "deinterleaved stereo 24kHz resample")
+  }
+
+  @Test("mono passthrough at 48kHz copies data unchanged")
+  func monoPassthrough() {
+    let input = makeMonoBuffer(sampleRate: 48000, frameCount: 512, value: 0.75)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(Int(result.frameLength) == 512)
+    assertConstantOutput(result, expected: 0.75, context: "mono passthrough")
+  }
+
+  @Test("mono 24kHz resamples to 48kHz")
+  func monoResample() {
+    let input = makeMonoBuffer(sampleRate: 24000, frameCount: 240, value: 0.3)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 24000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(Int(result.frameLength) == 480)
+    assertConstantOutput(result, expected: 0.3, context: "mono 24kHz resample")
+  }
+
+  @Test("resample preserves linear ramp")
+  func resamplePreservesRamp() {
+    // Create a stereo buffer with a linear ramp on both channels
+    let inFrames = 100
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 2, interleaved: true)!
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(inFrames))!
+    buf.frameLength = AVAudioFrameCount(inFrames)
+    let data = buf.floatChannelData![0]
+    for i in 0..<inFrames {
+      let v = Float(i) / Float(inFrames - 1)  // 0.0 to 1.0
+      data[i * 2] = v
+      data[i * 2 + 1] = v
+    }
+
+    let result = RecordingPipeline.resampleToMono48k(buf, sourceRate: 24000)!
+    let outFrames = Int(result.frameLength)
+    #expect(outFrames == 200)
+
+    let out = result.floatChannelData![0]
+    // Output should be a linear ramp from 0.0 to 1.0 (interpolated)
+    for i in 0..<outFrames {
+      let expected = Float(i) / Float(outFrames - 1)
+      #expect(
+        abs(out[i] - expected) < 0.02,
+        "Frame \(i): expected ~\(expected), got \(out[i])")
+    }
+  }
+
+  @Test("output frame count is correct for various rate ratios")
+  func outputFrameCount() {
+    let rates: [(Double, Int, Int)] = [
+      (24000, 240, 480),  // 2x upsample
+      (16000, 160, 480),  // 3x upsample
+      (44100, 441, 481),  // non-integer ratio (ceil rounds up)
+      (48000, 480, 480),  // passthrough
+    ]
+    for (rate, inCount, expectedOut) in rates {
+      let input = makeStereoBuffer(sampleRate: rate, frameCount: inCount, left: 0.5, right: 0.5)
+      let result = RecordingPipeline.resampleToMono48k(input, sourceRate: rate)!
+      #expect(
+        Int(result.frameLength) == expectedOut,
+        "\(rate)Hz: \(inCount) in -> expected \(expectedOut) out, got \(result.frameLength)")
+    }
+  }
+}
+
+@Suite("CATap Callback Format")
+struct CATapCallbackFormatTests {
+
+  @Test("follows aggregate rate at 48kHz (built-in speakers)")
+  func builtInSpeakers48k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 2)!
+    #expect(fmt.sampleRate == 48000)
+    #expect(fmt.channelCount == 2)
+    #expect(fmt.isInterleaved)
+    #expect(fmt.commonFormat == .pcmFormatFloat32)
+  }
+
+  @Test("follows aggregate rate at 24kHz (AirPods HFP)")
+  func airpodsHFP24k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 24000, channelCount: 2)!
+    // The bug: forcing 48kHz here while IO proc delivers 24kHz buffers made
+    // 6576s of audio label as 13152s, producing half silence + half 2x-sped content.
+    #expect(fmt.sampleRate == 24000)
+    #expect(fmt.channelCount == 2)
+    #expect(fmt.isInterleaved)
+  }
+
+  @Test("follows aggregate rate at 44.1kHz")
+  func rate44100() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 44100, channelCount: 2)!
+    #expect(fmt.sampleRate == 44100)
+  }
+
+  @Test("follows aggregate rate at 16kHz")
+  func rate16k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 16000, channelCount: 2)!
+    #expect(fmt.sampleRate == 16000)
+  }
+
+  @Test("preserves mono tap channel count")
+  func monoChannels() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 1)!
+    #expect(fmt.channelCount == 1)
+  }
+
+  @Test("returns nil for zero sample rate")
+  func rejectsZeroRate() {
+    #expect(
+      AudioRecorder.catapCallbackFormat(aggregateSampleRate: 0, channelCount: 2) == nil)
+  }
+
+  @Test("returns nil for zero channel count")
+  func rejectsZeroChannels() {
+    #expect(
+      AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 0) == nil)
+  }
 }

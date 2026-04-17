@@ -1,27 +1,36 @@
 # Blackbox
 
-macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per-process audio state polling. Captures system audio via ScreenCaptureKit and mic via AVAudioEngine as independent pipelines.
+macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per-process audio state polling. Captures system audio via CATap (CoreAudio Process Tap) and mic via AVAudioEngine as independent pipelines.
 
 ## Project Structure
 
 ```
-Package.swift              - SPM manifest, macOS 15+, Swift 6.2
+Package.swift                              - SPM manifest, macOS 26.1+, Swift 6.2
 Sources/
-  BlackboxApp.swift        - @main App, MenuBarExtra, Window scenes, AppDelegate
-  AudioMonitor.swift       - @Observable: call detection (polling), auto/manual recording lifecycle
-  AudioRecorder.swift      - SCStream (system audio) + AVAudioEngine (mic) + AVAssetWriter, dual-track capture
-  AECProcessor.swift       - DTLN-aec CoreML post-processing: echo cancellation on mic track
-  MainWindowView.swift     - Main window: TabView with Recordings table + Settings
-  SettingsView.swift       - Settings UI, defaults constants
-  OnboardingView.swift     - First-launch onboarding: permissions walkthrough
-  RecordingHUD.swift       - Floating NSPanel toast (top-right), recording start + save with click-to-reveal
-  Log.swift                - OSLog + file logging, debug export
-Info.plist                 - LSUIElement, NSMicrophoneUsageDescription
-Makefile                   - build, bundle, dmg, release, install, run, format, test, check, clean
+  BlackboxApp.swift                        - @main App, MenuBarExtra, Window scenes, AppDelegate
+  AudioMonitor.swift                       - @Observable: call detection (polling), auto/manual recording lifecycle
+  AudioMonitorSupport.swift                - RecorderSession protocol, AudioMonitorDependencies (DI), factory types
+  AudioRecorder.swift                      - CATap (system audio) + AVAudioEngine (mic), dual-track capture
+  RecordingPipeline.swift                  - AVAssetWriter management, gap filling, tail padding, audio level metering
+  AECProcessor.swift                       - DTLN-aec CoreML post-processing: echo cancellation on mic track
+  BlackboxTestMode.swift                   - Test mode flags (--ui-test-mode), IPC types for smoke tests
+  BlackboxTestController.swift             - File-based IPC controller for smoke test automation
+  MainWindowView.swift                     - Main window: TabView with Recordings table + Settings
+  SettingsView.swift                       - Settings UI, defaults constants
+  OnboardingView.swift                     - First-launch onboarding: permissions walkthrough
+  RecordingHUD.swift                       - Floating NSPanel toast (top-right), recording start + save with click-to-reveal
+  Log.swift                                - OSLog + file logging, debug export
+Info.plist                                 - LSUIElement, NSAudioCaptureUsageDescription, NSMicrophoneUsageDescription
+Makefile                                   - build, bundle, dmg, release, install, run, format, test, check, smoke, clean
 Tests/
-  BlackboxTests.swift      - Swift Testing placeholder (framework ready, tests TBD)
+  BlackboxTests.swift                      - PCM conversion, AEC processing, gap filling, resample tests
+  AudioMonitorIntegrationTests.swift       - AudioMonitor integration tests with fake dependencies
+  RecordingPipelineIntegrationTests.swift  - RecordingPipeline file output, gap fill, tail padding tests
+  HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
+  TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
+  Fixtures/Recordings/                     - Reference recordings for AEC regression tests
 .claude/skills/
-  release-dmg/SKILL.md     - /release-dmg slash command for full release automation
+  release-dmg/SKILL.md                     - /release-dmg slash command for full release automation
 ```
 
 ## Build & Run
@@ -35,6 +44,8 @@ make install    # bundle + copy to /Applications
 make run        # bundle + open .app
 make test       # swift test (Swift Testing framework)
 make check      # format + build + test (full validation)
+make smoke-test # bundle + run all tests including hardware smoke (requires audio permissions)
+make smoke      # alias for smoke-test
 make format     # swift-format --recursive Sources/ Tests/ --in-place
 make clean      # remove build artifacts
 ```
@@ -62,6 +73,14 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 - **Isolation**: Same `defaultIsolation(MainActor.self)` as production code
 - Tests require CLT framework search paths (configured in Package.swift via unsafeFlags)
 
+### Test categories
+- **Unit tests** (`make test`): PCM conversion, gap filling, resample, AEC processing, RecordingPipeline integration. Run without special permissions.
+- **AudioMonitor integration tests** (`make test`): Use `MonitorHarness` with `TestClock`, `FakeHUD`, and `TestRecorderFactory` to test call detection, auto/manual recording lifecycle, continuity events, and restart budgets - no real audio hardware needed.
+- **Hardware smoke tests** (`make smoke-test`): Launch the real `.app` bundle, drive it via file-based IPC (`BlackboxTestController`), record real audio, verify output file structure. Gated by `BLACKBOX_RUN_HARDWARE_SMOKE=1` env var. Require System Audio Recording + Microphone permissions.
+
+### Test mode infrastructure
+The app supports `--ui-test-mode` for smoke tests. `BlackboxTestMode` parses CLI flags, `BlackboxTestController` polls `command.json` and writes `state.json` for IPC. `BlackboxSmokeClient` (in TestSupport.swift) drives the app from the test process.
+
 ## Logs
 
 App logs: `~/Library/Logs/Blackbox/blackbox.log`
@@ -70,13 +89,14 @@ Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
 ## Pre-Release Checklist
 
 1. **Automated**: `make check` (format + build + test)
-2. **Manual smoke test**: `make install && open /Applications/Blackbox.app`
-3. **Verify permissions**: First launch should prompt for Screen Recording (as "Blackbox", not terminal)
-4. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
-5. **Test manual recording**: Menu > Record Now - should record and stop cleanly
-6. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
-7. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
-8. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
+2. **Hardware smoke test**: `make smoke-test` (builds bundle, launches app, records real audio, verifies output)
+3. **Manual smoke test**: `make install && open /Applications/Blackbox.app`
+4. **Verify permissions**: First recording should prompt for System Audio Recording permission
+5. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
+6. **Test manual recording**: Menu > Record Now - should record and stop cleanly
+7. **Test graceful quit**: Quit via menu while recording - file should be complete (not corrupted)
+8. **Test settings**: All settings persist across restart, changes take effect within 5 seconds
+9. **Check output files**: M4A files in ~/Library/Application Support/Blackbox/Recordings/, named with timestamp + app name, playable in QuickTime
 
 ## Release Process
 
@@ -93,13 +113,15 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 ## Key Architecture Decisions
 
-- **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio per-process APIs enumerate processes with BOTH `IsRunningInput` AND `IsRunningOutput` (filtering out own PID and ScreenCaptureKit helpers). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code. Requires macOS 14.2+.
-- **Dual-SCStream capture**: Two SCStreams run simultaneously. Display-wide stream (critical path) captures all system audio, guaranteeing completeness. Per-app stream (best-effort) captures only the calling app's audio for cleaner AEC reference. If per-app fails or delivers silence, display-wide has the audio. Nothing changes mid-recording. Both streams use `audioQueue` as their sample handler queue; callbacks route by stream identity.
-- **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file).
-- **`nonisolated(unsafe)`** on AudioRecorder state because SCStreamOutput callbacks and AVAudioEngine tap callbacks (dispatched to `audioQueue`) run on background threads. Thread safety: all writer state accessed exclusively on serial `audioQueue`.
-- **Multi-track M4A (2 or 3 tracks)**: Track 0 = display-wide audio (always). Track 1 = per-app audio (when single caller detected). Last track = mic. Session starts on first display-wide sample; per-app and mic samples before that are dropped.
-- **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using the best available reference: per-app (track 1) for 3-track files (cleaner signal), display-wide (track 0) for 2-track files. Writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified.
-- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
+- **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio Swift wrappers (`AudioHardwareSystem.shared.processes`) enumerate processes with BOTH `isRunningInput` AND `isRunningOutput` (filtering out own PID). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code.
+- **CATap system audio capture**: CoreAudio Process Tap via Swift wrappers (`system.makeProcessTap`, `system.makeAggregateDevice`) captures all system audio, excluding own PID via `CATapDescription(stereoGlobalTapButExcludeProcesses:)`. IO proc callback on aggregate device delivers interleaved Float32 AudioBufferList, converted to CMSampleBuffer and dispatched to `audioQueue` for writing. Drift compensation enabled via `kAudioSubTapDriftCompensationKey`. Output device changes trigger aggregate rebuild with silence gap filling (D8). Requires `NSAudioCaptureUsageDescription` in Info.plist.
+- **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file). Device latency offset (D9) applied as PTS shift to align mic with system audio.
+- **AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor.** All actor-isolated state runs on `audioQueue`. CATap IO proc and AVAudioEngine tap callbacks dispatch to `audioQueue` and use `assumeIsolated` to bridge into actor isolation. No `nonisolated(unsafe)` needed.
+- **RecordingPipeline** (`@unchecked Sendable`) handles AVAssetWriter management, gap filling, tail padding, and audio level metering. Extracted from AudioRecorder for testability. All access serialized by AudioRecorder's `audioQueue` - the pipeline has no internal synchronization. `nonisolated(unsafe)` state is safe because AudioRecorder guarantees single-threaded access.
+- **AudioMonitor dependency injection**: `AudioMonitorDependencies` struct injects all external dependencies (recorder factory, HUD, settings, clock, sleep, process query). Enables deterministic testing via `MonitorHarness` with `TestClock` and `TestRecorderFactory`. `RecorderSession` protocol abstracts over `AudioRecorder` for test doubles.
+- **2-track M4A**: Track 0 = system audio (1ch mono, downmixed+resampled to 48kHz). Track 1 = mic (1ch mono, when mic enabled). Session starts on whichever track delivers the first sample. Legacy 3-track recordings (pre-v0.7.0) remain playable.
+- **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using the system audio track (track 0) as the AEC reference. Writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified.
+- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, destroy CATap aggregate/tap, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
 
@@ -107,9 +129,43 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 
 With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
-- AudioMonitor is purely MainActor-isolated (no `@unchecked Sendable` needed - polling-only, no C callbacks)
-- AudioRecorder is `@unchecked Sendable` with `nonisolated(unsafe)` for callback state on `audioQueue`
-- SCStreamOutput/SCStreamDelegate methods are `nonisolated` (called directly on `audioQueue`)
-- SCStreamOutput routes by stream identity (`stream === displayStream` vs `appStream`)
-- AVAudioEngine tap callback dispatches to `audioQueue` via `audioQueue.async` to serialize with SCStream callbacks
-- AVAudioEngine config change observer is `nonisolated` (fires on NotificationCenter delivery thread, dispatches to `audioQueue` for thread safety)
+- AudioMonitor is purely MainActor-isolated (polling-only, no C callbacks)
+- AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor (`audioQueue`). All actor-isolated state accessed on `audioQueue` - same runtime behavior as the previous `nonisolated(unsafe)` approach, but with compile-time safety
+- RecordingPipeline is `@unchecked Sendable` with `nonisolated(unsafe)` state - safe because all access is serialized on AudioRecorder's `audioQueue`
+- CATap IO proc callback copies audio data and dispatches to `audioQueue.async` with `assumeIsolated` for CMSampleBuffer conversion and writing via RecordingPipeline
+- Output device change listener dispatches to `audioQueue.async` with `assumeIsolated` for aggregate device rebuild
+- AVAudioEngine tap callback dispatches to `audioQueue.async` with `assumeIsolated` to serialize with CATap callbacks
+- AVAudioEngine config change observer fires via `Task { await ... }`, actor-isolated `debounceConfigChange` uses `asyncAfter` with `assumeIsolated` for the delayed handler
+
+## Cross-Model Collaboration (Codex)
+
+Claude Code can delegate work to OpenAI Codex via `.claude/bin/codex-bridge.sh`.
+Both run on subscriptions - no API keys. The bridge script unsets `OPENAI_API_KEY`
+so Codex never accidentally uses your project's API key for billing.
+
+**Commands:**
+
+| Command | Purpose |
+|---------|---------|
+| `/collab <task>` | Full collaboration: think, build, or debug with Codex |
+| `/collab-review` | Quick second opinion from Codex on current changes |
+
+**How it works:** Claude calls `codex exec` via bash. Codex's response streams
+directly into Claude's context. Claude reads it, reasons about it, synthesizes.
+No tmux, no file polling, no third-party tools. Build tasks run asynchronously
+in the background so the user can keep talking to Claude while Codex works.
+
+**Bridge modes:**
+- `codex-bridge.sh think "prompt"` - read-only, for debate and review (sync)
+- `codex-bridge.sh build "prompt"` - workspace-write, for implementation (async)
+- `codex-bridge.sh build "prompt" path/to/spec.md` - build from spec file (async)
+
+**Build specs** go in `.collab/specs/`. **Reports** go in `.collab/reports/`.
+
+**Rules:**
+- Never assign overlapping files to both Claude subagents and Codex
+- Always run your test suite after Codex builds - never trust the self-report
+- Keep Codex prompts concise (500 words max) - it has no session memory
+- Synthesize Codex output for the user, don't relay it raw
+- Compact context before starting a collab workflow
+- Break large builds into 2-3 small focused Codex calls (max 3 files each)

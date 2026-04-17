@@ -662,9 +662,9 @@ struct RecordingDetailView: View {
   private var availableTrackSelections: [TrackSelection] {
     let count = metadata?.trackCount ?? 2
     if count >= 3 {
-      return [.all, .displayWide, .perApp, .mic]
+      return [.all, .system, .perApp, .mic]
     } else {
-      return [.all, .displayWide, .mic]
+      return [.all, .system, .mic]
     }
   }
 
@@ -676,7 +676,7 @@ struct RecordingDetailView: View {
       let isLast = (i == trackCount - 1)
       switch selection {
       case .all: track.isEnabled = true
-      case .displayWide: track.isEnabled = (i == 0)
+      case .system: track.isEnabled = (i == 0)
       case .perApp: track.isEnabled = (trackCount >= 3 && i == 1)
       case .mic: track.isEnabled = isLast
       }
@@ -1029,12 +1029,12 @@ private struct TranscriptSegmentView: View {
 // MARK: - Track Selection
 
 enum TrackSelection: String, Identifiable {
-  case all, displayWide, perApp, mic
+  case all, system, perApp, mic
   var id: String { rawValue }
   var label: String {
     switch self {
     case .all: "All"
-    case .displayWide: "Display"
+    case .system: "System"
     case .perApp: "App"
     case .mic: "Mic"
     }

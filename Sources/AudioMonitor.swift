@@ -1,7 +1,5 @@
 import AVFoundation
 import AppKit
-import CoreAudio
-import UserNotifications
 
 @Observable
 final class AudioMonitor {
@@ -16,14 +14,15 @@ final class AudioMonitor {
   private(set) var isSaving = false
   private(set) var formattedElapsed: String?
   private(set) var audioLevel: Float = 0
+  private(set) var lastSavedRecordingURL: URL?
   private var savingCount = 0
 
   // Auto-recording triggered by call detection
-  private var autoRecorder: AudioRecorder?
+  private var autoRecorder: (any RecorderSession)?
   private var autoRecordingAppName: String?
   private var autoRecordingBundleID: String?
   // Manual recording triggered by user
-  private var manualRecorder: AudioRecorder?
+  private var manualRecorder: (any RecorderSession)?
 
   private var settingsTask: Task<Void, Never>?
   private var elapsedTimer: Timer?
@@ -37,8 +36,9 @@ final class AudioMonitor {
 
   private var micPollingTask: Task<Void, Never>?
   private var lastKnownMicRunning = false
-
-  private let hud = RecordingHUD()
+  private var consecutiveInactivePolls = 0
+  private var continuityCooldownUntil: Date?
+  @ObservationIgnored private let dependencies: AudioMonitorDependencies
 
   // Settings
   var autoRecord: Bool = true
@@ -50,6 +50,10 @@ final class AudioMonitor {
   var notifyOnError: Bool = true
 
   private var errorGeneration = 0
+
+  init(dependencies: AudioMonitorDependencies = .live) {
+    self.dependencies = dependencies
+  }
 
   // MARK: - Monitoring Lifecycle
 
@@ -65,16 +69,13 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    if !CGPreflightScreenCaptureAccess() {
-      Log.info(Log.monitor, "monitor", "screen recording permission not granted")
-      permissionNeeded = true
-    }
+    // CATap has no preflight API - permission is checked on first AudioHardwareCreateProcessTap call.
+    // permissionNeeded will be set to true if recording fails with .permissionDenied.
 
     if !skipPermissionRequests {
-      Task {
-        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-          await AVCaptureDevice.requestAccess(for: .audio)
-        }
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        await self.dependencies.requestMicrophoneAccessIfNeeded()
       }
     }
 
@@ -84,8 +85,8 @@ final class AudioMonitor {
     // Periodically reload settings
     settingsTask = Task { [weak self] in
       while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(5))
         guard let self else { return }
+        await self.dependencies.sleep(.seconds(5))
         self.loadSettings()
       }
     }
@@ -100,12 +101,12 @@ final class AudioMonitor {
     cancelGracePeriod()
 
     if let recorder = autoRecorder {
-      await recorder.stop()
+      _ = await recorder.stop()
       autoRecorder = nil
     }
 
     if let recorder = manualRecorder {
-      await recorder.stop()
+      _ = await recorder.stop()
       manualRecorder = nil
       isManualRecording = false
     }
@@ -125,9 +126,10 @@ final class AudioMonitor {
     notifyError(message: message)
     errorGeneration += 1
     let gen = errorGeneration
-    Task {
-      try? await Task.sleep(for: .seconds(10))
-      if errorGeneration == gen { errorMessage = nil }
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      await self.dependencies.sleep(.seconds(10))
+      if self.errorGeneration == gen { self.errorMessage = nil }
     }
   }
 
@@ -159,7 +161,7 @@ final class AudioMonitor {
       formattedElapsed = nil
       return
     }
-    let total = max(0, Int(Date().timeIntervalSince(start)))
+    let total = max(0, Int(dependencies.now().timeIntervalSince(start)))
     let h = total / 3600
     let m = (total % 3600) / 60
     let s = total % 60
@@ -171,52 +173,52 @@ final class AudioMonitor {
 
   // MARK: - Manual Recording
 
-  func startManualRecording() {
+  func startManualRecording(resetRestartBudget: Bool = true) {
     guard manualRecorder == nil else {
       Log.info(Log.monitor, "monitor", "startManualRecording skipped: already recording")
       return
     }
 
+    if resetRestartBudget {
+      manualRestartCount = 0
+      manualRestartWindowStart = nil
+    }
+
     let useMic = micEnabled
-    let recorder = AudioRecorder(
-      appName: "Manual recording",
-      micEnabled: useMic,
-      saveDirectory: saveDirectory,
-      onFailure: { [weak self] failure in
-        Task { @MainActor [weak self] in
-          self?.handleManualRecorderFailure(failure)
-        }
-      },
-      onAudioLevel: { [weak self] level in
-        Task { @MainActor [weak self] in
-          self?.audioLevel = level
-        }
-      },
-      onLowDiskSpace: { [weak self] remaining in
-        Task { @MainActor [weak self] in
-          self?.handleLowDiskSpace(remaining)
-        }
-      }
+    lastSavedRecordingURL = nil
+    let recorder = dependencies.recorderFactory.makeRecorder(
+      configuration: RecorderSessionConfiguration(
+        bundleID: nil,
+        appName: "Manual recording",
+        micEnabled: useMic,
+        saveDirectory: saveDirectory,
+        isManualRecording: true
+      ),
+      onFailure: makeFailureHandler(isManual: true),
+      onAudioLevel: makeAudioLevelHandler(),
+      onLowDiskSpace: makeLowDiskSpaceHandler(),
+      onContinuityEvent: makeContinuityHandler()
     )
 
     manualRecorder = recorder
     isManualRecording = true
 
-    Task {
+    Task { @MainActor [weak self] in
+      guard let self else { return }
       do {
         try await recorder.start()
-        manualRestartCount = 0
-        manualRestartWindowStart = nil
-        recordingStartTime = Date()
-        currentAppName = "Manual recording"
-        isRecording = true
-        startElapsedTimer()
-        notifyRecordingStarted(appName: "Manual recording")
+        self.dependencies.saveAudioRecordingGranted()
+        self.permissionNeeded = false
+        self.recordingStartTime = self.dependencies.now()
+        self.currentAppName = "Manual recording"
+        self.isRecording = true
+        self.startElapsedTimer()
+        self.notifyRecordingStarted(appName: "Manual recording")
       } catch {
-        setError("Failed to start recording: \(error.localizedDescription)")
-        manualRecorder = nil
-        isManualRecording = false
-        updateAutoState()
+        self.setError("Failed to start recording: \(error.localizedDescription)")
+        self.manualRecorder = nil
+        self.isManualRecording = false
+        self.updateAutoState()
       }
     }
   }
@@ -251,7 +253,7 @@ final class AudioMonitor {
         count: &manualRestartCount, windowStart: &manualRestartWindowStart)
       {
         setError("Recording interrupted - restarting...")
-        startManualRecording()
+        startManualRecording(resetRestartBudget: false)
       } else {
         setError("Recording failed repeatedly")
       }
@@ -276,6 +278,7 @@ final class AudioMonitor {
       savingCount -= 1
       isSaving = savingCount > 0
       if url != nil {
+        lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
       updateAutoState()
@@ -288,7 +291,7 @@ final class AudioMonitor {
   // MARK: - Call Detection (macOS 14.2+)
 
   private func setupCallDetection() {
-    let callers = Self.findActiveCallingProcesses()
+    let callers = dependencies.findActiveCallingProcesses()
     lastKnownMicRunning = !callers.isEmpty
     Log.info(
       Log.monitor, "monitor",
@@ -303,126 +306,11 @@ final class AudioMonitor {
     // Poll every 3 seconds for active calling processes
     micPollingTask = Task { [weak self] in
       while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(3))
         guard let self else { return }
+        await self.dependencies.sleep(.seconds(3))
         self.evaluateCallState()
       }
     }
-  }
-
-  // MARK: - Process Query Functions
-
-  /// Enumerate all audio process objects registered with CoreAudio.
-  nonisolated private static func allAudioProcessObjects() -> [AudioObjectID] {
-    var propSize: UInt32 = 0
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyProcessObjectList,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    guard
-      AudioObjectGetPropertyDataSize(
-        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize) == noErr,
-      propSize > 0
-    else { return [] }
-
-    let count = Int(propSize) / MemoryLayout<AudioObjectID>.size
-    var objects = [AudioObjectID](repeating: 0, count: count)
-    guard
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &propSize, &objects) == noErr
-    else { return [] }
-    return objects
-  }
-
-  /// Get the PID for an AudioProcess object.
-  nonisolated private static func processPID(for objectID: AudioObjectID) -> pid_t? {
-    var pid: pid_t = 0
-    var size = UInt32(MemoryLayout<pid_t>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyPID,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &pid) == noErr else {
-      return nil
-    }
-    return pid
-  }
-
-  /// Get the bundle ID for an AudioProcess object.
-  nonisolated private static func processBundleID(for objectID: AudioObjectID) -> String? {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyBundleID,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    // CFString is a reference type - can't form UnsafeMutableRawPointer to it directly.
-    // Allocate a raw buffer for the CFStringRef pointer instead.
-    let buf = UnsafeMutablePointer<UnsafeRawPointer?>.allocate(capacity: 1)
-    defer { buf.deallocate() }
-    buf.initialize(to: nil)
-    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
-    guard AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, buf) == noErr,
-      let raw = buf.pointee
-    else {
-      return nil
-    }
-    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-  }
-
-  /// Check if an AudioProcess object has active microphone input.
-  nonisolated private static func isProcessUsingMicInput(_ objectID: AudioObjectID) -> Bool {
-    var isRunning: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyIsRunningInput,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &isRunning)
-    return isRunning != 0
-  }
-
-  /// Check if an AudioProcess object has active audio output.
-  nonisolated private static func isProcessUsingOutput(_ objectID: AudioObjectID) -> Bool {
-    var isRunning: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyIsRunningOutput,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &isRunning)
-    return isRunning != 0
-  }
-
-  /// Returns external processes with both active mic input AND audio output (i.e. calls).
-  /// Filters out our own PID and ScreenCaptureKit XPC helpers.
-  nonisolated private static func findActiveCallingProcesses() -> [String?] {
-    let myPID = ProcessInfo.processInfo.processIdentifier
-    var result: [String?] = []
-
-    for objectID in allAudioProcessObjects() {
-      guard isProcessUsingMicInput(objectID) && isProcessUsingOutput(objectID) else { continue }
-      guard let pid = processPID(for: objectID) else { continue }
-
-      // Filter out our own process
-      if pid == myPID { continue }
-
-      // Filter out ScreenCaptureKit XPC helpers (they open the mic on our behalf)
-      let bundleID = processBundleID(for: objectID)
-      if let bid = bundleID,
-        bid.hasPrefix("com.apple.screencapturekit")
-          || bid.hasPrefix("com.apple.ScreenCaptureKit")
-          || bid.hasPrefix("com.apple.replayd")
-      {
-        continue
-      }
-
-      result.append(bundleID)
-    }
-    return result
   }
 
   // MARK: - Call State Evaluation
@@ -430,26 +318,47 @@ final class AudioMonitor {
   /// Re-evaluate call state by checking which external processes have active calls.
   /// Called from polling loop every 3 seconds.
   private func evaluateCallState() {
-    let callers = Self.findActiveCallingProcesses()
+    let callers = dependencies.findActiveCallingProcesses()
     let running = !callers.isEmpty
+
+    if running {
+      consecutiveInactivePolls = 0
+      continuityCooldownUntil = nil
+      if running != lastKnownMicRunning {
+        Log.info(
+          Log.monitor, "monitor",
+          "call state changed: activeCallers=\(callers.count), running=\(running)")
+        lastKnownMicRunning = true
+        let bundleID = callers.count == 1 ? callers.first ?? nil : nil
+        handleMicBecameActive(appBundleID: bundleID)
+      } else if autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
+        Log.info(Log.monitor, "monitor", "retrying auto-recording for active call")
+        handleMicBecameActive(appBundleID: callers.first ?? nil)
+      }
+      return
+    }
 
     if running != lastKnownMicRunning {
       Log.info(
         Log.monitor, "monitor",
         "call state changed: activeCallers=\(callers.count), running=\(running)")
       lastKnownMicRunning = running
-      if running {
-        // Single caller: per-app capture. Multiple callers: nil → display-wide only.
-        let bundleID = callers.count == 1 ? callers.first ?? nil : nil
-        handleMicBecameActive(appBundleID: bundleID)
-      } else {
-        handleMicBecameInactive()
-      }
-    } else if running, autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
-      // Recovery: callers active but no recording running (e.g., start() failed previously).
-      Log.info(Log.monitor, "monitor", "retrying auto-recording for active call")
-      handleMicBecameActive(appBundleID: callers.first ?? nil)
     }
+
+    guard autoRecorder != nil else { return }
+
+    if shouldSuppressInactiveStop() {
+      Log.info(Log.monitor, "monitor", "inactive poll ignored during continuity cooldown")
+      return
+    }
+
+    consecutiveInactivePolls += 1
+    guard consecutiveInactivePolls >= 2 else {
+      Log.info(Log.monitor, "monitor", "inactive poll threshold not reached yet")
+      return
+    }
+
+    handleMicBecameInactive()
   }
 
   /// Resolve helper subprocess bundle IDs to the parent app.
@@ -490,6 +399,7 @@ final class AudioMonitor {
 
   private func handleMicBecameActive(appBundleID: String? = nil) {
     cancelGracePeriod()
+    consecutiveInactivePolls = 0
 
     guard autoRecord, !isRecording, !isManualRecording else {
       Log.info(
@@ -499,14 +409,8 @@ final class AudioMonitor {
       return
     }
 
-    // Check screen recording permission
-    if !CGPreflightScreenCaptureAccess() {
-      Log.info(
-        Log.monitor, "monitor", "handleMicBecameActive blocked: screen recording permission denied")
-      permissionNeeded = true
-      return
-    }
-    permissionNeeded = false
+    // CATap permission is checked when AudioRecorder.start() creates the process tap.
+    // If denied, the failure callback sets permissionNeeded = true.
 
     autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
@@ -519,63 +423,95 @@ final class AudioMonitor {
       Log.info(Log.monitor, "monitor", "handleMicBecameInactive skipped: no active auto-recording")
       return
     }
+    guard graceTask == nil else { return }
+
     Log.info(Log.monitor, "monitor", "mic inactive, starting grace period")
-    startGracePeriod()
+    let period = gracePeriod
+    graceTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      let start = self.dependencies.now()
+      while !Task.isCancelled {
+        let remaining = period - self.dependencies.now().timeIntervalSince(start)
+        if remaining <= 0 {
+          self.graceCountdown = nil
+          self.stopAutoRecording()
+          return
+        }
+        self.graceCountdown = remaining
+        await self.dependencies.sleep(.seconds(1))
+      }
+    }
   }
 
-  private func startAutoRecording() {
+  private func handleRecorderContinuityEvent(_ event: RecorderContinuityEvent) {
+    let now = dependencies.now()
+    continuityCooldownUntil = now.addingTimeInterval(max(gracePeriod, 8))
+    consecutiveInactivePolls = 0
+    cancelGracePeriod()
+    Log.info(Log.monitor, "monitor", "continuity event observed: \(String(describing: event))")
+  }
+
+  private func shouldSuppressInactiveStop() -> Bool {
+    guard let continuityCooldownUntil else { return false }
+    if continuityCooldownUntil > dependencies.now() {
+      return true
+    }
+    self.continuityCooldownUntil = nil
+    return false
+  }
+
+  private func startAutoRecording(resetRestartBudget: Bool = true) {
     guard autoRecorder == nil else {
       Log.info(Log.monitor, "monitor", "startAutoRecording skipped: already recording")
       return
     }
 
+    if resetRestartBudget {
+      autoRestartCount = 0
+      autoRestartWindowStart = nil
+    }
+
     let useMic = micEnabled
     let appName = autoRecordingAppName ?? "Call"
-    let recorder = AudioRecorder(
-      bundleID: autoRecordingBundleID,
-      appName: appName,
-      micEnabled: useMic,
-      saveDirectory: saveDirectory,
-      onFailure: { [weak self] failure in
-        Task { @MainActor [weak self] in
-          self?.handleAutoRecorderFailure(failure)
-        }
-      },
-      onAudioLevel: { [weak self] level in
-        Task { @MainActor [weak self] in
-          self?.audioLevel = level
-        }
-      },
-      onLowDiskSpace: { [weak self] remaining in
-        Task { @MainActor [weak self] in
-          self?.handleLowDiskSpace(remaining)
-        }
-      }
+    lastSavedRecordingURL = nil
+    let recorder = dependencies.recorderFactory.makeRecorder(
+      configuration: RecorderSessionConfiguration(
+        bundleID: autoRecordingBundleID,
+        appName: appName,
+        micEnabled: useMic,
+        saveDirectory: saveDirectory,
+        isManualRecording: false
+      ),
+      onFailure: makeFailureHandler(isManual: false),
+      onAudioLevel: makeAudioLevelHandler(),
+      onLowDiskSpace: makeLowDiskSpaceHandler(),
+      onContinuityEvent: makeContinuityHandler()
     )
 
     autoRecorder = recorder
     Log.info(
       Log.monitor, "monitor", "starting auto-recording (call detected, app=\(appName))")
 
-    Task {
+    Task { @MainActor [weak self] in
+      guard let self else { return }
       do {
         try await recorder.start()
-        autoRestartCount = 0
-        autoRestartWindowStart = nil
-        isRecording = true
-        currentAppName = appName
-        recordingStartTime = Date()
-        startElapsedTimer()
-        notifyRecordingStarted(appName: appName)
+        self.dependencies.saveAudioRecordingGranted()
+        self.permissionNeeded = false
+        self.isRecording = true
+        self.currentAppName = appName
+        self.recordingStartTime = self.dependencies.now()
+        self.startElapsedTimer()
+        self.notifyRecordingStarted(appName: appName)
       } catch {
-        setError("Failed to start recording: \(error.localizedDescription)")
-        if (error as NSError).domain == "com.apple.ScreenCaptureKit.SCStreamError",
-          (error as NSError).code == -3801
+        self.setError("Failed to start recording: \(error.localizedDescription)")
+        if let recError = error as? RecorderError,
+          case .permissionDenied = recError
         {
-          permissionNeeded = true
+          self.permissionNeeded = true
         }
-        autoRecorder = nil
-        updateAutoState()
+        self.autoRecorder = nil
+        self.updateAutoState()
       }
     }
   }
@@ -594,6 +530,7 @@ final class AudioMonitor {
       savingCount -= 1
       isSaving = savingCount > 0
       if url != nil {
+        lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
       updateAutoState()
@@ -629,7 +566,7 @@ final class AudioMonitor {
         count: &autoRestartCount, windowStart: &autoRestartWindowStart)
       {
         Log.info(Log.monitor, "monitor", "auto-recording interrupted, restarting")
-        startAutoRecording()
+        startAutoRecording(resetRestartBudget: false)
       } else {
         Log.error(Log.monitor, "monitor", "auto-recording restart limit exceeded")
         setError("Recording failed repeatedly")
@@ -652,29 +589,11 @@ final class AudioMonitor {
 
   // MARK: - Grace Period
 
-  private func startGracePeriod() {
-    graceTask?.cancel()
-    let period = gracePeriod
-    graceTask = Task {
-      let start = Date()
-      while !Task.isCancelled {
-        let elapsed = Date().timeIntervalSince(start)
-        let remaining = period - elapsed
-        if remaining <= 0 {
-          graceCountdown = nil
-          stopAutoRecording()
-          return
-        }
-        graceCountdown = remaining
-        try? await Task.sleep(for: .seconds(1))
-      }
-    }
-  }
-
   private func cancelGracePeriod() {
     graceTask?.cancel()
     graceTask = nil
     graceCountdown = nil
+    consecutiveInactivePolls = 0
   }
 
   // MARK: - State
@@ -693,17 +612,70 @@ final class AudioMonitor {
   }
 
   private func loadSettings() {
-    let defaults = UserDefaults.standard
-    autoRecord = defaults.object(forKey: "autoRecord") as? Bool ?? true
-    gracePeriod = defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5)
-    micEnabled = defaults.object(forKey: "micEnabled") as? Bool ?? true
-    let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
-    saveDirectory = URL(fileURLWithPath: path)
-    notifyOnStart = defaults.object(forKey: "notifyOnStart") as? Bool ?? true
-    notifyOnSaved = defaults.object(forKey: "notifyOnSaved") as? Bool ?? true
-    notifyOnError = defaults.object(forKey: "notifyOnError") as? Bool ?? true
-    micPermissionNeeded =
-      micEnabled && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized
+    let settings = dependencies.loadSettings()
+    if autoRecord != settings.autoRecord { autoRecord = settings.autoRecord }
+    if gracePeriod != settings.gracePeriod { gracePeriod = settings.gracePeriod }
+    if micEnabled != settings.micEnabled { micEnabled = settings.micEnabled }
+    if saveDirectory != settings.saveDirectory { saveDirectory = settings.saveDirectory }
+    if notifyOnStart != settings.notifyOnStart { notifyOnStart = settings.notifyOnStart }
+    if notifyOnSaved != settings.notifyOnSaved { notifyOnSaved = settings.notifyOnSaved }
+    if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }
+
+    let nextMicPermissionNeeded =
+      micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
+    if micPermissionNeeded != nextMicPermissionNeeded {
+      micPermissionNeeded = nextMicPermissionNeeded
+    }
+  }
+
+  private func makeFailureHandler(isManual: Bool) -> @Sendable (RecorderFailure) -> Void {
+    { [weak self] failure in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        if isManual {
+          self.handleManualRecorderFailure(failure)
+        } else {
+          self.handleAutoRecorderFailure(failure)
+        }
+      }
+    }
+  }
+
+  private func makeAudioLevelHandler() -> @Sendable (Float) -> Void {
+    { [weak self] level in
+      Task { @MainActor [weak self] in
+        self?.audioLevel = level
+      }
+    }
+  }
+
+  private func makeLowDiskSpaceHandler() -> @Sendable (Int64) -> Void {
+    { [weak self] remaining in
+      Task { @MainActor [weak self] in
+        self?.handleLowDiskSpace(remaining)
+      }
+    }
+  }
+
+  private func makeContinuityHandler() -> @Sendable (RecorderContinuityEvent) -> Void {
+    { [weak self] event in
+      Task { @MainActor [weak self] in
+        self?.handleRecorderContinuityEvent(event)
+      }
+    }
+  }
+
+  func testSnapshot() -> BlackboxTestSnapshot {
+    BlackboxTestSnapshot(
+      isRecording: isRecording,
+      isManualRecording: isManualRecording,
+      isSaving: isSaving,
+      currentAppName: currentAppName,
+      errorMessage: errorMessage,
+      permissionNeeded: permissionNeeded,
+      micPermissionNeeded: micPermissionNeeded,
+      lastSavedRecordingPath: lastSavedRecordingURL?.path
+    )
   }
 
   // MARK: - Restart Rate Limiting
@@ -711,7 +683,7 @@ final class AudioMonitor {
   private func shouldAllowRestart(
     count: inout Int, windowStart: inout Date?, max: Int = 3, window: TimeInterval = 30
   ) -> Bool {
-    let now = Date()
+    let now = dependencies.now()
     if let start = windowStart, now.timeIntervalSince(start) > window {
       count = 0
       windowStart = nil
@@ -725,40 +697,31 @@ final class AudioMonitor {
 
   private func notifyRecordingStarted(appName: String) {
     guard notifyOnStart else { return }
-    hud.showRecordingStarted(appName: appName)
+    dependencies.hud.showRecordingStarted(appName: appName)
   }
 
   private func notifyRecordingSaved(appName: String) {
     guard notifyOnSaved else { return }
-    hud.showRecordingSaved(appName: appName)
+    dependencies.hud.showRecordingSaved(appName: appName)
   }
 
   private func notifyError(message: String) {
     guard notifyOnError else { return }
-    hud.showError(message: message)
+    dependencies.hud.showError(message: message)
   }
 
-  /// Send system notification when Screen Recording permission is revoked.
+  /// Send system notification when audio recording permission is revoked.
   /// Used because the user may be focused on their call app and not see the menu bar.
   private func notifyPermissionLost() {
-    let content = UNMutableNotificationContent()
-    content.title = "Recording stopped"
-    content.body =
-      "Screen Recording permission was revoked. Re-authorize in System Settings to resume."
-    content.sound = .default
-    let request = UNNotificationRequest(
-      identifier: "screenRecordingPermissionLost",
-      content: content,
-      trigger: nil
-    )
-    Task {
-      try? await UNUserNotificationCenter.current().add(request)
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      await self.dependencies.notifyPermissionLost()
     }
   }
 }
 
 extension Double {
-  fileprivate func clamped(to range: ClosedRange<Double>, default defaultValue: Double) -> Double {
+  func clamped(to range: ClosedRange<Double>, default defaultValue: Double) -> Double {
     self == 0 ? defaultValue : min(max(self, range.lowerBound), range.upperBound)
   }
 }

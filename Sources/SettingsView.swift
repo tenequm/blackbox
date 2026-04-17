@@ -15,7 +15,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnError") private var notifyOnError = true
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
-  @State private var screenRecordingGranted = false
+  @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
   @State private var notificationPermissionGranted = false
   @State private var storageStats: (count: Int, sizeFormatted: String)?
@@ -92,13 +92,14 @@ struct SettingsView: View {
   private var permissionsSection: some View {
     Section("Permissions") {
       permissionRow(
-        "Screen Recording",
-        granted: screenRecordingGranted
+        "System Audio Recording",
+        granted: audioRecordingGranted
       ) {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+          )!)
       }
       permissionRow(
         "Microphone",
@@ -114,7 +115,8 @@ struct SettingsView: View {
           NSWorkspace.shared.open(
             URL(
               string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
+            )!)
         }
       }
       permissionRow(
@@ -219,7 +221,8 @@ struct SettingsView: View {
   // MARK: - Permissions Refresh
 
   private func refreshPermissions() {
-    screenRecordingGranted = CGPreflightScreenCaptureAccess()
+    // CATap has no preflight API - show as granted if app has recorded successfully before
+    audioRecordingGranted = UserDefaults.standard.bool(forKey: "audioRecordingGranted")
     micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     Task {
       let settings = await UNUserNotificationCenter.current().notificationSettings()

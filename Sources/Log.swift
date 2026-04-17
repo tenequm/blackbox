@@ -16,6 +16,12 @@ nonisolated enum Log {
     LogFile.write("INFO", category, message)
   }
 
+  /// Log warning to both os.Logger and file.
+  nonisolated static func warning(_ logger: Logger, _ category: String, _ message: String) {
+    logger.warning("\(message, privacy: .public)")
+    LogFile.write("WARNING", category, message)
+  }
+
   /// Log error to both os.Logger and file.
   nonisolated static func error(_ logger: Logger, _ category: String, _ message: String) {
     logger.error("\(message, privacy: .public)")
