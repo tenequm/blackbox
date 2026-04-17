@@ -359,12 +359,11 @@ final class BlackboxSmokeClient {
   }
 
   private func terminateRunningApps() {
+    // Kill any Blackbox instance — including an installed /Applications copy —
+    // so two tap/aggregate owners don't contend for the same system audio.
     for app in NSRunningApplication.runningApplications(
       withBundleIdentifier: "com.tenequm.Blackbox")
     {
-      guard app.bundleURL?.resolvingSymlinksInPath() == appURL.resolvingSymlinksInPath() else {
-        continue
-      }
       app.terminate()
     }
   }

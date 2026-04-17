@@ -69,10 +69,10 @@ struct HardwareSmokeTests {
   }
 
   @Test(
-    "recording survives default output device switch mid-capture",
+    "recording survives default output device round-trip mid-capture",
     .tags(.hardware),
     .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
-    .timeLimit(.minutes(1))
+    .timeLimit(.minutes(2))
   )
   func outputDeviceSwitchDuringRecording() async throws {
     let outputs = try CoreAudioDevices.listOutputDevices()
@@ -81,8 +81,15 @@ struct HardwareSmokeTests {
       "Need at least 2 output devices for this test (found \(outputs.count)). Connect an external output (AirPods, USB, etc) and retry."
     )
     let originalOutput = try CoreAudioDevices.defaultOutputDevice()
+    // Prefer a Bluetooth alternate when available so every run exercises the
+    // HFP renegotiation path — that's where the v0.7.x rate regression lived
+    // (forcing the aggregate to 48kHz while HFP pinned 24kHz). Round-trip
+    // A→B→A catches asymmetries where only one direction rebuilds cleanly.
     let alternateOutput = try #require(
-      outputs.first { $0 != originalOutput }, "No alternate output device available")
+      outputs.first(where: { $0 != originalOutput && CoreAudioDevices.isBluetooth($0) })
+        ?? outputs.first(where: { $0 != originalOutput }),
+      "No alternate output device available"
+    )
 
     let originalName = CoreAudioDevices.deviceName(originalOutput) ?? "<unknown>"
     let alternateName = CoreAudioDevices.deviceName(alternateOutput) ?? "<unknown>"
@@ -106,14 +113,20 @@ struct HardwareSmokeTests {
       snapshot.isRecording && snapshot.isManualRecording
     }
 
+    // Phase 1: baseline on original device.
     try client.playSystemAudioFixture()
     try await Task.sleep(for: .seconds(2))
 
-    // Switch default output device mid-recording. The app's listener on
-    // kAudioHardwarePropertyDefaultOutputDevice should fire, tear down the
-    // CATap + aggregate device, rebuild, and resume the IO proc. D8 handles
-    // the silence gap during rebuild.
+    // Phase 2: A → B. Listener on kAudioHardwarePropertyDefaultOutputDevice
+    // tears down the CATap + aggregate, rebuilds, resumes the IO proc.
+    // D8 handles the silence gap.
     try CoreAudioDevices.setDefaultOutputDevice(alternateOutput)
+    try await Task.sleep(for: .seconds(2))
+    try client.playSystemAudioFixture()
+    try await Task.sleep(for: .seconds(2))
+
+    // Phase 3: B → A. Second rebuild in the opposite direction.
+    try CoreAudioDevices.setDefaultOutputDevice(originalOutput)
     try await Task.sleep(for: .seconds(2))
     try client.playSystemAudioFixture()
     try await Task.sleep(for: .seconds(2))
@@ -136,7 +149,18 @@ struct HardwareSmokeTests {
     #expect(tracks.count == 2, "Expected 2 audio tracks, found \(tracks.count)")
 
     let duration = try await asset.load(.duration).seconds
-    #expect(duration > 4.0, "Expected ~6s recording across the switch, got \(duration)s")
+    #expect(duration > 9.0, "Expected ~12s recording across A→B→A, got \(duration)s")
+
+    // HFP renegotiation can legitimately stall both streams for seconds while
+    // macOS re-plumbs through CADefaultDeviceAggregate; loosen tolerances when
+    // either endpoint is Bluetooth. The ceilings still catch truly dead IO
+    // procs / stuck AVAudioEngine (those stall indefinitely).
+    let hfpInvolved =
+      CoreAudioDevices.isBluetooth(originalOutput)
+      || CoreAudioDevices.isBluetooth(alternateOutput)
+    let ageCeilingMs: Double = hfpInvolved ? 8000 : 500
+    // Two rebuilds each add a D8 silence gap; HFP can add multi-second stalls.
+    let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
 
     var trackDurations: [Double] = []
     for track in tracks {
@@ -145,19 +169,35 @@ struct HardwareSmokeTests {
     }
     let minDuration = try #require(trackDurations.min())
     let maxDuration = try #require(trackDurations.max())
-    // Wider tolerance than the baseline: D8 silence gap during aggregate rebuild
-    // can legitimately add 50-150ms of divergence.
     #expect(
-      maxDuration - minDuration < 0.15,
-      "Track durations diverged across output switch: \(trackDurations) (original=\(originalName), alternate=\(alternateName))"
+      maxDuration - minDuration < divergenceCeilingS,
+      "Track durations diverged across output round-trip: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
     )
 
     // Belt-and-suspenders: confirm the listener actually fired.
     #expect(
       BlackboxLogProbe.containsAfter(
-        "output device changed, rebuilding aggregate device", since: logMarker),
+        "output device changed", since: logMarker),
       "Expected 'output device changed' log line after \(logMarker) - listener may not have fired"
     )
+
+    if let maxSysAge = BlackboxLogProbe.maxSystemAgeAfter(since: logMarker) {
+      #expect(
+        maxSysAge < ageCeilingMs,
+        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). IO proc may have died."
+      )
+    } else {
+      Issue.record("No drift logs found after \(logMarker) - cannot verify sys_age")
+    }
+
+    if let maxMicAge = BlackboxLogProbe.maxMicAgeAfter(since: logMarker) {
+      #expect(
+        maxMicAge < ageCeilingMs,
+        "Mic stopped after output device round-trip: mic_age=\(maxMicAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). AVAudioEngine may have stalled."
+      )
+    } else {
+      Issue.record("No drift logs found after \(logMarker) - cannot verify mic_age")
+    }
   }
 
   @Test(
@@ -236,13 +276,16 @@ struct HardwareSmokeTests {
     }
     let minDuration = try #require(trackDurations.min())
     let maxDuration = try #require(trackDurations.max())
-    // Mic tap reinstall can introduce a gap while AVAudioEngine restarts.
-    // 300ms tolerance = debounceConfigChange(300ms) in AudioRecorder.swift's
-    // debounceConfigChange + engine restart jitter. If that debounce value
-    // changes, update this tolerance accordingly.
+    // Non-BT baseline: 300ms tolerance ≈ debounceConfigChange(300ms) + engine
+    // restart jitter. Bluetooth inputs can legitimately stall multi-second
+    // while HFP renegotiates; loosen accordingly.
+    let hfpInvolved =
+      CoreAudioDevices.isBluetooth(originalInput)
+      || CoreAudioDevices.isBluetooth(alternateInput)
+    let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
     #expect(
-      maxDuration - minDuration < 0.3,
-      "Track durations diverged across input switch: \(trackDurations) (original=\(originalName), alternate=\(alternateName))"
+      maxDuration - minDuration < divergenceCeilingS,
+      "Track durations diverged across input switch: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
     )
 
     // Belt-and-suspenders: confirm the engine config-change path actually fired.
@@ -298,6 +341,27 @@ enum CoreAudioDevices {
     let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &name)
     guard status == noErr, let name else { return nil }
     return name.takeRetainedValue() as String
+  }
+
+  static func transportType(_ id: AudioDeviceID) -> UInt32 {
+    var transport: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyTransportType,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    AudioObjectGetPropertyData(id, &address, 0, nil, &size, &transport)
+    return transport
+  }
+
+  static func isBuiltIn(_ id: AudioDeviceID) -> Bool {
+    transportType(id) == kAudioDeviceTransportTypeBuiltIn
+  }
+
+  static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+    let t = transportType(id)
+    return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
   }
 
   private static func allDevices() throws -> [AudioDeviceID] {
@@ -405,5 +469,60 @@ enum BlackboxLogProbe {
       Thread.sleep(forTimeInterval: 0.1)
     }
     return false
+  }
+
+  /// Extracts the maximum age for a drift-log field after `since`.
+  /// Returns nil if no drift logs found. Drift logs look like:
+  /// `drift: t=45.0s sys_age=3016.1ms mic_age=169.8ms ...`
+  private static func maxAgeAfter(
+    field: String,
+    since: Date,
+    timeoutSeconds: TimeInterval = 2.0
+  ) -> Double? {
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    let flooredSince = Date(timeIntervalSince1970: floor(since.timeIntervalSince1970))
+    let logURL = URL(fileURLWithPath: NSHomeDirectory())
+      .appendingPathComponent("Library/Logs/Blackbox/blackbox.log")
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    let regex = try! NSRegularExpression(pattern: #"(\#(field))=(\d+\.?\d*)ms"#)
+
+    while Date() < deadline {
+      if let contents = try? String(contentsOf: logURL, encoding: .utf8) {
+        var maxAge: Double?
+        for line in contents.split(separator: "\n") where line.contains("drift:") {
+          let head = line.prefix(20)
+          let timestamp = String(head).replacingOccurrences(of: " ", with: "")
+          guard let lineDate = formatter.date(from: timestamp), lineDate >= flooredSince else {
+            continue
+          }
+          let lineStr = String(line)
+          let range = NSRange(lineStr.startIndex..., in: lineStr)
+          if let match = regex.firstMatch(in: lineStr, range: range),
+            let valueRange = Range(match.range(at: 2), in: lineStr)
+          {
+            if let value = Double(lineStr[valueRange]) {
+              maxAge = max(maxAge ?? 0, value)
+            }
+          }
+        }
+        if maxAge != nil { return maxAge }
+      }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+    return nil
+  }
+
+  /// Extracts the maximum sys_age (system audio staleness) from drift logs after `since`.
+  /// A healthy sys_age is <100ms. If IO proc stops, sys_age grows unbounded.
+  static func maxSystemAgeAfter(since: Date, timeoutSeconds: TimeInterval = 2.0) -> Double? {
+    maxAgeAfter(field: "sys_age", since: since, timeoutSeconds: timeoutSeconds)
+  }
+
+  /// Extracts the maximum mic_age (mic audio staleness) from drift logs after `since`.
+  /// Healthy mic restarts may spike briefly during device churn; sustained growth means
+  /// AVAudioEngine stopped delivering buffers.
+  static func maxMicAgeAfter(since: Date, timeoutSeconds: TimeInterval = 2.0) -> Double? {
+    maxAgeAfter(field: "mic_age", since: since, timeoutSeconds: timeoutSeconds)
   }
 }

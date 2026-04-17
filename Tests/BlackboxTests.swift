@@ -508,18 +508,29 @@ struct GapFillingTests {
 @Suite("System Audio Resample")
 struct ResampleTests {
 
-  /// Create an interleaved stereo buffer with known L/R values.
+  /// Create a stereo buffer with known L/R values.
   private func makeStereoBuffer(
-    sampleRate: Double, frameCount: Int, left: Float, right: Float
+    sampleRate: Double, frameCount: Int, left: Float, right: Float, interleaved: Bool = true
   ) -> AVAudioPCMBuffer {
     let fmt = AVAudioFormat(
-      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2, interleaved: true)!
+      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2,
+      interleaved: interleaved)!
     let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frameCount))!
     buf.frameLength = AVAudioFrameCount(frameCount)
-    let data = buf.floatChannelData![0]
-    for i in 0..<frameCount {
-      data[i * 2] = left
-      data[i * 2 + 1] = right
+
+    if interleaved {
+      let data = buf.floatChannelData![0]
+      for i in 0..<frameCount {
+        data[i * 2] = left
+        data[i * 2 + 1] = right
+      }
+    } else {
+      let leftData = buf.floatChannelData![0]
+      let rightData = buf.floatChannelData![1]
+      for i in 0..<frameCount {
+        leftData[i] = left
+        rightData[i] = right
+      }
     }
     return buf
   }
@@ -537,6 +548,23 @@ struct ResampleTests {
     return buf
   }
 
+  private func assertConstantOutput(
+    _ buffer: AVAudioPCMBuffer,
+    expected: Float,
+    tolerance: Float = 0.0001,
+    context: String
+  ) {
+    let out = buffer.floatChannelData![0]
+    let frameCount = Int(buffer.frameLength)
+    var maxDeviation: Float = 0
+    for i in 0..<frameCount {
+      maxDeviation = max(maxDeviation, abs(out[i] - expected))
+    }
+    #expect(
+      maxDeviation < tolerance,
+      "\(context): expected \(expected), max deviation was \(maxDeviation)")
+  }
+
   @Test("stereo 48kHz downmixes to mono without resampling")
   func stereoDownmixNoResample() {
     let input = makeStereoBuffer(sampleRate: 48000, frameCount: 1024, left: 0.6, right: 0.4)
@@ -545,11 +573,7 @@ struct ResampleTests {
     #expect(result.format.sampleRate == 48000)
     #expect(result.format.channelCount == 1)
     #expect(Int(result.frameLength) == 1024)
-
-    let out = result.floatChannelData![0]
-    for i in 0..<1024 {
-      #expect(abs(out[i] - 0.5) < 0.0001, "Frame \(i): expected 0.5, got \(out[i])")
-    }
+    assertConstantOutput(result, expected: 0.5, context: "interleaved stereo 48kHz downmix")
   }
 
   @Test("stereo 24kHz resamples and downmixes to mono 48kHz")
@@ -561,11 +585,31 @@ struct ResampleTests {
     #expect(result.format.channelCount == 1)
     // 240 frames at 24kHz -> 480 frames at 48kHz
     #expect(Int(result.frameLength) == 480)
+    assertConstantOutput(result, expected: 0.5, context: "interleaved stereo 24kHz resample")
+  }
 
-    let out = result.floatChannelData![0]
-    for i in 0..<480 {
-      #expect(abs(out[i] - 0.5) < 0.0001, "Frame \(i): expected 0.5, got \(out[i])")
-    }
+  @Test("deinterleaved stereo 48kHz downmixes to mono without distortion")
+  func deinterleavedStereoDownmixNoResample() {
+    let input = makeStereoBuffer(
+      sampleRate: 48000, frameCount: 1024, left: 0.6, right: 0.4, interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "deinterleaved stereo 48kHz downmix")
+  }
+
+  @Test("deinterleaved stereo 24kHz resamples and downmixes to mono 48kHz")
+  func deinterleavedStereo24kResampleDownmix() {
+    let input = makeStereoBuffer(
+      sampleRate: 24000, frameCount: 240, left: 0.8, right: 0.2, interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 24000)!
+
+    #expect(result.format.sampleRate == 48000)
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 480)
+    assertConstantOutput(result, expected: 0.5, context: "deinterleaved stereo 24kHz resample")
   }
 
   @Test("mono passthrough at 48kHz copies data unchanged")
@@ -574,10 +618,7 @@ struct ResampleTests {
     let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
 
     #expect(Int(result.frameLength) == 512)
-    let out = result.floatChannelData![0]
-    for i in 0..<512 {
-      #expect(abs(out[i] - 0.75) < 0.0001)
-    }
+    assertConstantOutput(result, expected: 0.75, context: "mono passthrough")
   }
 
   @Test("mono 24kHz resamples to 48kHz")
@@ -587,11 +628,7 @@ struct ResampleTests {
 
     #expect(result.format.sampleRate == 48000)
     #expect(Int(result.frameLength) == 480)
-
-    let out = result.floatChannelData![0]
-    for i in 0..<480 {
-      #expect(abs(out[i] - 0.3) < 0.0001, "Frame \(i): expected 0.3, got \(out[i])")
-    }
+    assertConstantOutput(result, expected: 0.3, context: "mono 24kHz resample")
   }
 
   @Test("resample preserves linear ramp")
@@ -638,5 +675,58 @@ struct ResampleTests {
         Int(result.frameLength) == expectedOut,
         "\(rate)Hz: \(inCount) in -> expected \(expectedOut) out, got \(result.frameLength)")
     }
+  }
+}
+
+@Suite("CATap Callback Format")
+struct CATapCallbackFormatTests {
+
+  @Test("follows aggregate rate at 48kHz (built-in speakers)")
+  func builtInSpeakers48k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 2)!
+    #expect(fmt.sampleRate == 48000)
+    #expect(fmt.channelCount == 2)
+    #expect(fmt.isInterleaved)
+    #expect(fmt.commonFormat == .pcmFormatFloat32)
+  }
+
+  @Test("follows aggregate rate at 24kHz (AirPods HFP)")
+  func airpodsHFP24k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 24000, channelCount: 2)!
+    // The bug: forcing 48kHz here while IO proc delivers 24kHz buffers made
+    // 6576s of audio label as 13152s, producing half silence + half 2x-sped content.
+    #expect(fmt.sampleRate == 24000)
+    #expect(fmt.channelCount == 2)
+    #expect(fmt.isInterleaved)
+  }
+
+  @Test("follows aggregate rate at 44.1kHz")
+  func rate44100() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 44100, channelCount: 2)!
+    #expect(fmt.sampleRate == 44100)
+  }
+
+  @Test("follows aggregate rate at 16kHz")
+  func rate16k() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 16000, channelCount: 2)!
+    #expect(fmt.sampleRate == 16000)
+  }
+
+  @Test("preserves mono tap channel count")
+  func monoChannels() {
+    let fmt = AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 1)!
+    #expect(fmt.channelCount == 1)
+  }
+
+  @Test("returns nil for zero sample rate")
+  func rejectsZeroRate() {
+    #expect(
+      AudioRecorder.catapCallbackFormat(aggregateSampleRate: 0, channelCount: 2) == nil)
+  }
+
+  @Test("returns nil for zero channel count")
+  func rejectsZeroChannels() {
+    #expect(
+      AudioRecorder.catapCallbackFormat(aggregateSampleRate: 48000, channelCount: 0) == nil)
   }
 }

@@ -196,6 +196,8 @@ Architectural decisions with reasoning and alternatives considered.
 
 **IO proc callback:** Receives interleaved Float32 `AudioBufferList` on a real-time thread. Must be RT-safe (no allocations, no ObjC messaging, no locks without priority donation).
 
+**Sample rate policy:** The aggregate device's nominal rate is dictated by the output subdevice (e.g. AirPods HFP pins it at 24kHz, built-in speakers at 48kHz). We read `kAudioDevicePropertyNominalSampleRate` on the aggregate and build the IO proc callback format from that rate - we do not try to write it. Chromium's "force 48kHz" approach is a silent no-op when the output subdevice pins the rate: `AudioObjectSetPropertyData` returns `noErr` while the subsequent read-back shows the unchanged rate. If we then wrap IO proc buffers with a 48kHz format while the callback delivers 24kHz frames, the audio is labeled at 2x its true rate and resampling misfires - producing a file that is half silence and half 2x-sped-up content. `resampleToMono48k` already handles any source rate via linear interpolation, so following the aggregate's rate on the hot path is the correct strategy.
+
 **AudioBufferList-to-CMSampleBuffer conversion:** The IO proc receives raw interleaved Float32 `AudioBufferList`. Conversion on `audioQueue`:
 1. Zero-copy wrap via `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:deallocator:nil)`, then copy frame data (IO proc buffer only valid during callback)
 2. Resample and downmix to mono 48kHz via `RecordingPipeline.resampleToMono48k()` (stereo L+R average, linear interpolation for rate conversion)

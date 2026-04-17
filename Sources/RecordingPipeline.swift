@@ -757,6 +757,7 @@ final class RecordingPipeline: @unchecked Sendable {
     guard let inData = buffer.floatChannelData?[0] else { return nil }
     let inFrames = Int(buffer.frameLength)
     let inChannels = Int(buffer.format.channelCount)
+    let isInterleaved = buffer.format.isInterleaved
 
     let needsResample = sourceRate != writerSampleRate
     let ratio = needsResample ? writerSampleRate / sourceRate : 1.0
@@ -771,19 +772,29 @@ final class RecordingPipeline: @unchecked Sendable {
     else { return nil }
 
     if inChannels >= 2 {
+      let rightData = isInterleaved ? nil : buffer.floatChannelData?[1]
+      guard isInterleaved || rightData != nil else { return nil }
+
+      let monoSample: (Int) -> Float = { index in
+        if isInterleaved {
+          return (inData[index * 2] + inData[index * 2 + 1]) * 0.5
+        }
+        return (inData[index] + rightData![index]) * 0.5
+      }
+
       if needsResample {
         for i in 0..<outFrames {
           let srcIdx = Double(i) / ratio
           let lo = Int(srcIdx)
           let hi = min(lo + 1, inFrames - 1)
           let frac = Float(srcIdx - Double(lo))
-          let loMono = (inData[lo * 2] + inData[lo * 2 + 1]) * 0.5
-          let hiMono = (inData[hi * 2] + inData[hi * 2 + 1]) * 0.5
+          let loMono = monoSample(lo)
+          let hiMono = monoSample(hi)
           outData[i] = loMono * (1 - frac) + hiMono * frac
         }
       } else {
         for i in 0..<inFrames {
-          outData[i] = (inData[i * 2] + inData[i * 2 + 1]) * 0.5
+          outData[i] = monoSample(i)
         }
       }
     } else {

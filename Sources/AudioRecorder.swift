@@ -37,7 +37,6 @@ actor AudioRecorder {
   private var ioProcID: AudioDeviceIOProcID?
   private var tapFormat: AVAudioFormat?
   private var outputDeviceListenerBlock: AudioObjectPropertyListenerBlock?
-  private var rateChangeListenerBlock: AudioObjectPropertyListenerBlock?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -132,12 +131,9 @@ actor AudioRecorder {
     Log.info(Log.recorder, "recorder", "created process tap #\(tap.id)")
 
     // 4-6: Read tap format, output device, create aggregate. Clean up tap on any failure.
-    let aggregateFormat: AVAudioFormat
+    let callbackFormat: AVAudioFormat
     do {
-      var streamDesc = try tap.format
-      guard let tapFmt = AVAudioFormat(streamDescription: &streamDesc) else {
-        throw RecorderError.tapCreationFailed("invalid tap stream format")
-      }
+      let tapFmt = try readTapStreamFormat(tap)
       Log.info(
         Log.recorder, "recorder",
         "tap format: \(tapFmt.channelCount)ch, \(tapFmt.sampleRate)Hz, interleaved=\(tapFmt.isInterleaved)"
@@ -153,10 +149,23 @@ actor AudioRecorder {
       self.aggregateDevice = aggregate
       Log.info(Log.recorder, "recorder", "created aggregate device #\(aggregate.id)")
 
-      // Force 48kHz on aggregate device (Chromium's approach - prevents rate mismatch
-      // when Bluetooth HFP or other non-48kHz devices pull the system audio graph rate)
-      aggregateFormat = configureAggregateSampleRate(aggregate)
-      self.tapFormat = aggregateFormat
+      // IO proc delivers buffers at the aggregate device's rate (dictated by the
+      // output subdevice - e.g. 24kHz for AirPods HFP). `resampleToMono48k` converts
+      // to 48kHz on the hot path, so we just need a callback format that matches
+      // what the IO proc actually delivers.
+      let aggregateRate = readAggregateNominalRate(aggregate)
+      guard
+        let fmt = Self.catapCallbackFormat(
+          aggregateSampleRate: aggregateRate, channelCount: tapFmt.channelCount)
+      else {
+        throw RecorderError.tapCreationFailed(
+          "failed to build callback format for aggregate rate \(aggregateRate)Hz")
+      }
+      Log.info(
+        Log.recorder, "recorder",
+        "aggregate nominal rate: \(aggregateRate)Hz (tap native: \(tapFmt.sampleRate)Hz)")
+      callbackFormat = fmt
+      self.tapFormat = callbackFormat
     } catch {
       destroyTap()
       throw error
@@ -191,7 +200,7 @@ actor AudioRecorder {
       self.pipeline = pipeline
 
       // 8. Create IO proc on aggregate device
-      let capturedFormat = aggregateFormat
+      let capturedFormat = callbackFormat
       let aggregate = self.aggregateDevice!
       let ioProcBlock = makeIOProcBlock(format: capturedFormat)
       let err = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregate.id, nil, ioProcBlock)
@@ -209,7 +218,6 @@ actor AudioRecorder {
       startDiskSpaceMonitor()
       startDriftMonitor()
       installOutputDeviceListener()
-      installRateChangeListener()
 
       // 10. Start mic capture independently - failure does not stop system audio
       if micEnabled {
@@ -224,7 +232,6 @@ actor AudioRecorder {
     } catch {
       Log.error(Log.recorder, "recorder", "recording setup failed for \(appName): \(error)")
       stopMicCapture()
-      removeRateChangeListener()
       removeOutputDeviceListener()
       destroyIOProc()
       destroyAggregateDevice()
@@ -253,7 +260,6 @@ actor AudioRecorder {
     }
 
     // CATap teardown (order matters per spec D5)
-    removeRateChangeListener()
     removeOutputDeviceListener()
     destroyIOProc()
     destroyAggregateDevice()
@@ -391,106 +397,42 @@ actor AudioRecorder {
     return aggregate
   }
 
-  /// Forces 48kHz on the aggregate device and returns an AVAudioFormat reflecting the confirmed rate.
-  /// Logs initial, requested, and confirmed rates for diagnostics.
-  private func configureAggregateSampleRate(
+  private func readTapStreamFormat(_ tap: AudioHardwareTap) throws -> AVAudioFormat {
+    var streamDesc = try tap.format
+    guard let format = AVAudioFormat(streamDescription: &streamDesc) else {
+      throw RecorderError.tapCreationFailed("invalid tap stream format")
+    }
+    return format
+  }
+
+  /// Reads the aggregate device's nominal sample rate. The rate is dictated by
+  /// the output subdevice (e.g. AirPods HFP pins it at 24kHz) - we do not write it.
+  private func readAggregateNominalRate(
     _ aggregate: AudioHardwareAggregateDevice
-  ) -> AVAudioFormat {
+  ) -> Double {
     var addr = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyNominalSampleRate,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain)
     var size = UInt32(MemoryLayout<Float64>.size)
+    var rate: Float64 = 0
+    AudioObjectGetPropertyData(aggregate.id, &addr, 0, nil, &size, &rate)
+    return rate
+  }
 
-    var initialRate: Float64 = 0
-    AudioObjectGetPropertyData(aggregate.id, &addr, 0, nil, &size, &initialRate)
-
-    var confirmedRate = initialRate
-    if initialRate != 48000 {
-      var targetRate: Float64 = 48000
-      let setStatus = AudioObjectSetPropertyData(
-        aggregate.id, &addr, 0, nil,
-        UInt32(MemoryLayout<Float64>.size), &targetRate)
-      // Read back to confirm
-      AudioObjectGetPropertyData(aggregate.id, &addr, 0, nil, &size, &confirmedRate)
-      Log.info(
-        Log.recorder, "recorder",
-        "aggregate device rate: initial=\(initialRate)Hz, requested=48000Hz, confirmed=\(confirmedRate)Hz, setStatus=\(setStatus)"
-      )
-    } else {
-      Log.info(
-        Log.recorder, "recorder",
-        "aggregate device rate: \(confirmedRate)Hz (already 48kHz)")
-    }
-
-    // Build format from confirmed rate (not tap.format which may be stale)
-    if let fmt = AVAudioFormat(
-      commonFormat: .pcmFormatFloat32,
-      sampleRate: confirmedRate,
-      channels: 2,
-      interleaved: true)
-    {
-      return fmt
-    }
-    Log.error(
-      Log.recorder, "recorder",
-      "failed to create AVAudioFormat for \(confirmedRate)Hz, falling back to 48kHz")
+  /// Builds the interleaved Float32 AVAudioFormat that wraps IO proc buffers.
+  /// The rate must match the aggregate's actual delivery rate; resampling to
+  /// 48kHz happens downstream in `RecordingPipeline.resampleToMono48k`.
+  nonisolated static func catapCallbackFormat(
+    aggregateSampleRate: Double,
+    channelCount: UInt32
+  ) -> AVAudioFormat? {
+    guard aggregateSampleRate > 0, channelCount > 0 else { return nil }
     return AVAudioFormat(
-      commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: true)!
-  }
-
-  // MARK: - Aggregate Device Rate Change Listener
-
-  private func installRateChangeListener() {
-    guard let aggregate = aggregateDevice else { return }
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyNominalSampleRate,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-      guard let self else { return }
-      self.assumeIsolated { iso in
-        iso.handleRateChange()
-      }
-    }
-    AudioObjectAddPropertyListenerBlock(aggregate.id, &addr, audioQueue, block)
-    rateChangeListenerBlock = block
-  }
-
-  private func removeRateChangeListener() {
-    guard let block = rateChangeListenerBlock, let aggregate = aggregateDevice else { return }
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyNominalSampleRate,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    AudioObjectRemovePropertyListenerBlock(aggregate.id, &addr, audioQueue, block)
-    rateChangeListenerBlock = nil
-  }
-
-  private func handleRateChange() {
-    guard !stopped, let aggregate = aggregateDevice else { return }
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyNominalSampleRate,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    var size = UInt32(MemoryLayout<Float64>.size)
-    var currentRate: Float64 = 0
-    AudioObjectGetPropertyData(aggregate.id, &addr, 0, nil, &size, &currentRate)
-
-    let previousRate = tapFormat?.sampleRate ?? 0
-    if currentRate != previousRate {
-      Log.info(
-        Log.recorder, "recorder",
-        "aggregate device rate changed: \(previousRate)Hz -> \(currentRate)Hz")
-      if let fmt = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32,
-        sampleRate: currentRate,
-        channels: 2,
-        interleaved: true)
-      {
-        tapFormat = fmt
-      }
-    }
+      commonFormat: .pcmFormatFloat32,
+      sampleRate: aggregateSampleRate,
+      channels: AVAudioChannelCount(channelCount),
+      interleaved: true)
   }
 
   /// Creates a mic tap handler that dispatches to audioQueue.
@@ -562,7 +504,6 @@ actor AudioRecorder {
     let system = AudioHardwareSystem.shared
 
     // Tear down IO proc, aggregate, and tap - recreate all with new output device
-    removeRateChangeListener()
     destroyIOProc()
     destroyAggregateDevice()
     destroyTap()
@@ -608,12 +549,38 @@ actor AudioRecorder {
     }
     self.aggregateDevice = aggregate
 
-    // Force 48kHz and use confirmed rate for IO proc
-    let confirmedFormat = configureAggregateSampleRate(aggregate)
-    self.tapFormat = confirmedFormat
+    // Read the rebuilt aggregate's rate and build the callback format from it.
+    // The new output device dictates the rate; we just follow.
+    let aggregateRate = readAggregateNominalRate(aggregate)
+    let tapChannels: UInt32
+    do {
+      tapChannels = try readTapStreamFormat(newTap).channelCount
+    } catch {
+      Log.error(Log.recorder, "recorder", "failed to read rebuilt tap format: \(error)")
+      destroyAggregateDevice()
+      destroyTap()
+      onFailure?(.systemStopped)
+      return
+    }
+    guard
+      let callbackFormat = Self.catapCallbackFormat(
+        aggregateSampleRate: aggregateRate, channelCount: tapChannels)
+    else {
+      Log.error(
+        Log.recorder, "recorder",
+        "failed to build callback format after device change (rate=\(aggregateRate)Hz)")
+      destroyAggregateDevice()
+      destroyTap()
+      onFailure?(.systemStopped)
+      return
+    }
+    Log.info(
+      Log.recorder, "recorder",
+      "rebuilt aggregate nominal rate: \(aggregateRate)Hz")
+    self.tapFormat = callbackFormat
 
-    // Recreate IO proc using confirmed format
-    let ioProcBlock = makeIOProcBlock(format: confirmedFormat)
+    // Recreate IO proc using the actual callback format
+    let ioProcBlock = makeIOProcBlock(format: callbackFormat)
     let err = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregate.id, nil, ioProcBlock)
     guard err == noErr else {
       Log.error(
@@ -636,10 +603,10 @@ actor AudioRecorder {
       return
     }
 
-    installRateChangeListener()
     Log.info(
       Log.recorder, "recorder",
       "aggregate device rebuilt after output device change (new output: \(outputUID))")
+    scheduleMicRecoveryAfterOutputDeviceChange()
   }
 
   // MARK: - AVAudioEngine Mic Capture
@@ -729,6 +696,7 @@ actor AudioRecorder {
   }
 
   private func stopMicCapture() {
+    configChangeGeneration += 1
     if let observer = configChangeObserver {
       NotificationCenter.default.removeObserver(observer)
       configChangeObserver = nil
@@ -740,6 +708,44 @@ actor AudioRecorder {
       }
       let _ = ObjCStopEngine(engine)
       audioEngine = nil
+    }
+  }
+
+  private func scheduleMicRecoveryAfterOutputDeviceChange() {
+    guard micEnabled else { return }
+    let baselineMicHostTime = lastMicHostTime
+    let scheduledGeneration = configChangeGeneration
+    audioQueue.asyncAfter(deadline: .now() + .milliseconds(900)) { [weak self] in
+      guard let self else { return }
+      self.assumeIsolated { iso in
+        iso.recoverMicAfterOutputDeviceChangeIfNeeded(
+          baselineMicHostTime: baselineMicHostTime,
+          scheduledGeneration: scheduledGeneration)
+      }
+    }
+  }
+
+  private func recoverMicAfterOutputDeviceChangeIfNeeded(
+    baselineMicHostTime: UInt64,
+    scheduledGeneration: Int
+  ) {
+    guard !stopped, micEnabled else { return }
+    guard configChangeGeneration == scheduledGeneration else { return }
+    guard lastMicHostTime == baselineMicHostTime else { return }
+
+    Log.info(
+      Log.recorder, "recorder",
+      "mic appears stalled after output device change, recreating mic capture")
+    stopMicCapture()
+    do {
+      try startMicCapture()
+      Log.info(
+        Log.recorder, "recorder",
+        "mic capture recovered after output device change")
+    } catch {
+      Log.error(
+        Log.recorder, "recorder",
+        "mic capture recovery failed after output device change: \(error)")
     }
   }
 
