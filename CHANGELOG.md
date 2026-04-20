@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-20
+
+### Changed
+
+- Reverted system audio capture from CoreAudio Process Tap (CATap) back to display-wide `SCStream` (ScreenCaptureKit). v0.6.0's SCStream approach had an empirical production track record with zero silent-recording reports; CATap produced three distinct silent-recording bugs in 5 days (Bluetooth HFP 24kHz pin, IO-proc stop when nothing plays, Chrome Meet routed to non-default idle output). Root cause: aggregate-device IO proc fires on a hardware output-device clock that can be idle, pinned, or stalled. SCStream's clock comes from the OS-composited mix, decoupled from any specific device.
+- Onboarding now actively requests Screen Recording permission on completion via `CGRequestScreenCaptureAccess()`.
+
+### Fixed
+
+- Full-hour mic-only recordings when default output was idle while Chrome Meet routed call audio to a non-default output via its in-page device picker.
+
+### Removed
+
+- CATap tap/aggregate-device/IO-proc pipeline, output-device change listener, IO proc buffer pool, and mic recovery-after-device-change paths.
+
 ## [0.7.0] - 2026-04-17
 
 ### Added

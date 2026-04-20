@@ -2,17 +2,19 @@
 import AudioToolbox
 import CoreAudio
 import ObjCExceptionCatcher
+@preconcurrency import ScreenCaptureKit
 
-/// Records system audio via CATap (CoreAudio Process Tap) and mic via AVAudioEngine
-/// as independent pipelines.
+/// Records system audio via ScreenCaptureKit (SCStream, display-wide) and mic via
+/// AVAudioEngine as independent pipelines.
 ///
-/// Dual-track capture: system audio (CATap aggregate device IO proc) and mic (AVAudioEngine)
-/// written as separate AVAssetWriterInputs to a single M4A file. No post-processing or mixing.
-/// Uses a custom DispatchSerialQueue executor - all actor-isolated state is accessed on `audioQueue`.
+/// Dual-track capture: system audio (SCStream) and mic (AVAudioEngine) written as
+/// separate AVAssetWriterInputs to a single M4A file. No post-processing or mixing.
+/// Uses a custom DispatchSerialQueue executor - all actor-isolated state is
+/// accessed on `audioQueue`.
 ///
-/// AVAudioEngine handles mic device following automatically - on hardware change, the
-/// `AVAudioEngineConfigurationChange` notification fires and the tap is reinstalled.
-/// `movieFragmentInterval` ensures partial file recovery on crash.
+/// AVAudioEngine handles mic device following automatically - on hardware change,
+/// the `AVAudioEngineConfigurationChange` notification fires and the tap is
+/// reinstalled. `movieFragmentInterval` ensures partial file recovery on crash.
 actor AudioRecorder {
   nonisolated let bundleID: String?
   nonisolated let appName: String
@@ -31,12 +33,9 @@ actor AudioRecorder {
     audioQueue.asUnownedSerialExecutor()
   }
 
-  // CATap state
-  private var processTap: AudioHardwareTap?
-  private var aggregateDevice: AudioHardwareAggregateDevice?
-  private var ioProcID: AudioDeviceIOProcID?
-  private var tapFormat: AVAudioFormat?
-  private var outputDeviceListenerBlock: AudioObjectPropertyListenerBlock?
+  // SCStream state
+  private var displayStream: SCStream?
+  private var streamProxy: SCStreamProxy?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -50,6 +49,7 @@ actor AudioRecorder {
   private var lowDiskSpaceWarned = false
   private var micTapFormat: AVAudioFormat?
   private var micBuffersConversionFailed: Int = 0
+  private var systemBuffersConversionFailed: Int = 0
   private var configChangeGeneration: Int = 0
 
   // D9: device latency offset for mic-system alignment.
@@ -58,22 +58,9 @@ actor AudioRecorder {
   private var micLatencyOffset: Double = 0
   private var micLatencyOffsetTicks: UInt64 = 0
 
-  // Pool of pre-allocated AVAudioPCMBuffer copies for the CATap IO proc.
-  // Spec D5 mandates RT-safety on the IO proc thread - no storage allocations.
-  // The IO proc cycles through the pool by callback count (single-producer),
-  // memcpys ABL bytes into a slot's backing store, and dispatches the slot
-  // reference to audioQueue. Pool size × typical IO-period (~32 × 10ms = 320ms)
-  // gives ample slack before the IO proc could wrap and overwrite a slot still
-  // held by audioQueue. Published before the IO proc starts and released after
-  // the IO proc is destroyed, so no cross-thread races.
-  private static let ioProcBufferPoolSize = 32
-  private static let ioProcBufferMaxFrames: AVAudioFrameCount = 4096
-  nonisolated(unsafe) private var ioProcBufferPool: [AVAudioPCMBuffer] = []
-  nonisolated(unsafe) private var ioProcCallbackCount: UInt64 = 0
-
-  // Drift monitor state. Raw (pre-D9) host times from the most recent buffer
-  // delivered by each path, plus a 5s log timer. Used to surface mic-vs-system
-  // clock skew or drift during a live recording.
+  // Drift monitor state. Raw host times from the most recent buffer delivered
+  // by each path, plus a 5s log timer. Used to surface mic-vs-system clock
+  // skew or drift during a live recording.
   private var driftTimer: DispatchSourceTimer?
   private var lastMicHostTime: UInt64 = 0
   private var lastSystemHostTime: UInt64 = 0
@@ -112,76 +99,20 @@ actor AudioRecorder {
   func start() async throws {
     Log.info(Log.recorder, "recorder", "start() for \(appName) (\(bundleID ?? "all"))")
 
-    // 1. Get own PID's AudioObjectID via Swift wrapper
-    let myPID = ProcessInfo.processInfo.processIdentifier
-    let system = AudioHardwareSystem.shared
-    guard let myProcess = try system.process(for: myPID) else {
-      throw RecorderError.tapCreationFailed("own PID not found in CoreAudio")
+    // 1. Discover a display to drive the system-audio SCStream.
+    let content = try await SCShareableContent.excludingDesktopWindows(
+      false, onScreenWindowsOnly: false)
+    guard let display = content.displays.first else {
+      Log.error(Log.recorder, "recorder", "no display found for \(appName)")
+      throw RecorderError.noDisplay
     }
 
-    // 2. Create CATapDescription excluding own PID (global stereo tap)
-    let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [myProcess.id])
-    tapDescription.uuid = UUID()
-
-    // 3. Create process tap
-    let tap: AudioHardwareTap
-    do {
-      guard let created = try system.makeProcessTap(description: tapDescription) else {
-        throw RecorderError.tapCreationFailed("makeProcessTap returned nil")
-      }
-      tap = created
-    } catch let error as RecorderError {
-      throw error
-    } catch {
-      let audioError = error as? AudioHardwareError
-      if audioError?.error == OSStatus(kAudioHardwareBadObjectError) {
-        throw RecorderError.permissionDenied
-      }
-      throw RecorderError.tapCreationFailed("makeProcessTap failed: \(error)")
-    }
-    self.processTap = tap
-    Log.info(Log.recorder, "recorder", "created process tap #\(tap.id)")
-
-    // 4-6: Read tap format, output device, create aggregate. Clean up tap on any failure.
-    let callbackFormat: AVAudioFormat
-    do {
-      let tapFmt = try readTapStreamFormat(tap)
-      Log.info(
-        Log.recorder, "recorder",
-        "tap format: \(tapFmt.channelCount)ch, \(tapFmt.sampleRate)Hz, interleaved=\(tapFmt.isInterleaved)"
-      )
-
-      guard let outputDevice = try system.defaultOutputDevice else {
-        throw RecorderError.tapCreationFailed("no default output device")
-      }
-      let outputUID = try outputDevice.uid
-
-      let aggregate = try createAggregateDevice(
-        system: system, outputUID: outputUID, tapUUID: tapDescription.uuid)
-      self.aggregateDevice = aggregate
-      Log.info(Log.recorder, "recorder", "created aggregate device #\(aggregate.id)")
-
-      // IO proc delivers buffers at the aggregate device's rate (dictated by the
-      // output subdevice - e.g. 24kHz for AirPods HFP). `resampleToMono48k` converts
-      // to 48kHz on the hot path, so we just need a callback format that matches
-      // what the IO proc actually delivers.
-      let aggregateRate = readAggregateNominalRate(aggregate)
-      guard
-        let fmt = Self.catapCallbackFormat(
-          aggregateSampleRate: aggregateRate, channelCount: tapFmt.channelCount)
-      else {
-        throw RecorderError.tapCreationFailed(
-          "failed to build callback format for aggregate rate \(aggregateRate)Hz")
-      }
-      Log.info(
-        Log.recorder, "recorder",
-        "aggregate nominal rate: \(aggregateRate)Hz (tap native: \(tapFmt.sampleRate)Hz)")
-      callbackFormat = fmt
-      self.tapFormat = callbackFormat
-    } catch {
-      destroyTap()
-      throw error
-    }
+    // Display-wide audio capture (no window/app exclusions). SCStream's display
+    // mix is driven by the OS-composited output path, not a specific hardware
+    // clock, so it is resilient to idle/pinned/stalled output devices.
+    let filter = SCContentFilter(
+      display: display, excludingApplications: [], exceptingWindows: [])
+    let config = makeStreamConfig()
 
     do {
       let pipeline = RecordingPipeline(
@@ -211,33 +142,25 @@ actor AudioRecorder {
       try pipeline.start()
       self.pipeline = pipeline
 
-      // 8. Pre-allocate IO proc buffer pool so the RT-thread callback does no
-      // storage allocation (spec D5). Pool is visible before IO proc starts.
-      guard allocateIOProcBufferPool(format: callbackFormat) else {
-        throw RecorderError.tapCreationFailed("IO proc buffer pool allocation failed")
-      }
+      let proxy = SCStreamProxy(audioQueue: audioQueue)
+      proxy.recorder = self
+      self.streamProxy = proxy
 
-      // 9. Create IO proc on aggregate device
-      let capturedFormat = callbackFormat
-      let aggregate = self.aggregateDevice!
-      let ioProcBlock = makeIOProcBlock(format: capturedFormat)
-      let err = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregate.id, nil, ioProcBlock)
-      guard err == noErr else {
-        throw RecorderError.tapCreationFailed("AudioDeviceCreateIOProcIDWithBlock failed: \(err)")
-      }
+      let stream = SCStream(filter: filter, configuration: config, delegate: proxy)
+      try stream.addStreamOutput(proxy, type: .audio, sampleHandlerQueue: audioQueue)
 
-      // 10. Start IO proc
       activity = ProcessInfo.processInfo.beginActivity(
         options: .userInitiated,
         reason: "Recording call audio"
       )
-      try aggregate.start(IOProcID: ioProcID)
-      Log.info(Log.recorder, "recorder", "CATap started for \(appName)")
-      startDiskSpaceMonitor()
-      startDriftMonitor()
-      installOutputDeviceListener()
 
-      // 11. Start mic capture independently - failure does not stop system audio
+      try await stream.startCapture()
+      self.displayStream = stream
+      Log.info(Log.recorder, "recorder", "SCStream started for \(appName)")
+      startDiskSpaceMonitor()
+      if micEnabled { startDriftMonitor() }
+
+      // Start mic capture independently - failure does not stop system audio.
       if micEnabled {
         do {
           try startMicCapture()
@@ -250,10 +173,11 @@ actor AudioRecorder {
     } catch {
       Log.error(Log.recorder, "recorder", "recording setup failed for \(appName): \(error)")
       stopMicCapture()
-      removeOutputDeviceListener()
-      destroyIOProc()
-      destroyAggregateDevice()
-      destroyTap()
+      if let stream = displayStream {
+        try? await stream.stopCapture()
+        self.displayStream = nil
+      }
+      self.streamProxy = nil
       if let existingPipeline = self.pipeline {
         _ = await existingPipeline.stop()
         self.pipeline = nil
@@ -262,7 +186,7 @@ actor AudioRecorder {
         ProcessInfo.processInfo.endActivity(activity)
         self.activity = nil
       }
-      throw error
+      throw mappedStartError(error)
     }
   }
 
@@ -271,23 +195,20 @@ actor AudioRecorder {
   func stop() async -> URL? {
     Log.info(Log.recorder, "recorder", "stop() for \(appName)")
 
-    // Remove observer on MainActor (prevents new config change dispatches)
     if let observer = configChangeObserver {
       NotificationCenter.default.removeObserver(observer)
       configChangeObserver = nil
     }
 
-    // CATap teardown (order matters per spec D5)
-    removeOutputDeviceListener()
-    destroyIOProc()
-    destroyAggregateDevice()
-    destroyTap()
+    if let stream = displayStream {
+      try? await stream.stopCapture()
+    }
+    self.displayStream = nil
+    self.streamProxy = nil
 
-    // Capture engine ref, clear property on MainActor
     let capturedEngine = audioEngine
     audioEngine = nil
 
-    // All state mutations are actor-isolated (runs on audioQueue via custom executor)
     stopped = true
 
     // Mic teardown (serialized with config change handlers)
@@ -303,7 +224,7 @@ actor AudioRecorder {
     let systemStats = diagnostics?.system ?? TrackDiagnostics()
     Log.info(
       Log.recorder, "recorder",
-      "system stats: received=\(systemStats.buffersReceived) appended=\(systemStats.buffersAppended) notReady=\(systemStats.buffersDroppedNotReady) appendFail=\(systemStats.buffersAppendFailed) gapsFilled=\(systemStats.gapsFilled) tailPad=\(String(format: "%.3f", systemStats.tailPaddingSeconds))s"
+      "system stats: received=\(systemStats.buffersReceived) appended=\(systemStats.buffersAppended) notReady=\(systemStats.buffersDroppedNotReady) convFail=\(systemBuffersConversionFailed) appendFail=\(systemStats.buffersAppendFailed) gapsFilled=\(systemStats.gapsFilled) tailPad=\(String(format: "%.3f", systemStats.tailPaddingSeconds))s"
     )
     if micEnabled {
       let micStats = diagnostics?.mic ?? TrackDiagnostics()
@@ -321,7 +242,6 @@ actor AudioRecorder {
     driftStartHost = 0
     lowDiskSpaceWarned = false
     micTapFormat = nil
-    tapFormat = nil
     micLatencyOffset = 0
     micLatencyOffsetTicks = 0
     let pipeline = self.pipeline
@@ -336,345 +256,123 @@ actor AudioRecorder {
     return savedURL
   }
 
-  // MARK: - CATap Lifecycle Helpers
+  // MARK: - SCStream Configuration
 
-  private func destroyIOProc() {
-    guard let ioProcID, let aggregate = aggregateDevice else { return }
-    try? aggregate.stop(IOProcID: ioProcID)
-    AudioDeviceDestroyIOProcID(aggregate.id, ioProcID)
-    self.ioProcID = nil
-    // IO proc is torn down - safe to release the pool (no more callbacks possible)
-    releaseIOProcBufferPool()
+  /// Builds the audio-only SCStreamConfiguration. The tiny 2x2 frame and
+  /// infinite `minimumFrameInterval` suppress video pipeline overhead; only
+  /// the `.audio` output is subscribed.
+  private func makeStreamConfig() -> SCStreamConfiguration {
+    let config = SCStreamConfiguration()
+    config.width = 2
+    config.height = 2
+    config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+    config.showsCursor = false
+    config.capturesAudio = true
+    config.sampleRate = Int(RecordingPipeline.writerSampleRate)
+    config.channelCount = 2
+    config.excludesCurrentProcessAudio = true
+    config.captureMicrophone = false
+    return config
   }
 
-  /// Allocates the IO proc buffer pool for the given callback format.
-  /// Must be called on audioQueue (actor-isolated) before creating the IO proc
-  /// so that pool visibility is established before any RT-thread callback fires.
-  private func allocateIOProcBufferPool(format: AVAudioFormat) -> Bool {
-    releaseIOProcBufferPool()
-    var pool: [AVAudioPCMBuffer] = []
-    pool.reserveCapacity(Self.ioProcBufferPoolSize)
-    for _ in 0..<Self.ioProcBufferPoolSize {
-      guard
-        let buf = AVAudioPCMBuffer(
-          pcmFormat: format, frameCapacity: Self.ioProcBufferMaxFrames)
-      else { return false }
-      pool.append(buf)
-    }
-    ioProcBufferPool = pool
-    ioProcCallbackCount = 0
-    return true
-  }
+  // MARK: - SCStream Callbacks (called from SCStreamProxy via assumeIsolated)
 
-  private func releaseIOProcBufferPool() {
-    ioProcBufferPool = []
-    ioProcCallbackCount = 0
-  }
-
-  private func destroyAggregateDevice() {
-    guard let aggregate = aggregateDevice else { return }
-    try? AudioHardwareSystem.shared.destroyAggregateDevice(aggregate)
-    aggregateDevice = nil
-  }
-
-  private func destroyTap() {
-    guard let tap = processTap else { return }
-    try? AudioHardwareSystem.shared.destroyProcessTap(tap)
-    processTap = nil
-  }
-
-  // MARK: - Output Device Change Listener
-
-  private func installOutputDeviceListener() {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-      guard let self else { return }
-      self.assumeIsolated { iso in
-        iso.handleOutputDeviceChange()
-      }
-    }
-    AudioObjectAddPropertyListenerBlock(
-      AudioObjectID(kAudioObjectSystemObject), &addr, audioQueue, block)
-    outputDeviceListenerBlock = block
-  }
-
-  private func removeOutputDeviceListener() {
-    guard let block = outputDeviceListenerBlock else { return }
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain)
-    AudioObjectRemovePropertyListenerBlock(
-      AudioObjectID(kAudioObjectSystemObject), &addr, audioQueue, block)
-    outputDeviceListenerBlock = nil
-  }
-
-  // MARK: - Aggregate Device Helpers
-
-  private func createAggregateDevice(
-    system: AudioHardwareSystem, outputUID: String, tapUUID: UUID
-  ) throws -> AudioHardwareAggregateDevice {
-    let aggregateUID = UUID().uuidString
-    let description: [String: Any] = [
-      kAudioAggregateDeviceNameKey: "Blackbox-Tap",
-      kAudioAggregateDeviceUIDKey: aggregateUID,
-      kAudioAggregateDeviceMainSubDeviceKey: outputUID,
-      kAudioAggregateDeviceIsPrivateKey: true,
-      kAudioAggregateDeviceIsStackedKey: false,
-      kAudioAggregateDeviceTapAutoStartKey: true,
-      kAudioAggregateDeviceSubDeviceListKey: [
-        [kAudioSubDeviceUIDKey: outputUID]
-      ],
-      kAudioAggregateDeviceTapListKey: [
-        [
-          kAudioSubTapDriftCompensationKey: true,
-          kAudioSubTapUIDKey: tapUUID.uuidString,
-        ]
-      ],
-    ]
-    guard let aggregate = try system.makeAggregateDevice(description: description) else {
-      throw RecorderError.tapCreationFailed("makeAggregateDevice returned nil")
-    }
-    return aggregate
-  }
-
-  private func readTapStreamFormat(_ tap: AudioHardwareTap) throws -> AVAudioFormat {
-    var streamDesc = try tap.format
-    guard let format = AVAudioFormat(streamDescription: &streamDesc) else {
-      throw RecorderError.tapCreationFailed("invalid tap stream format")
-    }
-    return format
-  }
-
-  /// Reads the aggregate device's nominal sample rate. The rate is dictated by
-  /// the output subdevice (e.g. AirPods HFP pins it at 24kHz) - we do not write it.
-  private func readAggregateNominalRate(
-    _ aggregate: AudioHardwareAggregateDevice
-  ) -> Double {
-    (try? aggregate.nominalSampleRate) ?? 0
-  }
-
-  /// Builds the interleaved Float32 AVAudioFormat that wraps IO proc buffers.
-  /// The rate must match the aggregate's actual delivery rate; resampling to
-  /// 48kHz happens downstream in `RecordingPipeline.resampleToMono48k`.
-  nonisolated static func catapCallbackFormat(
-    aggregateSampleRate: Double,
-    channelCount: UInt32
-  ) -> AVAudioFormat? {
-    guard aggregateSampleRate > 0, channelCount > 0 else { return nil }
-    return AVAudioFormat(
-      commonFormat: .pcmFormatFloat32,
-      sampleRate: aggregateSampleRate,
-      channels: AVAudioChannelCount(channelCount),
-      interleaved: true)
-  }
-
-  /// Creates a mic tap handler that dispatches to audioQueue.
-  nonisolated private func makeMicTapHandler()
-    -> @Sendable (AVAudioPCMBuffer, AVAudioTime) ->
-    Void
-  {
-    return { [weak self] buffer, when in
-      guard let self else { return }
-      self.audioQueue.async { [weak self] in
-        guard let self else { return }
-        self.assumeIsolated { iso in
-          iso.handleMicBuffer(buffer, at: when)
-        }
-      }
-    }
-  }
-
-  /// Creates an IO proc callback block that copies audio data and dispatches to audioQueue.
-  /// Used by both start() and handleOutputDeviceChange() to avoid duplication.
+  /// Handles a system-audio CMSampleBuffer delivered by SCStream on `audioQueue`.
   ///
-  /// Spec D5: the callback runs on a CoreAudio RT thread and must be RT-safe -
-  /// no storage allocations. We memcpy into a pre-allocated pool slot and dispatch
-  /// the slot reference. `frameLength` is set on audioQueue (not the RT thread).
-  nonisolated private func makeIOProcBlock(format: AVAudioFormat) -> AudioDeviceIOBlock {
-    let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
-    let isInterleaved = format.isInterleaved
-    let channelCount = Int(format.channelCount)
-    let sourceRate = format.sampleRate
-    let poolSize = UInt64(Self.ioProcBufferPoolSize)
-    let maxFrames = Self.ioProcBufferMaxFrames
+  /// SCStream produces 48 kHz stereo interleaved Float32. The writer is mono,
+  /// so we downmix through `RecordingPipeline.resampleToMono48k` (at 48 kHz the
+  /// ratio is 1.0 so only the L+R downmix runs). The original PTS is preserved
+  /// through the PCM round-trip so gap filling and session alignment keep
+  /// working unchanged.
+  fileprivate func handleSystemSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    guard !stopped else { return }
+    guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
-    return { [weak self] _, inInputData, inInputTime, _, _ in
-      guard let self else { return }
-      let mutableABL = UnsafeMutablePointer<AudioBufferList>(mutating: inInputData)
-      let abl = UnsafeMutableAudioBufferListPointer(mutableABL)
-      guard abl.count > 0, let firstSrc = abl[0].mData else { return }
-      let firstByteCount = Int(abl[0].mDataByteSize)
-      guard bytesPerFrame > 0 else { return }
-      let frameCount = AVAudioFrameCount(firstByteCount / bytesPerFrame)
-      guard frameCount > 0, frameCount <= maxFrames else { return }
+    let originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let hostTicks = CMClockConvertHostTimeToSystemUnits(originalPTS)
+    lastSystemHostTime = hostTicks
 
-      // Pick next slot from pool (IO proc thread is the sole writer of the counter)
-      let pool = self.ioProcBufferPool
-      guard pool.count == Int(poolSize) else { return }
-      let slot = Int(self.ioProcCallbackCount % poolSize)
-      self.ioProcCallbackCount &+= 1
-      let copy = pool[slot]
-
-      if isInterleaved {
-        guard let dst = copy.floatChannelData?[0] else { return }
-        memcpy(dst, firstSrc, firstByteCount)
-      } else {
-        let channels = min(channelCount, abl.count)
-        for ch in 0..<channels {
-          guard let src = abl[ch].mData, let dst = copy.floatChannelData?[ch]
-          else { return }
-          memcpy(dst, src, Int(abl[ch].mDataByteSize))
-        }
-      }
-
-      let hostTime = inInputTime.pointee.mHostTime
-      let audioTime = AVAudioTime(hostTime: hostTime)
-
-      self.audioQueue.async { [weak self] in
-        guard let self else { return }
-        self.assumeIsolated { iso in
-          iso.lastSystemHostTime = hostTime
-          copy.frameLength = frameCount
-          guard
-            let monoBuf = RecordingPipeline.resampleToMono48k(
-              copy, sourceRate: sourceRate),
-            let sampleBuffer = monoBuf.asSampleBuffer(timestamp: audioTime)
-          else { return }
-          iso.handleSystemSample(sampleBuffer)
-        }
-      }
+    guard let stereoBuffer = Self.pcmBuffer(from: sampleBuffer) else {
+      systemBuffersConversionFailed += 1
+      return
     }
+    guard
+      let monoBuffer = RecordingPipeline.resampleToMono48k(
+        stereoBuffer, sourceRate: stereoBuffer.format.sampleRate)
+    else {
+      systemBuffersConversionFailed += 1
+      return
+    }
+    guard
+      let monoSample = monoBuffer.asSampleBuffer(
+        timestamp: AVAudioTime(hostTime: hostTicks))
+    else {
+      systemBuffersConversionFailed += 1
+      return
+    }
+    pipeline?.appendSystemSample(monoSample)
   }
 
-  /// Rebuilds aggregate device and IO proc when system output device changes.
-  /// Gap during rebuild is handled by D8 silence gap filling.
-  private func handleOutputDeviceChange() {
+  /// SCStream delegate reported that the stream stopped. Map the error to
+  /// the recovery vocabulary `AudioMonitor` understands.
+  fileprivate func handleStreamStopped(code: Int, description: String) {
     guard !stopped else { return }
-    onContinuityEvent?(.outputDeviceChanged)
-    Log.info(Log.recorder, "recorder", "output device changed, rebuilding aggregate device")
-
-    let system = AudioHardwareSystem.shared
-
-    // Tear down IO proc, aggregate, and tap - recreate all with new output device
-    destroyIOProc()
-    destroyAggregateDevice()
-    destroyTap()
-
-    // Read new output device
-    guard let outputDevice = try? system.defaultOutputDevice,
-      let outputUID = try? outputDevice.uid
-    else {
-      Log.error(Log.recorder, "recorder", "failed to read new output device after change")
-      onFailure?(.systemStopped)
-      return
+    let failure: RecorderFailure
+    switch code {
+    case -3801: failure = .permissionDenied
+    case -3802, -3821: failure = .systemStopped
+    default: failure = .other(description)
     }
-
-    // Recreate process tap
-    let myPID = ProcessInfo.processInfo.processIdentifier
-    guard let myProcess = try? system.process(for: myPID) else {
-      Log.error(Log.recorder, "recorder", "PID translation failed during device change")
-      onFailure?(.systemStopped)
-      return
-    }
-
-    let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [myProcess.id])
-    tapDescription.uuid = UUID()
-
-    guard let newTap = try? system.makeProcessTap(description: tapDescription) else {
-      Log.error(Log.recorder, "recorder", "process tap recreation failed during device change")
-      onFailure?(.systemStopped)
-      return
-    }
-    self.processTap = newTap
-
-    // Recreate aggregate device
-    guard
-      let aggregate = try? createAggregateDevice(
-        system: system, outputUID: outputUID, tapUUID: tapDescription.uuid)
-    else {
-      Log.error(
-        Log.recorder, "recorder",
-        "aggregate device recreation failed during device change")
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
-    }
-    self.aggregateDevice = aggregate
-
-    // Read the rebuilt aggregate's rate and build the callback format from it.
-    // The new output device dictates the rate; we just follow.
-    let aggregateRate = readAggregateNominalRate(aggregate)
-    let tapChannels: UInt32
-    do {
-      tapChannels = try readTapStreamFormat(newTap).channelCount
-    } catch {
-      Log.error(Log.recorder, "recorder", "failed to read rebuilt tap format: \(error)")
-      destroyAggregateDevice()
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
-    }
-    guard
-      let callbackFormat = Self.catapCallbackFormat(
-        aggregateSampleRate: aggregateRate, channelCount: tapChannels)
-    else {
-      Log.error(
-        Log.recorder, "recorder",
-        "failed to build callback format after device change (rate=\(aggregateRate)Hz)")
-      destroyAggregateDevice()
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
-    }
-    Log.info(
+    Log.error(
       Log.recorder, "recorder",
-      "rebuilt aggregate nominal rate: \(aggregateRate)Hz")
-    self.tapFormat = callbackFormat
+      "SCStream stopped for \(appName) (code=\(code)): \(description)")
+    onFailure?(failure)
+  }
 
-    // Reallocate IO proc buffer pool for the rebuilt format (channel count or
-    // rate may have changed). destroyIOProc above already released the prior pool.
-    guard allocateIOProcBufferPool(format: callbackFormat) else {
-      Log.error(
-        Log.recorder, "recorder",
-        "IO proc buffer pool reallocation failed during device change")
-      destroyAggregateDevice()
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
+  /// Wraps start-time ScreenCaptureKit errors in `RecorderFailure`-friendly
+  /// `RecorderError` cases so the caller sees a stable failure surface.
+  private func mappedStartError(_ error: any Error) -> any Error {
+    let nsError = error as NSError
+    if nsError.domain == SCStreamErrorDomain, nsError.code == -3801 {
+      return RecorderError.permissionDenied
     }
+    return error
+  }
 
-    // Recreate IO proc using the actual callback format
-    let ioProcBlock = makeIOProcBlock(format: callbackFormat)
-    let err = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregate.id, nil, ioProcBlock)
-    guard err == noErr else {
-      Log.error(
-        Log.recorder, "recorder", "IO proc recreation failed during device change: \(err)")
-      destroyAggregateDevice()
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
-    }
+  /// Converts a CMSampleBuffer produced by SCStream (interleaved Float32 PCM)
+  /// into an AVAudioPCMBuffer so `resampleToMono48k` can be reused. Returns
+  /// nil for non-PCM or zero-sample buffers.
+  private static func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+    guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+      let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+    else { return nil }
 
-    do {
-      try aggregate.start(IOProcID: ioProcID)
-    } catch {
-      Log.error(
-        Log.recorder, "recorder", "AudioDeviceStart failed during device change: \(error)")
-      destroyIOProc()
-      destroyAggregateDevice()
-      destroyTap()
-      onFailure?(.systemStopped)
-      return
-    }
+    var asbd = asbdPointer.pointee
+    guard asbd.mFormatID == kAudioFormatLinearPCM,
+      (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+      asbd.mChannelsPerFrame > 0
+    else { return nil }
 
-    Log.info(
-      Log.recorder, "recorder",
-      "aggregate device rebuilt after output device change (new output: \(outputUID))")
-    scheduleMicRecoveryAfterOutputDeviceChange()
+    guard let format = AVAudioFormat(streamDescription: &asbd) else { return nil }
+
+    let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+    guard frameCount > 0 else { return nil }
+
+    guard
+      let pcmBuffer = AVAudioPCMBuffer(
+        pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount))
+    else { return nil }
+    pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
+
+    guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+      let dst = pcmBuffer.floatChannelData?[0]
+    else { return nil }
+
+    let byteCount = CMBlockBufferGetDataLength(blockBuffer)
+    let status = CMBlockBufferCopyDataBytes(
+      blockBuffer, atOffset: 0, dataLength: byteCount, destination: dst)
+    guard status == noErr else { return nil }
+    return pcmBuffer
   }
 
   // MARK: - AVAudioEngine Mic Capture
@@ -779,41 +477,19 @@ actor AudioRecorder {
     }
   }
 
-  private func scheduleMicRecoveryAfterOutputDeviceChange() {
-    guard micEnabled else { return }
-    let baselineMicHostTime = lastMicHostTime
-    let scheduledGeneration = configChangeGeneration
-    audioQueue.asyncAfter(deadline: .now() + .milliseconds(900)) { [weak self] in
+  /// Creates a mic tap handler that dispatches to audioQueue.
+  nonisolated private func makeMicTapHandler()
+    -> @Sendable (AVAudioPCMBuffer, AVAudioTime) ->
+    Void
+  {
+    return { [weak self] buffer, when in
       guard let self else { return }
-      self.assumeIsolated { iso in
-        iso.recoverMicAfterOutputDeviceChangeIfNeeded(
-          baselineMicHostTime: baselineMicHostTime,
-          scheduledGeneration: scheduledGeneration)
+      self.audioQueue.async { [weak self] in
+        guard let self else { return }
+        self.assumeIsolated { iso in
+          iso.handleMicBuffer(buffer, at: when)
+        }
       }
-    }
-  }
-
-  private func recoverMicAfterOutputDeviceChangeIfNeeded(
-    baselineMicHostTime: UInt64,
-    scheduledGeneration: Int
-  ) {
-    guard !stopped, micEnabled else { return }
-    guard configChangeGeneration == scheduledGeneration else { return }
-    guard lastMicHostTime == baselineMicHostTime else { return }
-
-    Log.info(
-      Log.recorder, "recorder",
-      "mic appears stalled after output device change, recreating mic capture")
-    stopMicCapture()
-    do {
-      try startMicCapture()
-      Log.info(
-        Log.recorder, "recorder",
-        "mic capture recovered after output device change")
-    } catch {
-      Log.error(
-        Log.recorder, "recorder",
-        "mic capture recovery failed after output device change: \(error)")
     }
   }
 
@@ -972,9 +648,8 @@ actor AudioRecorder {
 
   // MARK: - Drift Monitoring
 
-  /// Logs the raw mic-vs-system `hostTime` delta every 5s. Raw (pre-D9) values
-  /// are used so we see the actual hardware offset and can judge whether D9 is
-  /// under- or over-compensating, and whether the two clocks drift over time.
+  /// Logs the raw mic-vs-system `hostTime` delta every 5s. Only starts when mic
+  /// is enabled - without a mic track there is nothing to compare against.
   private func startDriftMonitor() {
     driftStartHost = mach_absolute_time()
     lastMicHostTime = 0
@@ -997,18 +672,10 @@ actor AudioRecorder {
     let now = mach_absolute_time()
     let elapsedMs = Double(AudioConvertHostTimeToNanos(now - driftStartHost)) / 1_000_000
 
-    let micReady = lastMicHostTime != 0
-    let sysReady = lastSystemHostTime != 0
-    guard micReady || sysReady else {
+    guard lastMicHostTime != 0, lastSystemHostTime != 0 else {
       Log.info(
         Log.recorder, "recorder",
-        "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s waiting for both streams")
-      return
-    }
-    guard micReady, sysReady else {
-      Log.info(
-        Log.recorder, "recorder",
-        "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s only \(micReady ? "mic" : "sys") firing"
+        "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s waiting (mic=\(lastMicHostTime != 0 ? "1" : "0") sys=\(lastSystemHostTime != 0 ? "1" : "0"))"
       )
       return
     }
@@ -1064,12 +731,48 @@ actor AudioRecorder {
   }
 }
 
-// MARK: - System Audio Handling
+// MARK: - SCStreamProxy
 
-extension AudioRecorder {
-  private func handleSystemSample(_ sampleBuffer: CMSampleBuffer) {
-    guard !stopped else { return }
-    pipeline?.appendSystemSample(sampleBuffer)
+/// NSObject delegate/output for SCStream. Actors cannot inherit from NSObject,
+/// so this thin proxy forwards callbacks into the actor. The sample handler runs
+/// on `audioQueue` (the same executor the actor uses), so `assumeIsolated` bridges
+/// synchronously. The delegate's `didStopWithError` may run on any queue, so it
+/// hops through `audioQueue.async` first.
+final class SCStreamProxy: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+  nonisolated(unsafe) weak var recorder: AudioRecorder?
+  private let audioQueue: DispatchSerialQueue
+
+  nonisolated init(audioQueue: DispatchSerialQueue) {
+    self.audioQueue = audioQueue
+    super.init()
+  }
+
+  nonisolated func stream(
+    _ stream: SCStream,
+    didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+    of type: SCStreamOutputType
+  ) {
+    guard type == .audio else { return }
+    guard let recorder else { return }
+    nonisolated(unsafe) let buffer = sampleBuffer
+    audioQueue.async { [weak recorder] in
+      guard let recorder else { return }
+      recorder.assumeIsolated { iso in
+        iso.handleSystemSampleBuffer(buffer)
+      }
+    }
+  }
+
+  nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
+    let code = (error as NSError).code
+    let description = error.localizedDescription
+    guard let recorder else { return }
+    audioQueue.async { [weak recorder] in
+      guard let recorder else { return }
+      recorder.assumeIsolated { iso in
+        iso.handleStreamStopped(code: code, description: description)
+      }
+    }
   }
 }
 
@@ -1143,15 +846,15 @@ extension AVAudioPCMBuffer {
 // MARK: - Error Types
 
 enum RecorderError: Error, LocalizedError {
+  case noDisplay
   case permissionDenied
   case writerFailed
-  case tapCreationFailed(String)
 
   var errorDescription: String? {
     switch self {
-    case .permissionDenied: "System audio recording permission denied"
+    case .noDisplay: "No display found"
+    case .permissionDenied: "Screen Recording permission denied"
     case .writerFailed: "Failed to start audio writer"
-    case .tapCreationFailed(let detail): "Audio tap setup failed: \(detail)"
     }
   }
 }

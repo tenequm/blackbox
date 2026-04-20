@@ -31,22 +31,22 @@ This document records architectural decisions and their reasoning. Implementatio
 │                        CAPTURE                                      │
 │                                                                     │
 │  ┌────────────────────────┐       ┌──────────────────────────────┐  │
-│  │  CATap (CoreAudio Tap) │       │     AVAudioEngine            │  │
+│  │  SCStream (ScreenCap)  │       │     AVAudioEngine            │  │
 │  │                        │       │                              │  │
-│  │  Global system audio   │       │  Mic via inputNode tap       │  │
-│  │  via aggregate device  │       │  Follows system default      │  │
+│  │  Display-wide system   │       │  Mic via inputNode tap       │  │
+│  │  audio (video disabled)│       │  Follows system default      │  │
 │  │  Excludes own PID      │       │                              │  │
-│  │  Drift compensation on │       │  PTS offset-compensated      │  │
+│  │                        │       │  PTS offset-compensated      │  │
 │  │                        │       │  via device latency query    │  │
 │  └───────────┬────────────┘       └──────────────┬───────────────┘  │
 │              │                                   │                  │
 │              ▼                                   ▼                  │
-│         AudioBufferList                    CMSampleBuffer           │
-│         (IO proc callback)                 (from PCM + hostTime     │
+│         CMSampleBuffer                     CMSampleBuffer           │
+│         (sample handler queue)             (from PCM + hostTime     │
 │              │                              - latency offset)       │
 │              ▼                                   │                  │
 │         AVAudioPCMBuffer                         │                  │
-│         (zero-copy wrap)                         │                  │
+│         (for downmix)                            │                  │
 │              │                                   │                  │
 └──────────────┼───────────────────────────────────┼──────────────────┘
                │                                   │
@@ -95,6 +95,8 @@ This document records architectural decisions and their reasoning. Implementatio
 **v0.6.0 (Mar 2026):** Chrome/WebRTC silence bug discovered - per-app SCStream delivers silence for Chrome calls due to private audio routing. Added display-wide SCStream as safety net, keeping per-app as best-effort AEC reference. Output became variable 2-3 track M4A. Added DTLN-aec CoreML post-processing for echo cancellation (D7).
 
 **v0.6.1 (Apr 2026):** Smoke testing revealed 8.64s desync over a 2-hour recording - AVAssetWriter collapses PTS gaps from mic device switches. Implemented silence gap filling (D8) to preserve timeline integrity across both pipelines.
+
+**v0.8.0 (Apr 2026):** Reverted system audio capture from CATap back to display-wide SCStream (D10 supersedes D5). CATap produced three distinct silent-recording bugs in 5 days, all rooted in aggregate-device clock-source fragility (hardware output clock idle/pinned/stalled). Display-wide SCStream's clock is OS-composited, decoupled from any specific device; it had a production track record in v0.6.0 with zero silent-recording reports. Onboarding actively requests Screen Recording permission via `CGRequestScreenCaptureAccess()`. All v0.7.0 infrastructure improvements preserved (actor model, RecordingPipeline, AudioMonitorDependencies DI, hardware smoke tests, D8 gap filling, D9 latency offset).
 
 **v0.7.0 (Apr 2026):** CATap migration (D5) replaces dual SCStream. Per-app track dropped. Fixed 2-track M4A (both tracks 1ch mono 48kHz 64kbps - system audio downmixed from stereo via `resampleToMono48k`). Device latency offset compensation (D9). Requires macOS 26.1+. Adopted CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, `AudioHardwareAggregateDevice`, `AudioHardwareProcess`) eliminating ~170 lines of C-level CoreAudio boilerplate. Converted AudioRecorder from class to Swift 6.2 actor with custom `DispatchSerialQueue` executor, replacing all `nonisolated(unsafe)` declarations with compile-time actor isolation safety. Fixed mic latency offset to use actual device sample rate and `AudioConvertNanosToHostTime` for correct Mach time conversion. Extracted `RecordingPipeline` from `AudioRecorder` (AVAssetWriter management, gap filling, tail padding, audio level metering) for testability. Introduced `AudioMonitorDependencies` for dependency injection into `AudioMonitor`, enabling deterministic integration tests with `TestClock` and `TestRecorderFactory`. Added hardware smoke tests via `BlackboxTestMode` file-based IPC - launches real app bundle, drives recording, verifies output file structure.
 
@@ -173,7 +175,7 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Why both:** Input+output together identifies processes that are both capturing mic and playing audio - the defining characteristic of a call. Filters out most false positives without maintaining a hardcoded list of known call apps.
 
-### D5: CATap for system audio (replaces dual SCStream)
+### D5: CATap for system audio (replaces dual SCStream) [SUPERSEDED by D10 in v0.8.0]
 
 **Decision:** Use CoreAudio Process Tap via Swift wrappers (`AudioHardwareSystem.shared.makeProcessTap`) and an aggregate device for all system audio capture. Replaces the previous dual-SCStream architecture (display-wide + per-app).
 
@@ -309,3 +311,37 @@ Convert to seconds: `offsetSeconds = inputLatencyFrames / device.nominalSampleRa
 **Production validation:** RecordKit (Nonstrict) uses a configurable `audioDelay` parameter (v0.51.0) for the same purpose. They added "additional audio delay logging for debugging" (v0.51.1) to help determine the right value per hardware configuration.
 
 **Reference:** CoreAudio latency formula from Apple engineer Dan Klingler (CoreAudio mailing list, July 2017) and sbooth's SO answer verified experimentally on MacBook Pro. Typical values at 48kHz: input = 114 (device) + 2404 (stream) + 40 (safety) = 2558 frames (~53ms), output = 71 + 424 + 11 = 506 frames (~11ms). Note: Klingler's original formula also includes IO buffer size (kAudioDevicePropertyBufferFrameSize, typically 512 frames), which represents the buffer fill time. Our formula omits it because AVAudioEngine's tap delivers at the engine's IO cycle boundary, making the buffer size latency implicit in the timestamp.
+
+### D10: Display-wide SCStream for system audio (supersedes D5 in v0.8.0)
+
+**Decision:** Revert system audio capture from CATap back to a single display-wide `SCStream` (ScreenCaptureKit). This is the same capture strategy as v0.6.0's safety-net stream, stripped of the per-app best-effort stream.
+
+**Why the reversal:** CATap produced three distinct silent-recording bugs in the 5 days after v0.7.0 shipped, all in the same failure class:
+
+1. **Apr 16:** Bluetooth HFP pins aggregate device at 24kHz; IO proc never fires.
+2. **Apr 17:** IO proc stops emitting when nothing plays; 18s post-call silence drop.
+3. **Apr 20:** Default-output device idle while Chrome Meet routed call audio to non-default output via in-page picker; full-hour mic-only recording.
+
+**Root cause:** CATap's aggregate-device IO proc fires on the main sub-device's hardware output clock. When that clock is idle, pinned, or stalled, the tap has audio to deliver but no ticks to deliver it on. This is structural to the CATap architecture, not fixable with config or watchdog logic - a watchdog restart hits the same idle clock, exhausts the 3-restart/30s budget, and turns 60 min of working-mic recording into ~45s of partial + error.
+
+**Why display-wide SCStream instead:** Its clock comes from the OS-composited mix, decoupled from any specific hardware output device. There is no scenario where an active app is producing audio but SCStream's clock stops ticking. v0.6.0 used display-wide SCStream as the critical backbone for weeks in production with zero silent-recording reports. Empirically bulletproof on the scenarios that break CATap.
+
+**Why D5's arguments no longer apply:**
+- **Permission UX:** On macOS 26.1+ (current deployment target), a Screen Recording grant also grants audio capture (see Permissions section). The permission argument for CATap is neutralized.
+- **Chrome silence bug:** That was a per-app SCStream bug, not a display-wide bug. Display-wide SCStream captures the composited mix and never had the Chrome silence issue.
+- **Latency:** Post-processing AEC doesn't require sub-10ms capture latency. SCStream's handler-queue latency is immaterial for call recording.
+
+**What's preserved from v0.7.0:**
+- Actor-based `AudioRecorder` with custom `DispatchSerialQueue` executor.
+- `RecordingPipeline` extraction for testability.
+- `AudioMonitorDependencies` DI with `TestClock`/`TestRecorderFactory`.
+- Hardware smoke test infrastructure (`BlackboxTestMode`, file-based IPC).
+- D8 silence gap filling.
+- D9 device latency offset compensation.
+- Swift 6.2 strict concurrency.
+
+**SCStream configuration (audio-only):** `capturesAudio = true`, `sampleRate = 48000`, `channelCount = 2`, `excludesCurrentProcessAudio = true`, minimal video (`width = 2`, `height = 2`, `minimumFrameInterval` at max timescale) to suppress video pipeline overhead. Filter: `SCContentFilter(display: firstDisplay, excludingApplications: [], exceptingWindows: [])`.
+
+**Error routing:** `SCStreamDelegate.didStopWithError` maps NSError codes to `RecorderFailure` (−3801 → `.permissionDenied`, −3802/−3821 → `.systemStopped`, other → `.other`), feeding the same AudioMonitor restart budget logic used for CATap.
+
+**Non-goals:** No per-app SCStream (v0.6.0 had it as best-effort AEC reference; marginal benefit, Chrome silence history). No new audio-RMS watchdog (SCStream surfaces permission/stop errors via `didStopWithError`; defer RMS watchdog until a silent-but-ticking failure is observed).

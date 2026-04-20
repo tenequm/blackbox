@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import SwiftUI
 import UserNotifications
 
@@ -99,19 +100,21 @@ struct OnboardingView: View {
       Text("System Audio Recording")
         .font(.title2.bold())
       Text(
-        "Blackbox captures system audio to record both sides of your calls. It never records your screen - only audio."
+        "Blackbox captures system audio to record both sides of your calls. On macOS, this uses the Screen Recording permission - but Blackbox never records your screen, only audio."
       )
       .multilineTextAlignment(.center)
       .foregroundStyle(.secondary)
       .frame(maxWidth: 360)
 
-      Text(
-        "macOS will ask for permission when your first recording starts. Click Allow when prompted."
-      )
+      Button("Open System Settings") {
+        if let url = URL(
+          string:
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
+        ) {
+          NSWorkspace.shared.open(url)
+        }
+      }
       .font(.caption)
-      .multilineTextAlignment(.center)
-      .foregroundStyle(.tertiary)
-      .frame(maxWidth: 360)
     }
   }
 
@@ -136,8 +139,9 @@ struct OnboardingView: View {
   }
 
   private func completeOnboarding() {
-    // CATap permission prompt appears automatically on first recording attempt.
-    // No manual pre-authorization needed, no app restart required.
+    if !CGPreflightScreenCaptureAccess() {
+      CGRequestScreenCaptureAccess()
+    }
     UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
     onComplete?()
   }
