@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-20
+
+### Fixed
+
+- Silent-recording protection: when the CATap IO proc fails to deliver any system-audio buffer within 10 seconds while the mic is firing, the recorder now escalates via `onFailure(.systemStopped)` and AudioMonitor restarts it within its existing 3-restart/30s budget. Covers the idle-output-clock case (non-default output routing in Meet), the Bluetooth HFP rate-pin case, and coreaudiod wedge cases that previously produced hour-long mic-only recordings.
+
 ## [0.7.0] - 2026-04-17
 
 ### Added

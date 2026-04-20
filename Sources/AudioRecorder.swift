@@ -78,6 +78,7 @@ actor AudioRecorder {
   private var lastMicHostTime: UInt64 = 0
   private var lastSystemHostTime: UInt64 = 0
   private var driftStartHost: UInt64 = 0
+  private var watchdogFired: Bool = false
 
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
@@ -979,6 +980,7 @@ actor AudioRecorder {
     driftStartHost = mach_absolute_time()
     lastMicHostTime = 0
     lastSystemHostTime = 0
+    watchdogFired = false
     let timer = DispatchSource.makeTimerSource(queue: audioQueue)
     timer.schedule(deadline: .now() + 5, repeating: 5)
     let handler: @Sendable () -> Void = { [weak self] in
@@ -1010,6 +1012,18 @@ actor AudioRecorder {
         Log.recorder, "recorder",
         "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s only \(micReady ? "mic" : "sys") firing"
       )
+      // Watchdog: if mic is delivering but CATap IO proc has not fired a single
+      // buffer after 10s, treat as systemStopped so AudioMonitor can restart.
+      // Catches idle-clock, HFP rate-pin, and coreaudiod-wedge failure modes
+      // that AudioDeviceStart did not surface. One-shot per recording session.
+      if !sysReady && micReady && !watchdogFired && elapsedMs > 10_000 {
+        watchdogFired = true
+        Log.error(
+          Log.recorder, "recorder",
+          "watchdog: system audio silent for \(String(format: "%.1f", elapsedMs / 1000))s with mic firing, escalating as systemStopped"
+        )
+        onFailure?(.systemStopped)
+      }
       return
     }
 
