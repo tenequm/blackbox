@@ -82,9 +82,8 @@ struct HardwareSmokeTests {
     )
     let originalOutput = try CoreAudioDevices.defaultOutputDevice()
     // Prefer a Bluetooth alternate when available so every run exercises the
-    // HFP renegotiation path — that's where the v0.7.x rate regression lived
-    // (forcing the aggregate to 48kHz while HFP pinned 24kHz). Round-trip
-    // A→B→A catches asymmetries where only one direction rebuilds cleanly.
+    // HFP renegotiation path. Round-trip A→B→A catches asymmetries where only
+    // one direction resumes cleanly.
     let alternateOutput = try #require(
       outputs.first(where: { $0 != originalOutput && CoreAudioDevices.isBluetooth($0) })
         ?? outputs.first(where: { $0 != originalOutput }),
@@ -173,17 +172,14 @@ struct HardwareSmokeTests {
       "Track durations diverged across output round-trip: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
     )
 
-    // Belt-and-suspenders: confirm the listener actually fired.
-    #expect(
-      BlackboxLogProbe.containsAfter(
-        "output device changed", since: logMarker),
-      "Expected 'output device changed' log line after \(logMarker) - listener may not have fired"
-    )
+    // SCStream handles default-output changes transparently; there is no
+    // explicit listener/log line to assert on. Track-duration divergence
+    // (above) and the sys_age floor (below) are what matter.
 
     if let maxSysAge = BlackboxLogProbe.maxSystemAgeAfter(since: logMarker) {
       #expect(
         maxSysAge < ageCeilingMs,
-        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). IO proc may have died."
+        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). SCStream audio may have stalled."
       )
     } else {
       Issue.record("No drift logs found after \(logMarker) - cannot verify sys_age")
@@ -374,7 +370,7 @@ enum BlackboxLogProbe {
     let deadline = Date().addingTimeInterval(timeoutSeconds)
     // Round `since` down to whole-second precision: the file logger writes
     // second-resolution timestamps, so a sub-second logMarker captured right
-    // before a listener fires can legitimately land in the same second as the
+    // before an event fires can legitimately land in the same second as the
     // log line we are looking for.
     let flooredSince = Date(timeIntervalSince1970: floor(since.timeIntervalSince1970))
     let logURL = URL(fileURLWithPath: NSHomeDirectory())
@@ -451,7 +447,7 @@ enum BlackboxLogProbe {
   }
 
   /// Extracts the maximum sys_age (system audio staleness) from drift logs after `since`.
-  /// A healthy sys_age is <100ms. If IO proc stops, sys_age grows unbounded.
+  /// A healthy sys_age is <100ms. If SCStream stalls, sys_age grows unbounded.
   static func maxSystemAgeAfter(since: Date, timeoutSeconds: TimeInterval = 2.0) -> Double? {
     maxAgeAfter(field: "sys_age", since: since, timeoutSeconds: timeoutSeconds)
   }
