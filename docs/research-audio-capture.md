@@ -2,6 +2,8 @@
 
 Research on system audio + mic capture synchronization on macOS, conducted April 2026.
 
+> **Status note (v0.8.0):** This document captures the research that motivated the v0.7.0 CATap migration. The CATap migration was reverted in v0.8.0 because CATap's clock source (aggregate-device hardware output clock) produced silent-recording failures whenever that clock was idle/pinned/stalled. Display-wide SCStream - same pipeline described under "Current Architecture (v0.6.0)" minus the per-app best-effort stream - is the shipping capture backend again. The CATap evaluation below is kept as historical context, not as a recommendation. See `specification.md` D10 for the revert rationale.
+
 ## Current Architecture (v0.6.0)
 
 - **System audio**: Dual SCStream (display-wide + per-app) via ScreenCaptureKit
