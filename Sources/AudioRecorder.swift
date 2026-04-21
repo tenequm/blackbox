@@ -25,7 +25,7 @@ actor AudioRecorder {
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
   nonisolated let onAudioLevel: (@Sendable (Float) -> Void)?
   nonisolated let onLowDiskSpace: (@Sendable (Int64) -> Void)?
-  nonisolated let onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+  nonisolated let onContinuity: (@Sendable () -> Void)?
 
   private nonisolated let audioQueue = DispatchSerialQueue(
     label: "com.tenequm.blackbox.audio")
@@ -36,6 +36,10 @@ actor AudioRecorder {
   // SCStream state
   private var displayStream: SCStream?
   private var streamProxy: SCStreamProxy?
+  // Cached lazily on the first audio buffer. `makeStreamConfig()` pins the format
+  // for the lifetime of the stream, so rebuilding `AVAudioFormat` per buffer is
+  // pure overhead on the hot path.
+  private var systemFormat: AVAudioFormat?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -47,7 +51,6 @@ actor AudioRecorder {
   private var activity: NSObjectProtocol?
   private var diskSpaceTimer: DispatchSourceTimer?
   private var lowDiskSpaceWarned = false
-  private var micTapFormat: AVAudioFormat?
   private var micBuffersConversionFailed: Int = 0
   private var systemBuffersConversionFailed: Int = 0
   private var configChangeGeneration: Int = 0
@@ -73,7 +76,7 @@ actor AudioRecorder {
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
     onAudioLevel: (@Sendable (Float) -> Void)? = nil,
     onLowDiskSpace: (@Sendable (Int64) -> Void)? = nil,
-    onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)? = nil
+    onContinuity: (@Sendable () -> Void)? = nil
   ) {
     self.bundleID = bundleID
     self.appName = appName
@@ -83,7 +86,7 @@ actor AudioRecorder {
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
     self.onLowDiskSpace = onLowDiskSpace
-    self.onContinuityEvent = onContinuityEvent
+    self.onContinuity = onContinuity
   }
 
   deinit {
@@ -205,6 +208,7 @@ actor AudioRecorder {
     }
     self.displayStream = nil
     self.streamProxy = nil
+    self.systemFormat = nil
 
     let capturedEngine = audioEngine
     audioEngine = nil
@@ -241,7 +245,6 @@ actor AudioRecorder {
     lastSystemHostTime = 0
     driftStartHost = 0
     lowDiskSpaceWarned = false
-    micTapFormat = nil
     micLatencyOffset = 0
     micLatencyOffsetTicks = 0
     let pipeline = self.pipeline
@@ -292,7 +295,7 @@ actor AudioRecorder {
     let hostTicks = CMClockConvertHostTimeToSystemUnits(originalPTS)
     lastSystemHostTime = hostTicks
 
-    guard let stereoBuffer = Self.pcmBuffer(from: sampleBuffer) else {
+    guard let stereoBuffer = pcmBuffer(from: sampleBuffer) else {
       systemBuffersConversionFailed += 1
       return
     }
@@ -341,19 +344,25 @@ actor AudioRecorder {
 
   /// Converts a CMSampleBuffer produced by SCStream (interleaved Float32 PCM)
   /// into an AVAudioPCMBuffer so `resampleToMono48k` can be reused. Returns
-  /// nil for non-PCM or zero-sample buffers.
-  private static func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
-    guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-      let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
-    else { return nil }
-
-    var asbd = asbdPointer.pointee
-    guard asbd.mFormatID == kAudioFormatLinearPCM,
-      (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-      asbd.mChannelsPerFrame > 0
-    else { return nil }
-
-    guard let format = AVAudioFormat(streamDescription: &asbd) else { return nil }
+  /// nil for non-PCM or zero-sample buffers. Caches the derived AVAudioFormat
+  /// on the first successful call — SCStream's configured format is invariant.
+  private func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+    let format: AVAudioFormat
+    if let cached = systemFormat {
+      format = cached
+    } else {
+      guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+        let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+      else { return nil }
+      var asbd = asbdPointer.pointee
+      guard asbd.mFormatID == kAudioFormatLinearPCM,
+        (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+        asbd.mChannelsPerFrame > 0,
+        let derived = AVAudioFormat(streamDescription: &asbd)
+      else { return nil }
+      systemFormat = derived
+      format = derived
+    }
 
     let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
     guard frameCount > 0 else { return nil }
@@ -413,7 +422,6 @@ actor AudioRecorder {
             "Invalid mic format: \(nativeFormat.sampleRate)Hz, \(nativeFormat.channelCount)ch"
         ])
     }
-    micTapFormat = nativeFormat
     Log.info(
       Log.recorder, "recorder",
       "mic format: \(nativeFormat.channelCount)ch, \(nativeFormat.sampleRate)Hz, device: \(deviceName) (\(inputDeviceID)), permission: \(authName)"
@@ -556,7 +564,7 @@ actor AudioRecorder {
   /// Reinstalls tap and restarts engine. System audio continues regardless.
   private func handleEngineConfigChange(engine: AVAudioEngine) {
     guard !stopped else { return }
-    onContinuityEvent?(.micConfigurationChanged)
+    onContinuity?()
     Log.info(Log.recorder, "recorder", "audio engine config changed, restarting mic capture")
 
     var inputNodeException: NSException?
@@ -752,14 +760,14 @@ final class SCStreamProxy: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
     of type: SCStreamOutputType
   ) {
-    guard type == .audio else { return }
-    guard let recorder else { return }
+    guard type == .audio, let recorder else { return }
+    // SCStream delivers on `audioQueue` (see `addStreamOutput(sampleHandlerQueue:)`),
+    // which is the recorder actor's executor, so `assumeIsolated` is synchronous
+    // and safe. `nonisolated(unsafe)` satisfies Swift 6's sending check across
+    // the task-isolated → actor-isolated boundary.
     nonisolated(unsafe) let buffer = sampleBuffer
-    audioQueue.async { [weak recorder] in
-      guard let recorder else { return }
-      recorder.assumeIsolated { iso in
-        iso.handleSystemSampleBuffer(buffer)
-      }
+    recorder.assumeIsolated { iso in
+      iso.handleSystemSampleBuffer(buffer)
     }
   }
 

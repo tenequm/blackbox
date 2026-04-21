@@ -117,9 +117,8 @@ struct HardwareSmokeTests {
     try client.playSystemAudioFixture()
     try await Task.sleep(for: .seconds(2))
 
-    // Phase 2: A → B. Listener on kAudioHardwarePropertyDefaultOutputDevice
-    // tears down the CATap + aggregate, rebuilds, resumes the IO proc.
-    // D8 handles the silence gap.
+    // Phase 2: A → B. SCStream handles output-device changes transparently;
+    // any transient silence is filled by D8.
     try CoreAudioDevices.setDefaultOutputDevice(alternateOutput)
     try await Task.sleep(for: .seconds(2))
     try client.playSystemAudioFixture()

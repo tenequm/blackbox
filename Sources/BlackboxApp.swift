@@ -333,7 +333,7 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
 // MARK: - Helpers
 
 /// Maps audio RMS level to a waveform SF Symbol.
-/// Thresholds tuned for typical call audio captured via CATap.
+/// Thresholds tuned for typical call audio.
 private func recordingWaveformIcon(level: Float) -> String {
   if level > 0.05 {
     return "waveform"

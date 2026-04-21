@@ -16,18 +16,13 @@ struct RecorderSessionConfiguration: Sendable {
   var isManualRecording: Bool
 }
 
-enum RecorderContinuityEvent: Sendable {
-  case outputDeviceChanged
-  case micConfigurationChanged
-}
-
 protocol RecorderSessionFactory {
   func makeRecorder(
     configuration: RecorderSessionConfiguration,
     onFailure: (@Sendable (RecorderFailure) -> Void)?,
     onAudioLevel: (@Sendable (Float) -> Void)?,
     onLowDiskSpace: (@Sendable (Int64) -> Void)?,
-    onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+    onContinuity: (@Sendable () -> Void)?
   ) -> any RecorderSession
 }
 
@@ -37,7 +32,7 @@ struct LiveRecorderSessionFactory: RecorderSessionFactory {
     onFailure: (@Sendable (RecorderFailure) -> Void)?,
     onAudioLevel: (@Sendable (Float) -> Void)?,
     onLowDiskSpace: (@Sendable (Int64) -> Void)?,
-    onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+    onContinuity: (@Sendable () -> Void)?
   ) -> any RecorderSession {
     AudioRecorder(
       bundleID: configuration.bundleID,
@@ -48,7 +43,7 @@ struct LiveRecorderSessionFactory: RecorderSessionFactory {
       onFailure: onFailure,
       onAudioLevel: onAudioLevel,
       onLowDiskSpace: onLowDiskSpace,
-      onContinuityEvent: onContinuityEvent
+      onContinuity: onContinuity
     )
   }
 }

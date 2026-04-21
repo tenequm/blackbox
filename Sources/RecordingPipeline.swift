@@ -257,10 +257,10 @@ final class RecordingPipeline: @unchecked Sendable {
   /// Finalizes the writer and returns the output URL.
   ///
   /// Intentionally `nonisolated` because the caller (`AudioRecorder.stop`) drains
-  /// the pipeline before invoking this: the CATap IO proc is destroyed, the
-  /// aggregate device is torn down, and the AVAudioEngine mic tap is removed.
-  /// After those teardown steps, no new buffers can enqueue onto audioQueue,
-  /// so this method has no work to serialize against.
+  /// the pipeline before invoking this: the SCStream is stopped and the
+  /// AVAudioEngine mic tap is removed. After those teardown steps, no new
+  /// buffers can enqueue onto audioQueue, so this method has no work to
+  /// serialize against.
   ///
   /// Do not call while any buffer source is still live - the `nonisolated(unsafe)`
   /// state inside the pipeline assumes all writes happen on audioQueue.

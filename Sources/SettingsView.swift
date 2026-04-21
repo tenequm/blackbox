@@ -221,7 +221,9 @@ struct SettingsView: View {
   // MARK: - Permissions Refresh
 
   private func refreshPermissions() {
-    // CATap has no preflight API - show as granted if app has recorded successfully before
+    // Show as granted if the app has recorded successfully before. TCC state is
+    // authoritative only at capture time; the cached bool avoids a misleading
+    // "not granted" display before the user has triggered any recording.
     audioRecordingGranted = UserDefaults.standard.bool(forKey: "audioRecordingGranted")
     micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     Task {
