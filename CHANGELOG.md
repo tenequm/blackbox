@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Silent system-audio track on FaceTime (and any app routing through communication audio paths on macOS 26). SCStream delivers non-interleaved stereo Float32 CMSampleBuffers; the PCM round-trip helper inherited from the CATap era mis-copied non-interleaved payloads, producing system tracks with mean_volume near -66 dB. SCStream buffers are now appended directly to a stereo 128 kbps AAC writer input (v0.6.0 parity). Post-fix: FaceTime system track mean_volume -37.8 dB (from -66.4 dB); Chrome -27.1 dB.
+
+### Changed
+
+- System-audio track is now 2ch stereo 48 kHz 128 kbps AAC (was 1ch mono 64 kbps). Mic track remains 1ch mono 48 kHz 64 kbps. File size for a 30 min call: system track ~29 MB (was ~14 MB).
+- Gap fill (D8), leading silence, and tail padding apply to the mic track only. System track has no synthesised silence - matches v0.6.0 which shipped without system-track gap fill for weeks.
+- Settings > Permissions row relabelled "Screen & System Audio Recording"; deep-links to the Screen Recording pane; uses `CGPreflightScreenCaptureAccess()` for live TCC state instead of a "recorded once" cache.
+
+### Removed
+
+- `AudioRecorder.pcmBuffer(from:)` (interleaved-only PCM helper - root cause of the FaceTime silence on macOS 26), `systemFormat` cache, `systemBuffersConversionFailed` counter.
+
 ## [0.8.0] - 2026-04-20
 
 ### Changed
