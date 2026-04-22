@@ -27,3 +27,7 @@ DerivedData/
 
 # Claude Code
 **/.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Collab scratch (specs, codex output)
+.collab/
