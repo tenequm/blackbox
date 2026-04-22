@@ -54,9 +54,10 @@ This document records architectural decisions and their reasoning. Implementatio
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   RESAMPLE & DOWNMIX                                │
 │                                                                     │
-│  resampleToMono48k(): stereo→mono downmix (L+R avg),               │
+│  Mic: resampleToMono48k(): stereo→mono downmix (L+R avg),          │
 │  sample rate conversion via linear interpolation to 48kHz           │
-│  Both pipelines output 1ch mono Float32 at 48kHz                    │
+│  Mic pipeline outputs 1ch mono Float32 at 48kHz.                    │
+│  System pipeline passes SCStream stereo 48kHz Float32 through.      │
 │                                                                     │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
@@ -76,7 +77,7 @@ This document records architectural decisions and their reasoning. Implementatio
 │                        WRITING                                      │
 │                                                                     │
 │  AVAssetWriter → 2 track M4A (AAC, 48kHz)                          │
-│    Track 0: system audio (1ch mono, 64kbps)                         │
+│    Track 0: system audio (2ch stereo, 128kbps)                      │
 │    Track 1: mic audio (1ch mono, 64kbps)                            │
 │  movieFragmentInterval = 10s (crash safety)                         │
 │  No post-processing, no mixing                                      │
@@ -217,7 +218,7 @@ Architectural decisions with reasoning and alternatives considered.
 **Aggregate device mic list filtering:** The CATap aggregate device may appear in the system's input device list (`kAudioHardwarePropertyDevices` with input scope). Filter it out when displaying available mics or when `AVAudioEngine` is selecting a default input device. RecordKit fixed this in v0.84.0 ("Filter out aggregate device from available microphone list").
 
 **Track layout (fixed at writer setup):**
-- Track 0: system audio (1ch mono, downmixed from stereo via `resampleToMono48k`)
+- Track 0: system audio (2ch stereo 48kHz 128kbps AAC, SCStream buffers appended directly)
 - Track 1: mic audio (when mic enabled, 1ch mono)
 
 **Production validation:** CATap is used in production by RecordKit (Nonstrict, commercial SDK, default since v0.82.0), Chromium (behind feature flag since 2025), and audiotee (powers talat.app, commercial meeting transcription).
@@ -341,3 +342,11 @@ Convert to seconds: `offsetSeconds = inputLatencyFrames / device.nominalSampleRa
 **Error routing:** `SCStreamDelegate.didStopWithError` maps NSError codes to `RecorderFailure` (−3801 → `.permissionDenied`, −3802/−3821 → `.systemStopped`, other → `.other`), feeding the same AudioMonitor restart budget logic used for CATap.
 
 **Non-goals:** No per-app SCStream (v0.6.0 had it as best-effort AEC reference; marginal benefit, Chrome silence history). No new audio-RMS watchdog (SCStream surfaces permission/stop errors via `didStopWithError`; defer RMS watchdog until a silent-but-ticking failure is observed).
+
+### D11: v0.8.1 - restore v0.6.0 system-audio ingest shape
+
+SCStream CMSampleBuffers are appended directly to a stereo 128 kbps AAC writer input. The v0.7.0/v0.8.0 PCM round-trip + `resampleToMono48k` downmix + re-wrap path is removed on the system track. The old helper (`pcmBuffer(from:)`) assumed interleaved PCM but SCStream on macOS 26 delivers non-interleaved stereo Float32; mis-copying non-interleaved payloads is the suspected root cause of silent FaceTime recordings.
+
+Mic track still resamples/downmixes to mono via `resampleToMono48k` - only the system-track ingest changes. Gap fill (D8), leading silence, and tail padding now apply to the mic track only; v0.6.0 shipped without system-track gap fill for weeks across Chrome, Zoom, Meet, and FaceTime. AEC post-processing is unchanged: the reader pulls track 0 with `AVNumberOfChannelsKey: 1` in its output settings and AVAssetReader auto-downmixes stereo source to mono on read.
+
+File-size trade-off: stereo 128 kbps vs mono 64 kbps means the system track roughly doubles on disk (~29 MB vs ~14 MB for a 30-minute call). Accepted - this is what v0.6.0 shipped with.

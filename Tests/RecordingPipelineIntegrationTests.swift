@@ -82,29 +82,6 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.mic.tailPaddingSeconds > 0)
   }
 
-  @Test("fills timeline gaps on the system track")
-  func fillsSystemTrackGap() async throws {
-    let (pipeline, root) = try makePipeline()
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    try pipeline.start()
-    // mic@0 queued (pending), sys@0 anchors session at 0, sys@4096 triggers gap fill.
-    pipeline.appendMicSample(makeSampleBuffer(startSample: 0))
-    pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
-    pipeline.appendSystemSample(makeSampleBuffer(startSample: 4096))
-    pipeline.appendMicSample(makeSampleBuffer(startSample: 1024))
-    pipeline.appendMicSample(makeSampleBuffer(startSample: 2048))
-
-    let outputDir = try #require(await pipeline.stop())
-    let diagnostics = pipeline.currentDiagnostics
-    let audioURL = outputDir.appending(path: "audio.m4a")
-    let durations = try await trackDurations(for: audioURL)
-
-    #expect(diagnostics.system.gapsFilled > 0)
-    #expect(durations.count == 2)
-    #expect(durations[0] > 0.08)
-  }
-
   @Test("session start anchors on max(first_sys_pts, first_mic_pts)")
   func sessionStartAnchorsOnLaterTrack() async throws {
     let (pipeline, root) = try makePipeline()
@@ -156,7 +133,7 @@ struct RecordingPipelineIntegrationTests {
     // Mic finally arrives - session starts at max(first_sys=0, first_mic=5000)=5000.
     pipeline.appendMicSample(makeSampleBuffer(startSample: 5000))
     pipeline.appendMicSample(makeSampleBuffer(startSample: 6024))
-    // A new system sample after session start is appended normally (with leading silence).
+    // A new system sample after session start is appended normally.
     pipeline.appendSystemSample(makeSampleBuffer(startSample: 6000))
 
     _ = await pipeline.stop()
@@ -166,10 +143,10 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.sessionStartTrack == .mic)
     #expect(diagnostics.sessionStartPTS == CMTime(value: 5000, timescale: 48_000).seconds)
     #expect(diagnostics.mic.buffersAppended == 2)
-    // sys@6000 is post-session, passes the sessionStart check (6000 > 5000) and appends
-    // after filling leading silence from 5000 to 6000.
+    // sys@6000 arrives post-session. With the v0.6.0 passthrough it is appended
+    // directly at its own PTS; no leading silence is synthesised on the system track.
     #expect(diagnostics.system.buffersAppended >= 1)
-    #expect(diagnostics.system.leadingSilenceBuffers >= 1)
+    #expect(diagnostics.system.leadingSilenceBuffers == 0)
   }
 
   @Test("session start times out when second track never fires")
@@ -470,30 +447,28 @@ struct RecordingPipelineIntegrationTests {
     #expect(durations[0] > 0)
   }
 
-  @Test("large PTS jump triggers gap fill and produces valid output")
-  func largePTSJumpTriggersGapFill() async throws {
+  @Test("large PTS jump on system track produces valid output without crashing")
+  func largePTSJumpOnSystemTrackProducesValidOutput() async throws {
     let (pipeline, root) = try makePipeline(micEnabled: false)
     defer { try? FileManager.default.removeItem(at: root) }
 
     try pipeline.start()
     pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
-    // 2-second jump at 48kHz
+    // 2-second jump at 48kHz. With the v0.6.0 passthrough we no longer synthesise
+    // silence to bridge the gap; AVAssetWriter is trusted to absorb the discontinuity.
     pipeline.appendSystemSample(makeSampleBuffer(startSample: 96_000))
 
     let outputDir = try #require(await pipeline.stop())
-    let diagnostics = pipeline.currentDiagnostics
     let durations = try await trackDurations(for: outputDir.appending(path: "audio.m4a"))
 
-    #expect(diagnostics.system.gapsFilled > 0)
     #expect(durations.count >= 1)
-    // Duration should be approximately 2 seconds (the gap) + 1024 samples of real audio
-    #expect(durations[0] > 1.9)
+    #expect(durations[0] > 0)
   }
 
   // MARK: - preserveAllContent mode (manual recordings)
 
   @Test("preserveAllContent: mic-first session then late system gets leading silence")
-  func preserveAllContentMicFirstLateSystem() async throws {
+  func preserveAllContentMicFirstLateSystemAppendsDirectly() async throws {
     let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
     defer { try? FileManager.default.removeItem(at: root) }
 
@@ -511,13 +486,14 @@ struct RecordingPipelineIntegrationTests {
     let durations = try await trackDurations(for: outputDir.appending(path: "audio.m4a"))
 
     #expect(durations.count == 2)
+    // Tracks still end at the same final time - mic tail padding equalises them -
+    // but the system track no longer synthesises leading silence under v0.6.0 parity.
     #expect(abs(durations[0] - durations[1]) < 0.01)
     #expect(diagnostics.sessionStartTrack == .mic)
     #expect(diagnostics.sessionStartPTS == 0.0)
-    #expect(diagnostics.system.leadingSilenceBuffers > 0)
-    #expect(abs(diagnostics.system.leadingSilenceSeconds - (1500.0 / 48_000.0)) < 0.001)
+    #expect(diagnostics.system.leadingSilenceBuffers == 0)
+    #expect(diagnostics.system.leadingSilenceSeconds == 0)
     #expect(diagnostics.mic.leadingSilenceBuffers == 0)
-    // All samples preserved - no drops.
     #expect(diagnostics.system.buffersDroppedBeforeSession == 0)
     #expect(diagnostics.mic.buffersDroppedBeforeSession == 0)
   }

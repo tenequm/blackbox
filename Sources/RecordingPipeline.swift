@@ -199,7 +199,16 @@ final class RecordingPipeline: @unchecked Sendable {
     )
     try metadata.save(in: dirURL)
 
-    let audioSettings: [String: Any] = [
+    // v0.6.0 parity: system track is stereo 128 kbps AAC so SCStream buffers
+    // can be appended directly. Mic track is mono 64 kbps AAC - the mic path
+    // resamples/downmixes to mono via `resampleToMono48k` before append.
+    let systemSettings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatMPEG4AAC,
+      AVSampleRateKey: Self.writerSampleRate,
+      AVNumberOfChannelsKey: 2,
+      AVEncoderBitRateKey: 128_000,
+    ]
+    let micSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
       AVSampleRateKey: Self.writerSampleRate,
       AVNumberOfChannelsKey: 1,
@@ -209,13 +218,13 @@ final class RecordingPipeline: @unchecked Sendable {
     let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
     newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
-    let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+    let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: systemSettings)
     systemInput.expectsMediaDataInRealTime = true
     newWriter.add(systemInput)
 
     var newMicInput: AVAssetWriterInput?
     if micEnabled {
-      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
       input.expectsMediaDataInRealTime = true
       newWriter.add(input)
       newMicInput = input
@@ -475,49 +484,51 @@ final class RecordingPipeline: @unchecked Sendable {
 
     let nextExpected = self[track].nextExpected
 
-    if !nextExpected.isValid, sessionStartTime.isValid,
-      let input = self[track].input,
-      CMTimeCompare(pts, sessionStartTime) > 0
-    {
-      let leadSeconds = CMTimeGetSeconds(pts - sessionStartTime)
-      if leadSeconds > 0.001 {
-        // D8: fill as much leading silence as the writer will take in one pass;
-        // back-pressure breaks out immediately without blocking audioQueue. The
-        // residual (if any) is retried by `fillGap` on the next appendSample.
-        let (leadingBuffers, _) = Self.fillGapFully(
-          from: sessionStartTime,
-          to: pts,
-          channelCount: 1,
-          sampleRate: Self.writerSampleRate,
-          input: input
-        )
-        if leadingBuffers > 0 {
-          diagnostics[track].leadingSilenceBuffers += leadingBuffers
-          diagnostics[track].leadingSilenceSeconds += leadSeconds
-          Log.info(
-            Log.recorder, "recorder",
-            "\(track.rawValue): filled \(String(format: "%.3f", leadSeconds))s leading silence with \(leadingBuffers) buffers"
+    // Silence gap fill runs on the mic track only. SCStream buffers are
+    // appended directly (v0.6.0 parity); generating format-matched stereo
+    // silence on the fly is brittle and v0.6.0 shipped without it.
+    if track == .mic {
+      if !nextExpected.isValid, sessionStartTime.isValid,
+        let input = self[track].input,
+        CMTimeCompare(pts, sessionStartTime) > 0
+      {
+        let leadSeconds = CMTimeGetSeconds(pts - sessionStartTime)
+        if leadSeconds > 0.001 {
+          let (leadingBuffers, _) = Self.fillGapFully(
+            from: sessionStartTime,
+            to: pts,
+            channelCount: 1,
+            sampleRate: Self.writerSampleRate,
+            input: input
           )
+          if leadingBuffers > 0 {
+            diagnostics[track].leadingSilenceBuffers += leadingBuffers
+            diagnostics[track].leadingSilenceSeconds += leadSeconds
+            Log.info(
+              Log.recorder, "recorder",
+              "\(track.rawValue): filled \(String(format: "%.3f", leadSeconds))s leading silence with \(leadingBuffers) buffers"
+            )
+          }
         }
       }
-    }
 
-    if let input = self[track].input, nextExpected.isValid {
-      let gap = CMTimeGetSeconds(pts - nextExpected)
-      if gap > 0.005 {
-        let (filled, _) = Self.fillGap(
-          from: nextExpected,
-          to: pts,
-          channelCount: 1,
-          sampleRate: Self.writerSampleRate,
-          input: input
-        )
-        if filled > 0 {
-          diagnostics[track].gapsFilled += filled
-          Log.info(
-            Log.recorder, "recorder",
-            "\(track.rawValue): filled \(String(format: "%.3f", gap))s gap with \(filled) silence buffers"
+      if let input = self[track].input, nextExpected.isValid {
+        let gap = CMTimeGetSeconds(pts - nextExpected)
+        if gap > 0.005 {
+          let (filled, _) = Self.fillGap(
+            from: nextExpected,
+            to: pts,
+            channelCount: 1,
+            sampleRate: Self.writerSampleRate,
+            input: input
           )
+          if filled > 0 {
+            diagnostics[track].gapsFilled += filled
+            Log.info(
+              Log.recorder, "recorder",
+              "\(track.rawValue): filled \(String(format: "%.3f", gap))s gap with \(filled) silence buffers"
+            )
+          }
         }
       }
     }
@@ -538,6 +549,9 @@ final class RecordingPipeline: @unchecked Sendable {
   }
 
   nonisolated private func padTailIfNeeded(for track: RecordingTrackKind, to finalEndTime: CMTime) {
+    // Tail padding runs on the mic track only - same rationale as the
+    // gap-fill guard in appendSample.
+    guard track == .mic else { return }
     let nextExpected = self[track].nextExpected
     guard let input = self[track].input, nextExpected.isValid,
       nextExpected < finalEndTime

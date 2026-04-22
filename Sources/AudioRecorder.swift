@@ -36,10 +36,6 @@ actor AudioRecorder {
   // SCStream state
   private var displayStream: SCStream?
   private var streamProxy: SCStreamProxy?
-  // Cached lazily on the first audio buffer. `makeStreamConfig()` pins the format
-  // for the lifetime of the stream, so rebuilding `AVAudioFormat` per buffer is
-  // pure overhead on the hot path.
-  private var systemFormat: AVAudioFormat?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -52,7 +48,6 @@ actor AudioRecorder {
   private var diskSpaceTimer: DispatchSourceTimer?
   private var lowDiskSpaceWarned = false
   private var micBuffersConversionFailed: Int = 0
-  private var systemBuffersConversionFailed: Int = 0
   private var configChangeGeneration: Int = 0
 
   // D9: device latency offset for mic-system alignment.
@@ -208,7 +203,6 @@ actor AudioRecorder {
     }
     self.displayStream = nil
     self.streamProxy = nil
-    self.systemFormat = nil
 
     let capturedEngine = audioEngine
     audioEngine = nil
@@ -228,7 +222,7 @@ actor AudioRecorder {
     let systemStats = diagnostics?.system ?? TrackDiagnostics()
     Log.info(
       Log.recorder, "recorder",
-      "system stats: received=\(systemStats.buffersReceived) appended=\(systemStats.buffersAppended) notReady=\(systemStats.buffersDroppedNotReady) convFail=\(systemBuffersConversionFailed) appendFail=\(systemStats.buffersAppendFailed) gapsFilled=\(systemStats.gapsFilled) tailPad=\(String(format: "%.3f", systemStats.tailPaddingSeconds))s"
+      "system stats: received=\(systemStats.buffersReceived) appended=\(systemStats.buffersAppended) notReady=\(systemStats.buffersDroppedNotReady) appendFail=\(systemStats.buffersAppendFailed)"
     )
     if micEnabled {
       let micStats = diagnostics?.mic ?? TrackDiagnostics()
@@ -282,38 +276,17 @@ actor AudioRecorder {
 
   /// Handles a system-audio CMSampleBuffer delivered by SCStream on `audioQueue`.
   ///
-  /// SCStream produces 48 kHz stereo interleaved Float32. The writer is mono,
-  /// so we downmix through `RecordingPipeline.resampleToMono48k` (at 48 kHz the
-  /// ratio is 1.0 so only the L+R downmix runs). The original PTS is preserved
-  /// through the PCM round-trip so gap filling and session alignment keep
-  /// working unchanged.
+  /// Matches v0.6.0 semantics: SCStream delivers the CMSampleBuffer in its
+  /// native 48 kHz stereo Float32 format and we append it directly to a stereo
+  /// 128 kbps AAC writer input. No PCM round-trip, no downmix, no re-wrap.
   fileprivate func handleSystemSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
     guard !stopped else { return }
     guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
-    let originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    let hostTicks = CMClockConvertHostTimeToSystemUnits(originalPTS)
-    lastSystemHostTime = hostTicks
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    lastSystemHostTime = CMClockConvertHostTimeToSystemUnits(pts)
 
-    guard let stereoBuffer = pcmBuffer(from: sampleBuffer) else {
-      systemBuffersConversionFailed += 1
-      return
-    }
-    guard
-      let monoBuffer = RecordingPipeline.resampleToMono48k(
-        stereoBuffer, sourceRate: stereoBuffer.format.sampleRate)
-    else {
-      systemBuffersConversionFailed += 1
-      return
-    }
-    guard
-      let monoSample = monoBuffer.asSampleBuffer(
-        timestamp: AVAudioTime(hostTime: hostTicks))
-    else {
-      systemBuffersConversionFailed += 1
-      return
-    }
-    pipeline?.appendSystemSample(monoSample)
+    pipeline?.appendSystemSample(sampleBuffer)
   }
 
   /// SCStream delegate reported that the stream stopped. Map the error to
@@ -340,48 +313,6 @@ actor AudioRecorder {
       return RecorderError.permissionDenied
     }
     return error
-  }
-
-  /// Converts a CMSampleBuffer produced by SCStream (interleaved Float32 PCM)
-  /// into an AVAudioPCMBuffer so `resampleToMono48k` can be reused. Returns
-  /// nil for non-PCM or zero-sample buffers. Caches the derived AVAudioFormat
-  /// on the first successful call — SCStream's configured format is invariant.
-  private func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
-    let format: AVAudioFormat
-    if let cached = systemFormat {
-      format = cached
-    } else {
-      guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-        let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
-      else { return nil }
-      var asbd = asbdPointer.pointee
-      guard asbd.mFormatID == kAudioFormatLinearPCM,
-        (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-        asbd.mChannelsPerFrame > 0,
-        let derived = AVAudioFormat(streamDescription: &asbd)
-      else { return nil }
-      systemFormat = derived
-      format = derived
-    }
-
-    let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-    guard frameCount > 0 else { return nil }
-
-    guard
-      let pcmBuffer = AVAudioPCMBuffer(
-        pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount))
-    else { return nil }
-    pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-    guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
-      let dst = pcmBuffer.floatChannelData?[0]
-    else { return nil }
-
-    let byteCount = CMBlockBufferGetDataLength(blockBuffer)
-    let status = CMBlockBufferCopyDataBytes(
-      blockBuffer, atOffset: 0, dataLength: byteCount, destination: dst)
-    guard status == noErr else { return nil }
-    return pcmBuffer
   }
 
   // MARK: - AVAudioEngine Mic Capture
