@@ -44,31 +44,28 @@ This document records architectural decisions and their reasoning. Implementatio
 │         CMSampleBuffer                     CMSampleBuffer           │
 │         (sample handler queue)             (from PCM + hostTime     │
 │              │                              - latency offset)       │
-│              ▼                                   │                  │
-│         AVAudioPCMBuffer                         │                  │
-│         (for downmix)                            │                  │
 │              │                                   │                  │
 └──────────────┼───────────────────────────────────┼──────────────────┘
                │                                   │
                ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                   RESAMPLE & DOWNMIX                                │
+│              RESAMPLE & DOWNMIX (mic track only)                    │
 │                                                                     │
-│  Mic: resampleToMono48k(): stereo→mono downmix (L+R avg),          │
-│  sample rate conversion via linear interpolation to 48kHz           │
+│  resampleToMono48k(): stereo→mono downmix (L+R avg),                │
+│  sample rate conversion via linear interpolation to 48kHz.          │
 │  Mic pipeline outputs 1ch mono Float32 at 48kHz.                    │
-│  System pipeline passes SCStream stereo 48kHz Float32 through.      │
+│  System pipeline (SCStream) bypasses this stage - stereo passthrough│
 │                                                                     │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              GAP DETECTION & FILL (RecordingPipeline)               │
+│           GAP DETECTION & FILL (mic track only)                     │
 │                                                                     │
-│  Per-track: track nextExpectedTime from PTS + duration              │
+│  Mic: track nextExpectedTime from PTS + duration                    │
 │  If incoming PTS > expected → write zero-filled silence buffers     │
-│  Tail padding: pad shorter track to common end time on stop         │
-│  Ensures AVAssetWriter receives continuous timeline (no gaps)       │
+│  Tail padding: pad shorter mic tail to common end time on stop      │
+│  System: SCStream CMSampleBuffer appended directly, no gap fill     │
 │                                                                     │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
@@ -99,7 +96,7 @@ This document records architectural decisions and their reasoning. Implementatio
 
 **v0.7.0 (Apr 2026):** CATap migration (D5) replaces dual SCStream. Per-app track dropped. Fixed 2-track M4A (both tracks 1ch mono 48kHz 64kbps - system audio downmixed from stereo via `resampleToMono48k`). Device latency offset compensation (D9). Requires macOS 26.1+. Adopted CoreAudio Swift wrappers (`AudioHardwareSystem`, `AudioHardwareTap`, `AudioHardwareAggregateDevice`, `AudioHardwareProcess`) eliminating ~170 lines of C-level CoreAudio boilerplate. Converted AudioRecorder from class to Swift 6.2 actor with custom `DispatchSerialQueue` executor, replacing all `nonisolated(unsafe)` declarations with compile-time actor isolation safety. Fixed mic latency offset to use actual device sample rate and `AudioConvertNanosToHostTime` for correct Mach time conversion. Extracted `RecordingPipeline` from `AudioRecorder` (AVAssetWriter management, gap filling, tail padding, audio level metering) for testability. Introduced `AudioMonitorDependencies` for dependency injection into `AudioMonitor`, enabling deterministic integration tests with `TestClock` and `TestRecorderFactory`. Added hardware smoke tests via `BlackboxTestMode` file-based IPC - launches real app bundle, drives recording, verifies output file structure.
 
-**v0.8.0 (Apr 2026):** Reverted system audio capture from CATap back to display-wide SCStream (D10 supersedes D5). CATap produced three distinct silent-recording bugs in 5 days, all rooted in aggregate-device clock-source fragility (hardware output clock idle/pinned/stalled). Display-wide SCStream's clock is OS-composited, decoupled from any specific device; it had a production track record in v0.6.0 with zero silent-recording reports. Onboarding actively requests Screen Recording permission via `CGRequestScreenCaptureAccess()`. All v0.7.0 infrastructure improvements preserved (actor model, RecordingPipeline, AudioMonitorDependencies DI, hardware smoke tests, D8 gap filling, D9 latency offset).
+**v0.8.0 (Apr 2026):** Reverted system audio capture from CATap back to display-wide SCStream (D10 supersedes D5). CATap produced three distinct silent-recording bugs in 5 days, all rooted in aggregate-device clock-source fragility (hardware output clock idle/pinned/stalled). Display-wide SCStream's clock is OS-composited, decoupled from any specific device; it had a production track record in v0.6.0 with zero silent-recording reports. Onboarding actively requests Screen Recording permission via `CGRequestScreenCaptureAccess()`. Restored v0.6.0's direct-append ingest shape (D11): SCStream CMSampleBuffers are appended to a stereo 128 kbps AAC writer input with no PCM round-trip or downmix, fixing a latent non-interleaved-stereo mis-copy that produced silent FaceTime recordings under the v0.7.0/v0.8.0-internal ingest helper. Gap fill (D8), leading silence, and tail padding now run on the mic track only. All v0.7.0 infrastructure improvements preserved (actor model, RecordingPipeline, AudioMonitorDependencies DI, hardware smoke tests, D9 latency offset).
 
 ---
 
@@ -142,11 +139,11 @@ Architectural decisions with reasoning and alternatives considered.
 - **SCStream `.microphone`** (macOS 15+): requires manual device following via CoreAudio listener + `updateConfiguration()`. On failure, recording splits into separate files. Tied to SCStream lifecycle. Documented bugs with corrupted files and XPC PID uncertainty.
 - **AVCaptureSession + AVCaptureAudioDataOutput**: gives CMSampleBuffer natively (no conversion), structured interruption notifications. But requires manual device switching - doesn't solve the core problem.
 
-**Why AVAudioEngine wins:** Automatic device following via inputNode. One `AVAudioEngineConfigurationChange` notification handler replaces ~140 lines of CoreAudio listener management. Device switches cause a sub-second gap in the same file instead of a recording split. Independent from CATap system audio pipeline - mic survives CATap aggregate device rebuild.
+**Why AVAudioEngine wins:** Automatic device following via inputNode. One `AVAudioEngineConfigurationChange` notification handler replaces ~140 lines of CoreAudio listener management. Device switches cause a sub-second gap in the same file instead of a recording split. Independent from SCStream system audio pipeline - mic survives SCStream stop/restart.
 
 **Device switch gap is unavoidable.** When `AVAudioEngineConfigurationChange` fires, the engine has already stopped itself internally. The tap must be removed and reinstalled with the new device's format. This is a platform limitation - the engine cannot survive a sample rate or channel count change without a restart. The 300ms debounce (for Krisp's rapid-fire config changes) dominates the gap duration; the actual reinstall takes <10ms. See D8 for how these gaps are filled with silence to prevent track desync.
 
-**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate (existing `asSampleBuffer()` extension). Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits`, then adjusted by the device latency offset (D9) for alignment with CATap system audio.
+**Tradeoff accepted:** ~30 lines of AVAudioPCMBuffer-to-CMSampleBuffer conversion boilerplate (existing `asSampleBuffer()` extension). Timestamps use `AVAudioTime.hostTime` (`mach_absolute_time`, wall clock) converted via `CMClockMakeHostTimeFromSystemUnits`, then adjusted by the device latency offset (D9) for alignment with SCStream system audio.
 
 ### D2: Remove post-recording audio mixing
 
@@ -217,10 +214,6 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Aggregate device mic list filtering:** The CATap aggregate device may appear in the system's input device list (`kAudioHardwarePropertyDevices` with input scope). Filter it out when displaying available mics or when `AVAudioEngine` is selecting a default input device. RecordKit fixed this in v0.84.0 ("Filter out aggregate device from available microphone list").
 
-**Track layout (fixed at writer setup):**
-- Track 0: system audio (2ch stereo 48kHz 128kbps AAC, SCStream buffers appended directly)
-- Track 1: mic audio (when mic enabled, 1ch mono)
-
 **Production validation:** CATap is used in production by RecordKit (Nonstrict, commercial SDK, default since v0.82.0), Chromium (behind feature flag since 2025), and audiotee (powers talat.app, commercial meeting transcription).
 
 **Reference implementations:** insidegui/AudioCap (490 stars, cleanest CATap pattern), graphaelli/audiotap (documents AudioDeviceStart hang and mic device following).
@@ -281,7 +274,7 @@ Architectural decisions with reasoning and alternatives considered.
 - *Low-level AUHAL AudioUnit for mic:* Reduces gap duration (~50ms vs ~300ms debounce) but doesn't eliminate it. Still needs silence filling. 200+ lines of C-level CoreAudio code for marginal improvement.
 - *AVCaptureSession for mic:* Still a separate pipeline from CATap, same cross-clock issue. No advantage over AVAudioEngine for this problem.
 
-**Scope:** Both pipelines (system audio, mic). Mic device switches are the most common source of gaps. SCStream is normally transparent across output device changes, but any momentary stall or restart in the sample handler also shows up as a PTS gap.
+**Scope:** Mic track only. System audio (SCStream) CMSampleBuffers are appended directly to a stereo AAC writer input with no synthesised silence (D11, v0.6.0 parity) - v0.6.0 shipped without system-track gap fill for weeks across Chrome, Zoom, Meet, and FaceTime, and constructing format-matched non-interleaved stereo silence on demand is brittle enough to reintroduce the risk the passthrough just removed. Mic device switches (Bluetooth connect/disconnect, Krisp activation) remain the common source of gaps and are filled as described above.
 
 ### D9: Device latency offset compensation for mic-system alignment
 
@@ -289,7 +282,7 @@ Architectural decisions with reasoning and alternatives considered.
 
 **The problem:** System audio and AVAudioEngine mic audio traverse different processing pipelines with different internal latencies. Even though both ultimately use `mach_absolute_time` for timestamps, the mic track arrives with a different offset than the system audio track. In practice, the mic track appears ~20-70ms ahead of system audio, depending on hardware. Without compensation, this causes audible echo/doubling when playing both tracks.
 
-**History:** D9 was added in v0.7.0 when the CATap backend made the offset large enough to be obviously audible. After reverting to display-wide SCStream in v0.8.0, D9 is kept as-is: the offset it corrects is a mic-side hardware latency, not a capture-backend property, so the fix is backend-agnostic. Empirical validation against the SCStream backend is pending the v0.8.0 regression pass.
+**History:** D9 was added in v0.7.0 when the CATap backend made the offset large enough to be obviously audible. After reverting to display-wide SCStream in v0.8.0, D9 is kept as-is: the offset it corrects is a mic-side hardware latency, not a capture-backend property, so the fix is backend-agnostic. Validated against the SCStream backend via hardware smoke test and live FaceTime/Chrome recordings - mic-system alignment holds under passthrough.
 
 **How offset is computed:** Query the input device's total latency in frames at recording start using CoreAudio Swift wrappers:
 
@@ -341,9 +334,9 @@ Convert to seconds: `offsetSeconds = inputLatencyFrames / device.nominalSampleRa
 
 **Error routing:** `SCStreamDelegate.didStopWithError` maps NSError codes to `RecorderFailure` (−3801 → `.permissionDenied`, −3802/−3821 → `.systemStopped`, other → `.other`), feeding the same AudioMonitor restart budget logic used for CATap.
 
-**Non-goals:** No per-app SCStream (v0.6.0 had it as best-effort AEC reference; marginal benefit, Chrome silence history). No new audio-RMS watchdog (SCStream surfaces permission/stop errors via `didStopWithError`; defer RMS watchdog until a silent-but-ticking failure is observed).
+**Non-goals:** No per-app SCStream (v0.6.0 had it as best-effort AEC reference; marginal benefit, Chrome silence history). No new audio-RMS watchdog (SCStream surfaces permission/stop errors via `didStopWithError`).
 
-### D11: v0.8.1 - restore v0.6.0 system-audio ingest shape
+### D11: Restore v0.6.0 system-audio ingest shape
 
 SCStream CMSampleBuffers are appended directly to a stereo 128 kbps AAC writer input. The v0.7.0/v0.8.0 PCM round-trip + `resampleToMono48k` downmix + re-wrap path is removed on the system track. The old helper (`pcmBuffer(from:)`) assumed interleaved PCM but SCStream on macOS 26 delivers non-interleaved stereo Float32; mis-copying non-interleaved payloads is the suspected root cause of silent FaceTime recordings.
 
