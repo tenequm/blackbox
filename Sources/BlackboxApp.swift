@@ -218,13 +218,13 @@ struct MenuContent: View {
 
     // Status
     if monitor.permissionNeeded {
-      Text("System Audio Recording permission required")
+      Text("Screen & System Audio Recording permission required")
         .foregroundStyle(.red)
       Button("Open System Settings") {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
           )!
         )
       }

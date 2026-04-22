@@ -146,6 +146,7 @@ actor AudioRecorder {
 
       let stream = SCStream(filter: filter, configuration: config, delegate: proxy)
       try stream.addStreamOutput(proxy, type: .audio, sampleHandlerQueue: audioQueue)
+      self.displayStream = stream
 
       activity = ProcessInfo.processInfo.beginActivity(
         options: .userInitiated,
@@ -153,7 +154,6 @@ actor AudioRecorder {
       )
 
       try await stream.startCapture()
-      self.displayStream = stream
       Log.info(Log.recorder, "recorder", "SCStream started for \(appName)")
       startDiskSpaceMonitor()
       if micEnabled { startDriftMonitor() }
@@ -199,7 +199,15 @@ actor AudioRecorder {
     }
 
     if let stream = displayStream {
-      try? await stream.stopCapture()
+      // Race stopCapture against a 3s timeout so a hung SCStream (documented
+      // under WindowServer stalls) cannot exceed applicationShouldTerminate's
+      // 8s budget and corrupt the recording.
+      await withTaskGroup(of: Void.self) { group in
+        group.addTask { try? await stream.stopCapture() }
+        group.addTask { try? await Task.sleep(for: .seconds(3)) }
+        await group.next()
+        group.cancelAll()
+      }
     }
     self.displayStream = nil
     self.streamProxy = nil
@@ -283,8 +291,10 @@ actor AudioRecorder {
     guard !stopped else { return }
     guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
-    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    lastSystemHostTime = CMClockConvertHostTimeToSystemUnits(pts)
+    // Host ticks of callback arrival - symmetric with the mic path, which
+    // records `AVAudioTime.hostTime` from its tap callback. Avoids assuming
+    // SCStream's PTS sits on the host-time clock.
+    lastSystemHostTime = mach_absolute_time()
 
     pipeline?.appendSystemSample(sampleBuffer)
   }

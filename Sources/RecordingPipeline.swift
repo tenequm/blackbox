@@ -282,7 +282,6 @@ final class RecordingPipeline: @unchecked Sendable {
       .max { $0.seconds < $1.seconds }
 
     if let finalEndTime {
-      padTailIfNeeded(for: .system, to: finalEndTime)
       padTailIfNeeded(for: .mic, to: finalEndTime)
     }
 

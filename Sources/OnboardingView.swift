@@ -32,8 +32,7 @@ struct OnboardingView: View {
           Button("Continue") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         } else {
-          // System Audio step: permission granted on first recording
-          Button("Complete Setup") { completeOnboarding() }
+          Button("Complete Setup") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         }
       }
@@ -133,16 +132,14 @@ struct OnboardingView: View {
           options: [.alert, .sound])
         step += 1
       }
+    case 3:
+      if !CGPreflightScreenCaptureAccess() {
+        CGRequestScreenCaptureAccess()
+      }
+      UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+      onComplete?()
     default:
       step += 1
     }
-  }
-
-  private func completeOnboarding() {
-    if !CGPreflightScreenCaptureAccess() {
-      CGRequestScreenCaptureAccess()
-    }
-    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-    onComplete?()
   }
 }
