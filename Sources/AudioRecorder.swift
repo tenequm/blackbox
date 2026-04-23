@@ -1,5 +1,5 @@
 @preconcurrency import AVFoundation
-import AudioToolbox
+@preconcurrency import AudioToolbox
 import CoreAudio
 import ObjCExceptionCatcher
 @preconcurrency import ScreenCaptureKit
@@ -43,9 +43,12 @@ actor AudioRecorder {
 
   // D12: supplemental mic-recovery signals.
   // `defaultInputListenerBlock` is stored because AudioObjectRemovePropertyListenerBlock
-  // requires the same block reference that was passed to Add.
+  // requires the same block reference that was passed to Add. Typed as an
+  // explicit `@Sendable` closure (rather than the non-Sendable
+  // `AudioObjectPropertyListenerBlock` typealias) so `deinit` can read it.
   // `micWatchdogTimer` ticks on audioQueue and trips when buffers stop flowing.
-  private var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
+  private var defaultInputListenerBlock:
+    (@Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void)?
   private var micWatchdogTimer: DispatchSourceTimer?
   private static let micStallThresholdSeconds: Double = 2.0
   private static let micWatchdogTickSeconds: Double = 1.0
@@ -97,9 +100,19 @@ actor AudioRecorder {
     if let configChangeObserver {
       NotificationCenter.default.removeObserver(configChangeObserver)
     }
-    // D12: DispatchSourceTimer traps if released while still resumed.
-    // Cancel defensively in case the caller skipped stop().
+    // D12 defensive cleanup in case the caller skipped stop().
+    // DispatchSourceTimer traps if released while still resumed;
+    // AudioObjectRemovePropertyListenerBlock requires the original block
+    // reference, which is lost once this deinit returns.
     micWatchdogTimer?.cancel()
+    if let block = defaultInputListenerBlock {
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
+      AudioObjectRemovePropertyListenerBlock(
+        AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
+    }
     if let activity { ProcessInfo.processInfo.endActivity(activity) }
   }
 
@@ -205,11 +218,6 @@ actor AudioRecorder {
   func stop() async -> URL? {
     Log.info(Log.recorder, "recorder", "stop() for \(appName)")
 
-    if let observer = configChangeObserver {
-      NotificationCenter.default.removeObserver(observer)
-      configChangeObserver = nil
-    }
-
     if let stream = displayStream {
       // Race stopCapture against a 3s timeout so a hung SCStream (documented
       // under WindowServer stalls) cannot exceed applicationShouldTerminate's
@@ -224,19 +232,13 @@ actor AudioRecorder {
     self.displayStream = nil
     self.streamProxy = nil
 
-    let capturedEngine = audioEngine
-    audioEngine = nil
-
     stopped = true
 
-    // Mic teardown (serialized with config change handlers)
-    if let engine = capturedEngine {
-      var exc: NSException?
-      if let inputNode = ObjCGetInputNode(engine, &exc) {
-        let _ = ObjCRemoveTap(inputNode, 0)
-      }
-      let _ = ObjCStopEngine(engine)
-    }
+    // Delegates to stopMicCapture so the D12 watchdog + default-input listener
+    // + configChangeObserver + engine teardown all run in one place. With
+    // `stopped = true` already set above, any in-flight mic tap callback
+    // arriving during the teardown short-circuits inside handleMicBuffer.
+    stopMicCapture()
 
     let diagnostics = pipeline?.currentDiagnostics
     let systemStats = diagnostics?.system ?? TrackDiagnostics()
@@ -329,12 +331,15 @@ actor AudioRecorder {
 
   /// Wraps start-time ScreenCaptureKit errors in `RecorderFailure`-friendly
   /// `RecorderError` cases so the caller sees a stable failure surface.
+  /// Mirrors the code routing in `handleStreamStopped`.
   private func mappedStartError(_ error: any Error) -> any Error {
     let nsError = error as NSError
-    if nsError.domain == SCStreamErrorDomain, nsError.code == -3801 {
-      return RecorderError.permissionDenied
+    guard nsError.domain == SCStreamErrorDomain else { return error }
+    switch nsError.code {
+    case -3801: return RecorderError.permissionDenied
+    case -3802, -3821: return RecorderError.systemStopped
+    default: return error
     }
-    return error
   }
 
   // MARK: - AVAudioEngine Mic Capture
@@ -613,7 +618,8 @@ actor AudioRecorder {
       mSelector: kAudioHardwarePropertyDefaultInputDevice,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
-    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+    let block: @Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void = {
+      [weak self] _, _ in
       guard let self else { return }
       self.assumeIsolated { iso in
         guard !iso.stopped else { return }
@@ -913,12 +919,14 @@ extension AVAudioPCMBuffer {
 enum RecorderError: Error, LocalizedError {
   case noDisplay
   case permissionDenied
+  case systemStopped
   case writerFailed
 
   var errorDescription: String? {
     switch self {
     case .noDisplay: "No display found"
     case .permissionDenied: "Screen Recording permission denied"
+    case .systemStopped: "System audio capture was stopped"
     case .writerFailed: "Failed to start audio writer"
     }
   }

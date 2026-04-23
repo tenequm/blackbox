@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Layered mic recovery (D12). `AVAudioEngineConfigurationChange` (existing) is now supplemented by a CoreAudio `kAudioHardwarePropertyDefaultInputDevice` listener and a 1 Hz buffer-arrival watchdog (2 s stall threshold). All three sources funnel through `requestMicReinstall(source:)` → debounced mic-tap reinstall. Catches same-format default-input swaps that the AVAudioEngine notification silently misses.
+
 ### Fixed
 
 - Silent system-audio track on FaceTime (and any app routing through communication audio paths on macOS 26). SCStream delivers non-interleaved stereo Float32 CMSampleBuffers; the PCM round-trip helper inherited from the CATap era mis-copied non-interleaved payloads, producing system tracks with mean_volume near -66 dB. SCStream buffers are now appended directly to a stereo 128 kbps AAC writer input (v0.6.0 parity). Post-fix: FaceTime system track mean_volume -37.8 dB (from -66.4 dB); Chrome -27.1 dB.
+- `AudioRecorder.stop()` now tears down the D12 default-input CoreAudio listener and watchdog timer (previously only removed in `deinit`'s defensive path). Closes a listener leak on `kAudioObjectSystemObject` that accumulated across recording sessions.
+- Onboarding gate now treats `CGPreflightScreenCaptureAccess()` as the source of truth on every launch. First-run denial and post-install permission revocation both re-surface onboarding; prior behaviour sticky-marked onboarding complete even when the TCC prompt was denied.
+- `mappedStartError` now routes SCStream `-3802`/`-3821` codes to `RecorderError.systemStopped` (new case), matching the in-flight `handleStreamStopped` routing.
 
 ### Changed
 

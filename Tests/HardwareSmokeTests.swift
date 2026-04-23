@@ -156,15 +156,19 @@ struct HardwareSmokeTests {
     let hfpInvolved =
       CoreAudioDevices.isBluetooth(originalOutput)
       || CoreAudioDevices.isBluetooth(alternateOutput)
-    // Non-HFP baseline: the AVAudioEngine reinstall gap on an output-device
-    // change is "sub-second" per spec D1 (up to ~1 s: HAL stall + 300 ms
-    // debounce + ~100 ms reinstall + first-buffer latency). The 5-s drift
-    // timer can land anywhere in that window, so a ~700 ms reading is
-    // legitimate even on a healthy machine. Ceiling is set at 1500 ms to
-    // catch real catastrophic stalls (multi-second, indicative of a dead
-    // IO proc / stuck engine) without false-failing on phase alignment.
-    // HFP adds multi-second transport renegotiation on top.
-    let ageCeilingMs: Double = hfpInvolved ? 8000 : 1500
+    // Non-HFP baselines, split by track:
+    // - sys_age: SCStream is supposed to be transparent across default-output
+    //   changes (its clock comes from the OS-composited mix, decoupled from
+    //   any specific device). A healthy sys_age stays <100 ms; 500 ms catches
+    //   real SCStream stalls tightly.
+    // - mic_age: the AVAudioEngine reinstall gap on an output-device change
+    //   is "sub-second" per spec D1 (up to ~1 s: HAL stall + 300 ms debounce
+    //   + ~100 ms reinstall + first-buffer latency). The 5 s drift timer can
+    //   land anywhere in that window; 1500 ms catches multi-second catastrophic
+    //   stalls without false-failing on phase alignment.
+    // HFP adds multi-second transport renegotiation on top; loosen both to 8 s.
+    let sysAgeCeilingMs: Double = hfpInvolved ? 8000 : 500
+    let micAgeCeilingMs: Double = hfpInvolved ? 8000 : 1500
     // Two rebuilds each add a D8 silence gap; HFP can add multi-second stalls.
     let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
 
@@ -186,8 +190,8 @@ struct HardwareSmokeTests {
 
     if let maxSysAge = BlackboxLogProbe.maxSystemAgeAfter(since: logMarker) {
       #expect(
-        maxSysAge < ageCeilingMs,
-        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). SCStream audio may have stalled."
+        maxSysAge < sysAgeCeilingMs,
+        "System audio stopped after device round-trip: sys_age=\(maxSysAge)ms (max \(sysAgeCeilingMs)ms, hfp=\(hfpInvolved)). SCStream audio may have stalled."
       )
     } else {
       Issue.record("No drift logs found after \(logMarker) - cannot verify sys_age")
@@ -195,8 +199,8 @@ struct HardwareSmokeTests {
 
     if let maxMicAge = BlackboxLogProbe.maxMicAgeAfter(since: logMarker) {
       #expect(
-        maxMicAge < ageCeilingMs,
-        "Mic stopped after output device round-trip: mic_age=\(maxMicAge)ms (max \(ageCeilingMs)ms, hfp=\(hfpInvolved)). AVAudioEngine may have stalled."
+        maxMicAge < micAgeCeilingMs,
+        "Mic stopped after output device round-trip: mic_age=\(maxMicAge)ms (max \(micAgeCeilingMs)ms, hfp=\(hfpInvolved)). AVAudioEngine may have stalled."
       )
     } else {
       Issue.record("No drift logs found after \(logMarker) - cannot verify mic_age")

@@ -80,13 +80,12 @@ struct BlackboxApp: App {
         return
       }
 
-      // Existing users who already granted Screen Recording don't need onboarding.
-      // Use live TCC preflight as the source of truth rather than a cached flag.
-      if CGPreflightScreenCaptureAccess() {
-        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-      }
-
-      let willOnboard = !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+      // CGPreflightScreenCaptureAccess is the source of truth on every launch.
+      // If the user denies on first run or revokes between sessions, onboarding
+      // re-appears. The `hasCompletedOnboarding` UserDefaults key is now only
+      // written by `windowWillClose` as an X-button courtesy flag; it is never
+      // read here because preflight alone gives the correct answer.
+      let willOnboard = !CGPreflightScreenCaptureAccess()
 
       // Start monitoring AFTER the onboarding decision so the fallback
       // permission requests don't race with the onboarding UI.

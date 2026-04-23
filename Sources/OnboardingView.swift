@@ -136,7 +136,9 @@ struct OnboardingView: View {
       if !CGPreflightScreenCaptureAccess() {
         CGRequestScreenCaptureAccess()
       }
-      UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+      // BlackboxApp's launch gate owns `hasCompletedOnboarding`: it treats
+      // CGPreflightScreenCaptureAccess as source of truth on next launch. If
+      // the user denies the TCC prompt, onboarding re-appears.
       onComplete?()
     default:
       step += 1
