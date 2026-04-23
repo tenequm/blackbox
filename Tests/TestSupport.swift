@@ -194,7 +194,6 @@ final class MonitorHarness {
   )
   var activeCallers: [String?] = []
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
-  private(set) var audioRecordingGrantedSaves = 0
   private(set) var permissionLostNotifications = 0
 
   func makeMonitor() -> AudioMonitor {
@@ -218,9 +217,6 @@ final class MonitorHarness {
           self?.micAuthorizationStatus ?? .authorized
         },
         requestMicrophoneAccessIfNeeded: {},
-        saveAudioRecordingGranted: { [weak self] in
-          self?.audioRecordingGrantedSaves += 1
-        },
         notifyPermissionLost: { [weak self] in
           self?.permissionLostNotifications += 1
         },

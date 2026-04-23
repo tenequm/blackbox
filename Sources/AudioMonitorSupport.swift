@@ -75,7 +75,6 @@ struct AudioMonitorDependencies {
   var loadSettings: @MainActor () -> AudioMonitorSettings
   var microphoneAuthorizationStatus: @MainActor () -> AVAuthorizationStatus
   var requestMicrophoneAccessIfNeeded: @MainActor () async -> Void
-  var saveAudioRecordingGranted: @MainActor () -> Void
   var notifyPermissionLost: @MainActor () async -> Void
   var findActiveCallingProcesses: @MainActor () -> [String?]
   var now: @MainActor () -> Date
@@ -117,10 +116,6 @@ struct AudioMonitorDependencies {
       if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
         await AVCaptureDevice.requestAccess(for: .audio)
       }
-    },
-    saveAudioRecordingGranted: {
-      guard !BlackboxTestMode.isEnabled else { return }
-      UserDefaults.standard.set(true, forKey: "audioRecordingGranted")
     },
     notifyPermissionLost: {
       let content = UNMutableNotificationContent()

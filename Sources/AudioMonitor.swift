@@ -208,7 +208,6 @@ final class AudioMonitor {
       guard let self else { return }
       do {
         try await recorder.start()
-        self.dependencies.saveAudioRecordingGranted()
         self.permissionNeeded = false
         self.recordingStartTime = self.dependencies.now()
         self.currentAppName = "Manual recording"
@@ -497,7 +496,6 @@ final class AudioMonitor {
       guard let self else { return }
       do {
         try await recorder.start()
-        self.dependencies.saveAudioRecordingGranted()
         self.permissionNeeded = false
         self.isRecording = true
         self.currentAppName = appName

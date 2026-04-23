@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import Sparkle
 import SwiftUI
 
@@ -79,8 +80,9 @@ struct BlackboxApp: App {
         return
       }
 
-      // Existing users who already granted audio recording don't need onboarding
-      if UserDefaults.standard.bool(forKey: "audioRecordingGranted") {
+      // Existing users who already granted Screen Recording don't need onboarding.
+      // Use live TCC preflight as the source of truth rather than a cached flag.
+      if CGPreflightScreenCaptureAccess() {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
       }
 
