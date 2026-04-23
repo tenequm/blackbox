@@ -156,7 +156,15 @@ struct HardwareSmokeTests {
     let hfpInvolved =
       CoreAudioDevices.isBluetooth(originalOutput)
       || CoreAudioDevices.isBluetooth(alternateOutput)
-    let ageCeilingMs: Double = hfpInvolved ? 8000 : 500
+    // Non-HFP baseline: the AVAudioEngine reinstall gap on an output-device
+    // change is "sub-second" per spec D1 (up to ~1 s: HAL stall + 300 ms
+    // debounce + ~100 ms reinstall + first-buffer latency). The 5-s drift
+    // timer can land anywhere in that window, so a ~700 ms reading is
+    // legitimate even on a healthy machine. Ceiling is set at 1500 ms to
+    // catch real catastrophic stalls (multi-second, indicative of a dead
+    // IO proc / stuck engine) without false-failing on phase alignment.
+    // HFP adds multi-second transport renegotiation on top.
+    let ageCeilingMs: Double = hfpInvolved ? 8000 : 1500
     // Two rebuilds each add a D8 silence gap; HFP can add multi-second stalls.
     let divergenceCeilingS: Double = hfpInvolved ? 8.0 : 0.3
 
