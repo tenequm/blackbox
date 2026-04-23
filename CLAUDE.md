@@ -136,6 +136,7 @@ With `defaultIsolation(MainActor.self)`:
 - SCStream stop/error callbacks hop through `audioQueue.async` to `assumeIsolated` for `RecorderFailure` routing
 - AVAudioEngine tap callback dispatches to `audioQueue.async` with `assumeIsolated` to serialize with SCStream callbacks
 - AVAudioEngine config change observer fires via `Task { await ... }`, actor-isolated `debounceConfigChange` uses `asyncAfter` with `assumeIsolated` for the delayed handler
+- D12 supplemental mic-recovery signals feed the same debounced restart: `kAudioHardwarePropertyDefaultInputDevice` CoreAudio listener (dispatch queue = `audioQueue`, block uses `assumeIsolated`) and a `DispatchSourceTimer` watchdog on `audioQueue` that trips when mic buffers stall >2 s; all three sources call `requestMicReinstall(source:)` which logs the source and delegates to `debounceConfigChange`
 
 ## Cross-Model Collaboration (Codex)
 

@@ -41,6 +41,15 @@ actor AudioRecorder {
   private var audioEngine: AVAudioEngine?
   private var configChangeObserver: (any NSObjectProtocol)?
 
+  // D12: supplemental mic-recovery signals.
+  // `defaultInputListenerBlock` is stored because AudioObjectRemovePropertyListenerBlock
+  // requires the same block reference that was passed to Add.
+  // `micWatchdogTimer` ticks on audioQueue and trips when buffers stop flowing.
+  private var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
+  private var micWatchdogTimer: DispatchSourceTimer?
+  private static let micStallThresholdSeconds: Double = 2.0
+  private static let micWatchdogTickSeconds: Double = 1.0
+
   // Writer state
   private var pipeline: RecordingPipeline?
   private var stopped = false
@@ -88,6 +97,9 @@ actor AudioRecorder {
     if let configChangeObserver {
       NotificationCenter.default.removeObserver(configChangeObserver)
     }
+    // D12: DispatchSourceTimer traps if released while still resumed.
+    // Cancel defensively in case the caller skipped stop().
+    micWatchdogTimer?.cancel()
     if let activity { ProcessInfo.processInfo.endActivity(activity) }
   }
 
@@ -391,18 +403,26 @@ actor AudioRecorder {
     }
     audioEngine = engine
 
+    // D12: prime the watchdog baseline. Without this, a dead-on-arrival
+    // engine (engine.start() succeeded but no buffers ever flow) would not
+    // be detected, because `lastMicHostTime` would stay zero.
+    lastMicHostTime = mach_absolute_time()
+
     // D9: query initial mic latency offset
     queryMicLatencyOffset(deviceID: inputDeviceID)
 
-    let capturedEngine = engine
     configChangeObserver = NotificationCenter.default.addObserver(
       forName: .AVAudioEngineConfigurationChange,
       object: engine,
       queue: nil
     ) { [weak self] _ in
       guard let self else { return }
-      Task { await self.debounceConfigChange(engine: capturedEngine) }
+      Task { await self.requestMicReinstall(source: "avaudioengine_notification") }
     }
+
+    // D12: supplemental recovery signals.
+    installDefaultInputListener()
+    startMicWatchdog()
 
     Log.info(
       Log.recorder, "recorder",
@@ -412,6 +432,8 @@ actor AudioRecorder {
 
   private func stopMicCapture() {
     configChangeGeneration += 1
+    stopMicWatchdog()
+    removeDefaultInputListener()
     if let observer = configChangeObserver {
       NotificationCenter.default.removeObserver(observer)
       configChangeObserver = nil
@@ -508,6 +530,12 @@ actor AudioRecorder {
     onContinuity?()
     Log.info(Log.recorder, "recorder", "audio engine config changed, restarting mic capture")
 
+    // D12: give the watchdog a fresh 2s window regardless of whether the
+    // reinstall succeeds below. If buffers arrive, they will keep pushing
+    // `lastMicHostTime` forward; if they do not, the watchdog will trip
+    // again after 2s and retry.
+    defer { lastMicHostTime = mach_absolute_time() }
+
     var inputNodeException: NSException?
     guard let inputNode = ObjCGetInputNode(engine, &inputNodeException) else {
       if let e = inputNodeException {
@@ -563,6 +591,94 @@ actor AudioRecorder {
     queryMicLatencyOffset(deviceID: inputDeviceID)
 
     Log.info(Log.recorder, "recorder", "mic capture restarted after device change")
+  }
+
+  // MARK: - D12: Layered Mic Recovery
+
+  /// Routes all three mic-reinstall trigger sources (AVAudioEngine notification,
+  /// default-input listener, watchdog) through the same debounced path. Logs
+  /// the source so we can tell from logs which layer actually saved a recording.
+  private func requestMicReinstall(source: String) {
+    guard !stopped else { return }
+    guard let engine = audioEngine else { return }
+    Log.info(Log.recorder, "recorder", "mic reinstall requested (source=\(source))")
+    debounceConfigChange(engine: engine)
+  }
+
+  /// Registers a CoreAudio listener on `kAudioHardwarePropertyDefaultInputDevice`.
+  /// Catches same-format default-input switches that AVAudioEngine's own
+  /// notification silently misses.
+  private func installDefaultInputListener() {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDefaultInputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
+    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+      guard let self else { return }
+      self.assumeIsolated { iso in
+        guard !iso.stopped else { return }
+        iso.requestMicReinstall(source: "default_input_listener")
+      }
+    }
+    defaultInputListenerBlock = block
+    let status = AudioObjectAddPropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
+    if status != noErr {
+      Log.error(
+        Log.recorder, "recorder",
+        "failed to install default-input listener: OSStatus=\(status)")
+      defaultInputListenerBlock = nil
+    }
+  }
+
+  private func removeDefaultInputListener() {
+    guard let block = defaultInputListenerBlock else { return }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDefaultInputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
+    AudioObjectRemovePropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
+    defaultInputListenerBlock = nil
+  }
+
+  /// Buffer-arrival watchdog: trips when no mic buffers have arrived for
+  /// `micStallThresholdSeconds`. Universal safety net for device-zoo
+  /// failure modes (virtual drivers, in-place transport flips, silent
+  /// DeviceIsAlive=false, unknown-unknowns).
+  private func startMicWatchdog() {
+    stopMicWatchdog()
+    let timer = DispatchSource.makeTimerSource(queue: audioQueue)
+    timer.schedule(
+      deadline: .now() + .milliseconds(Int(Self.micWatchdogTickSeconds * 1000)),
+      repeating: .milliseconds(Int(Self.micWatchdogTickSeconds * 1000)))
+    timer.setEventHandler { [weak self] in
+      guard let self else { return }
+      self.assumeIsolated { iso in
+        iso.checkMicWatchdog()
+      }
+    }
+    micWatchdogTimer = timer
+    timer.resume()
+  }
+
+  private func stopMicWatchdog() {
+    micWatchdogTimer?.cancel()
+    micWatchdogTimer = nil
+  }
+
+  private func checkMicWatchdog() {
+    guard !stopped, audioEngine != nil else { return }
+    let now = mach_absolute_time()
+    guard now > lastMicHostTime else { return }
+    let elapsedTicks = now - lastMicHostTime
+    let elapsedNanos = AudioConvertHostTimeToNanos(elapsedTicks)
+    let elapsedSeconds = Double(elapsedNanos) / 1_000_000_000
+    guard elapsedSeconds > Self.micStallThresholdSeconds else { return }
+    Log.error(
+      Log.recorder, "recorder",
+      "mic buffer stall: \(String(format: "%.2f", elapsedSeconds))s since last buffer")
+    requestMicReinstall(source: "watchdog_mic_stall")
   }
 
   // MARK: - D9: Device Latency Offset
