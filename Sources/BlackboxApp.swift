@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import Sparkle
 import SwiftUI
 
@@ -79,12 +80,12 @@ struct BlackboxApp: App {
         return
       }
 
-      // Existing users who already granted audio recording don't need onboarding
-      if UserDefaults.standard.bool(forKey: "audioRecordingGranted") {
-        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-      }
-
-      let willOnboard = !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+      // CGPreflightScreenCaptureAccess is the source of truth on every launch.
+      // If the user denies on first run or revokes between sessions, onboarding
+      // re-appears. The `hasCompletedOnboarding` UserDefaults key is now only
+      // written by `windowWillClose` as an X-button courtesy flag; it is never
+      // read here because preflight alone gives the correct answer.
+      let willOnboard = !CGPreflightScreenCaptureAccess()
 
       // Start monitoring AFTER the onboarding decision so the fallback
       // permission requests don't race with the onboarding UI.
@@ -218,13 +219,13 @@ struct MenuContent: View {
 
     // Status
     if monitor.permissionNeeded {
-      Text("System Audio Recording permission required")
+      Text("Screen & System Audio Recording permission required")
         .foregroundStyle(.red)
       Button("Open System Settings") {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
           )!
         )
       }
@@ -333,7 +334,7 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
 // MARK: - Helpers
 
 /// Maps audio RMS level to a waveform SF Symbol.
-/// Thresholds tuned for typical call audio captured via CATap.
+/// Thresholds tuned for typical call audio.
 private func recordingWaveformIcon(level: Float) -> String {
   if level > 0.05 {
     return "waveform"

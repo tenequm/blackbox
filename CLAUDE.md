@@ -1,6 +1,6 @@
 # Blackbox
 
-macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per-process audio state polling. Captures system audio via CATap (CoreAudio Process Tap) and mic via AVAudioEngine as independent pipelines.
+macOS menu bar app that auto-records call audio. Detects calls via CoreAudio per-process audio state polling. Captures system audio via display-wide SCStream (ScreenCaptureKit) and mic via AVAudioEngine as independent pipelines.
 
 ## Project Structure
 
@@ -10,7 +10,7 @@ Sources/
   BlackboxApp.swift                        - @main App, MenuBarExtra, Window scenes, AppDelegate
   AudioMonitor.swift                       - @Observable: call detection (polling), auto/manual recording lifecycle
   AudioMonitorSupport.swift                - RecorderSession protocol, AudioMonitorDependencies (DI), factory types
-  AudioRecorder.swift                      - CATap (system audio) + AVAudioEngine (mic), dual-track capture
+  AudioRecorder.swift                      - SCStream (system audio) + AVAudioEngine (mic), dual-track capture
   RecordingPipeline.swift                  - AVAssetWriter management, gap filling, tail padding, audio level metering
   AECProcessor.swift                       - DTLN-aec CoreML post-processing: echo cancellation on mic track
   BlackboxTestMode.swift                   - Test mode flags (--ui-test-mode), IPC types for smoke tests
@@ -114,14 +114,14 @@ Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/
 ## Key Architecture Decisions
 
 - **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio Swift wrappers (`AudioHardwareSystem.shared.processes`) enumerate processes with BOTH `isRunningInput` AND `isRunningOutput` (filtering out own PID). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code.
-- **CATap system audio capture**: CoreAudio Process Tap via Swift wrappers (`system.makeProcessTap`, `system.makeAggregateDevice`) captures all system audio, excluding own PID via `CATapDescription(stereoGlobalTapButExcludeProcesses:)`. IO proc callback on aggregate device delivers interleaved Float32 AudioBufferList, converted to CMSampleBuffer and dispatched to `audioQueue` for writing. Drift compensation enabled via `kAudioSubTapDriftCompensationKey`. Output device changes trigger aggregate rebuild with silence gap filling (D8). Requires `NSAudioCaptureUsageDescription` in Info.plist.
+- **SCStream system audio capture**: Single display-wide `SCStream` (ScreenCaptureKit) captures the OS-composited audio mix, excluding own PID via `excludesCurrentProcessAudio = true`. Video disabled (2x2, max frame interval). `SCStreamOutput` callback delivers stereo 48kHz Float32 CMSampleBuffer on `audioQueue` and is appended **directly** to a stereo 128 kbps AAC writer input (v0.6.0 parity) - no PCM round-trip, no downmix. `SCStreamDelegate.didStopWithError` maps NSError codes (−3801 permission, −3802/−3821 stopped) to `RecorderFailure`. Requires Screen Recording permission (on macOS 26.1+, this also grants audio capture).
 - **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file). Device latency offset (D9) applied as PTS shift to align mic with system audio.
-- **AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor.** All actor-isolated state runs on `audioQueue`. CATap IO proc and AVAudioEngine tap callbacks dispatch to `audioQueue` and use `assumeIsolated` to bridge into actor isolation. No `nonisolated(unsafe)` needed.
+- **AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor.** All actor-isolated state runs on `audioQueue`. SCStream and AVAudioEngine tap callbacks dispatch to `audioQueue` and use `assumeIsolated` to bridge into actor isolation. No `nonisolated(unsafe)` needed.
 - **RecordingPipeline** (`@unchecked Sendable`) handles AVAssetWriter management, gap filling, tail padding, and audio level metering. Extracted from AudioRecorder for testability. All access serialized by AudioRecorder's `audioQueue` - the pipeline has no internal synchronization. `nonisolated(unsafe)` state is safe because AudioRecorder guarantees single-threaded access.
 - **AudioMonitor dependency injection**: `AudioMonitorDependencies` struct injects all external dependencies (recorder factory, HUD, settings, clock, sleep, process query). Enables deterministic testing via `MonitorHarness` with `TestClock` and `TestRecorderFactory`. `RecorderSession` protocol abstracts over `AudioRecorder` for test doubles.
-- **2-track M4A**: Track 0 = system audio (1ch mono, downmixed+resampled to 48kHz). Track 1 = mic (1ch mono, when mic enabled). Session starts on whichever track delivers the first sample. Legacy 3-track recordings (pre-v0.7.0) remain playable.
+- **2-track M4A**: Track 0 = system audio (2ch stereo 48kHz 128 kbps AAC, SCStream buffers appended directly). Track 1 = mic (1ch mono 48kHz 64 kbps AAC, resampled/downmixed via `resampleToMono48k`). Session starts on whichever track delivers the first sample. Gap fill (D8), leading silence, and tail padding run on the mic track only (v0.6.0 parity). Legacy 3-track recordings (pre-v0.7.0) remain playable.
 - **Echo cancellation post-processing**: After recording stops, DTLN-aec CoreML (256-unit model) processes the mic track using the system audio track (track 0) as the AEC reference. Writes `audio-processed.m4a` alongside the original. Fire-and-forget: errors are logged, original is never modified.
-- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, destroy CATap aggregate/tap, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
+- **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream capture, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.
 - **Crash safety**: `movieFragmentInterval` on AVAssetWriter writes fragment headers every 10s, making partial files recoverable.
 
@@ -132,10 +132,11 @@ With `defaultIsolation(MainActor.self)`:
 - AudioMonitor is purely MainActor-isolated (polling-only, no C callbacks)
 - AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor (`audioQueue`). All actor-isolated state accessed on `audioQueue` - same runtime behavior as the previous `nonisolated(unsafe)` approach, but with compile-time safety
 - RecordingPipeline is `@unchecked Sendable` with `nonisolated(unsafe)` state - safe because all access is serialized on AudioRecorder's `audioQueue`
-- CATap IO proc callback copies audio data and dispatches to `audioQueue.async` with `assumeIsolated` for CMSampleBuffer conversion and writing via RecordingPipeline
-- Output device change listener dispatches to `audioQueue.async` with `assumeIsolated` for aggregate device rebuild
-- AVAudioEngine tap callback dispatches to `audioQueue.async` with `assumeIsolated` to serialize with CATap callbacks
+- SCStream sample handler (via `SCStreamProxy`, a thin NSObject adapter) dispatches to `audioQueue.async` with `assumeIsolated` for direct passthrough to RecordingPipeline (no downmix)
+- SCStream stop/error callbacks hop through `audioQueue.async` to `assumeIsolated` for `RecorderFailure` routing
+- AVAudioEngine tap callback dispatches to `audioQueue.async` with `assumeIsolated` to serialize with SCStream callbacks
 - AVAudioEngine config change observer fires via `Task { await ... }`, actor-isolated `debounceConfigChange` uses `asyncAfter` with `assumeIsolated` for the delayed handler
+- D12 supplemental mic-recovery signals feed the same debounced restart: `kAudioHardwarePropertyDefaultInputDevice` CoreAudio listener (dispatch queue = `audioQueue`, block uses `assumeIsolated`) and a `DispatchSourceTimer` watchdog on `audioQueue` that trips when mic buffers stall >2 s; all three sources call `requestMicReinstall(source:)` which logs the source and delegates to `debounceConfigChange`
 
 ## Cross-Model Collaboration (Codex)
 

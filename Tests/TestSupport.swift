@@ -118,16 +118,16 @@ final class TestRecorderSession: RecorderSession {
   private(set) var stopCallCount = 0
 
   private let onFailure: (@Sendable (RecorderFailure) -> Void)?
-  private let onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+  private let onContinuity: (@Sendable () -> Void)?
 
   init(
     configuration: RecorderSessionConfiguration,
     onFailure: (@Sendable (RecorderFailure) -> Void)?,
-    onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+    onContinuity: (@Sendable () -> Void)?
   ) {
     self.configuration = configuration
     self.onFailure = onFailure
-    self.onContinuityEvent = onContinuityEvent
+    self.onContinuity = onContinuity
   }
 
   var appName: String { configuration.appName }
@@ -146,8 +146,8 @@ final class TestRecorderSession: RecorderSession {
     onFailure?(failure)
   }
 
-  func emitContinuityEvent(_ event: RecorderContinuityEvent) {
-    onContinuityEvent?(event)
+  func emitContinuityEvent() {
+    onContinuity?()
   }
 }
 
@@ -162,12 +162,12 @@ final class TestRecorderFactory: RecorderSessionFactory {
     onFailure: (@Sendable (RecorderFailure) -> Void)?,
     onAudioLevel: (@Sendable (Float) -> Void)?,
     onLowDiskSpace: (@Sendable (Int64) -> Void)?,
-    onContinuityEvent: (@Sendable (RecorderContinuityEvent) -> Void)?
+    onContinuity: (@Sendable () -> Void)?
   ) -> any RecorderSession {
     let session = TestRecorderSession(
       configuration: configuration,
       onFailure: onFailure,
-      onContinuityEvent: onContinuityEvent
+      onContinuity: onContinuity
     )
     session.startError = nextStartError
     session.stopURL = stopURL
@@ -194,7 +194,6 @@ final class MonitorHarness {
   )
   var activeCallers: [String?] = []
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
-  private(set) var audioRecordingGrantedSaves = 0
   private(set) var permissionLostNotifications = 0
 
   func makeMonitor() -> AudioMonitor {
@@ -218,9 +217,6 @@ final class MonitorHarness {
           self?.micAuthorizationStatus ?? .authorized
         },
         requestMicrophoneAccessIfNeeded: {},
-        saveAudioRecordingGranted: { [weak self] in
-          self?.audioRecordingGrantedSaves += 1
-        },
         notifyPermissionLost: { [weak self] in
           self?.permissionLostNotifications += 1
         },

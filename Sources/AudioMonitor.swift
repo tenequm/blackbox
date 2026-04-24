@@ -69,8 +69,9 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    // CATap has no preflight API - permission is checked on first AudioHardwareCreateProcessTap call.
-    // permissionNeeded will be set to true if recording fails with .permissionDenied.
+    // Screen Recording permission is requested at onboarding; if it was revoked
+    // or never granted, recording fails with .permissionDenied and the failure
+    // handler sets permissionNeeded = true.
 
     if !skipPermissionRequests {
       Task { @MainActor [weak self] in
@@ -197,7 +198,7 @@ final class AudioMonitor {
       onFailure: makeFailureHandler(isManual: true),
       onAudioLevel: makeAudioLevelHandler(),
       onLowDiskSpace: makeLowDiskSpaceHandler(),
-      onContinuityEvent: makeContinuityHandler()
+      onContinuity: makeContinuityHandler()
     )
 
     manualRecorder = recorder
@@ -207,7 +208,6 @@ final class AudioMonitor {
       guard let self else { return }
       do {
         try await recorder.start()
-        self.dependencies.saveAudioRecordingGranted()
         self.permissionNeeded = false
         self.recordingStartTime = self.dependencies.now()
         self.currentAppName = "Manual recording"
@@ -409,8 +409,8 @@ final class AudioMonitor {
       return
     }
 
-    // CATap permission is checked when AudioRecorder.start() creates the process tap.
-    // If denied, the failure callback sets permissionNeeded = true.
+    // Screen Recording permission is checked when AudioRecorder.start() creates
+    // the SCStream. If denied, the failure callback sets permissionNeeded = true.
 
     autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
@@ -443,12 +443,12 @@ final class AudioMonitor {
     }
   }
 
-  private func handleRecorderContinuityEvent(_ event: RecorderContinuityEvent) {
+  private func handleRecorderContinuity() {
     let now = dependencies.now()
     continuityCooldownUntil = now.addingTimeInterval(max(gracePeriod, 8))
     consecutiveInactivePolls = 0
     cancelGracePeriod()
-    Log.info(Log.monitor, "monitor", "continuity event observed: \(String(describing: event))")
+    Log.info(Log.monitor, "monitor", "continuity event observed")
   }
 
   private func shouldSuppressInactiveStop() -> Bool {
@@ -485,7 +485,7 @@ final class AudioMonitor {
       onFailure: makeFailureHandler(isManual: false),
       onAudioLevel: makeAudioLevelHandler(),
       onLowDiskSpace: makeLowDiskSpaceHandler(),
-      onContinuityEvent: makeContinuityHandler()
+      onContinuity: makeContinuityHandler()
     )
 
     autoRecorder = recorder
@@ -496,7 +496,6 @@ final class AudioMonitor {
       guard let self else { return }
       do {
         try await recorder.start()
-        self.dependencies.saveAudioRecordingGranted()
         self.permissionNeeded = false
         self.isRecording = true
         self.currentAppName = appName
@@ -657,10 +656,10 @@ final class AudioMonitor {
     }
   }
 
-  private func makeContinuityHandler() -> @Sendable (RecorderContinuityEvent) -> Void {
-    { [weak self] event in
+  private func makeContinuityHandler() -> @Sendable () -> Void {
+    { [weak self] in
       Task { @MainActor [weak self] in
-        self?.handleRecorderContinuityEvent(event)
+        self?.handleRecorderContinuity()
       }
     }
   }

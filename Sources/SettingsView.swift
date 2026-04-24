@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import Security
 import ServiceManagement
 import SwiftUI
@@ -92,13 +93,13 @@ struct SettingsView: View {
   private var permissionsSection: some View {
     Section("Permissions") {
       permissionRow(
-        "System Audio Recording",
+        "Screen & System Audio Recording",
         granted: audioRecordingGranted
       ) {
         NSWorkspace.shared.open(
           URL(
             string:
-              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture"
+              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
           )!)
       }
       permissionRow(
@@ -221,8 +222,7 @@ struct SettingsView: View {
   // MARK: - Permissions Refresh
 
   private func refreshPermissions() {
-    // CATap has no preflight API - show as granted if app has recorded successfully before
-    audioRecordingGranted = UserDefaults.standard.bool(forKey: "audioRecordingGranted")
+    audioRecordingGranted = CGPreflightScreenCaptureAccess()
     micPermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     Task {
       let settings = await UNUserNotificationCenter.current().notificationSettings()

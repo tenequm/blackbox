@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import SwiftUI
 import UserNotifications
 
@@ -31,8 +32,7 @@ struct OnboardingView: View {
           Button("Continue") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         } else {
-          // System Audio step: permission granted on first recording
-          Button("Complete Setup") { completeOnboarding() }
+          Button("Complete Setup") { advanceStep() }
             .keyboardShortcut(.defaultAction)
         }
       }
@@ -99,19 +99,21 @@ struct OnboardingView: View {
       Text("System Audio Recording")
         .font(.title2.bold())
       Text(
-        "Blackbox captures system audio to record both sides of your calls. It never records your screen - only audio."
+        "Blackbox captures system audio to record both sides of your calls. On macOS, this uses the Screen Recording permission - but Blackbox never records your screen, only audio."
       )
       .multilineTextAlignment(.center)
       .foregroundStyle(.secondary)
       .frame(maxWidth: 360)
 
-      Text(
-        "macOS will ask for permission when your first recording starts. Click Allow when prompted."
-      )
+      Button("Open System Settings") {
+        if let url = URL(
+          string:
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
+        ) {
+          NSWorkspace.shared.open(url)
+        }
+      }
       .font(.caption)
-      .multilineTextAlignment(.center)
-      .foregroundStyle(.tertiary)
-      .frame(maxWidth: 360)
     }
   }
 
@@ -130,15 +132,16 @@ struct OnboardingView: View {
           options: [.alert, .sound])
         step += 1
       }
+    case 3:
+      if !CGPreflightScreenCaptureAccess() {
+        CGRequestScreenCaptureAccess()
+      }
+      // BlackboxApp's launch gate owns `hasCompletedOnboarding`: it treats
+      // CGPreflightScreenCaptureAccess as source of truth on next launch. If
+      // the user denies the TCC prompt, onboarding re-appears.
+      onComplete?()
     default:
       step += 1
     }
-  }
-
-  private func completeOnboarding() {
-    // CATap permission prompt appears automatically on first recording attempt.
-    // No manual pre-authorization needed, no app restart required.
-    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-    onComplete?()
   }
 }

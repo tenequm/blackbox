@@ -68,7 +68,7 @@ struct AudioMonitorIntegrationTests {
     await settle()
 
     let session = try #require(harness.recorderFactory.createdSessions.first)
-    session.emitContinuityEvent(.outputDeviceChanged)
+    session.emitContinuityEvent()
     harness.activeCallers = []
 
     harness.clock.advance(by: .seconds(3))

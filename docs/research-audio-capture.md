@@ -2,6 +2,8 @@
 
 Research on system audio + mic capture synchronization on macOS, conducted April 2026.
 
+> **Status note (v0.8.0):** This document captures the research that motivated the v0.7.0 CATap migration. The CATap migration was reverted in v0.8.0 because CATap's clock source (aggregate-device hardware output clock) produced silent-recording failures whenever that clock was idle/pinned/stalled. Display-wide SCStream - same pipeline described under "Current Architecture (v0.6.0)" minus the per-app best-effort stream - is the shipping capture backend again. The CATap evaluation below is kept as historical context, not as a recommendation. See `specification.md` D10 for the revert rationale. v0.8.0 also documents a known `AVAudioEngineConfigurationChange` gap (missed same-format default-input switches) and adds a CoreAudio default-input listener plus a buffer-arrival watchdog to close it - see `specification.md` D12.
+
 ## Current Architecture (v0.6.0)
 
 - **System audio**: Dual SCStream (display-wide + per-app) via ScreenCaptureKit
@@ -40,6 +42,8 @@ Five approaches evaluated:
 | Don't capture mic | Rejected | Mic needed for call recording |
 
 AVAudioEngine's killer feature: **automatic device following**. On hardware change, `AVAudioEngineConfigurationChange` notification fires, tap is reinstalled, sub-second gap, same file. With Krisp as system default, most device switching happens inside Krisp and is invisible to AVAudioEngine.
+
+> **Caveat (discovered April 2026):** AVAudioEngine's automatic device following is reliable for format-changing switches, but it silently misses same-format default-input swaps. See "AVAudioEngine Device-Follow Gaps" below and `specification.md` D12.
 
 ## Why Dual SCStream (v0.6.0)
 
@@ -166,3 +170,39 @@ The sync problem has two independent components:
 2. **Constant latency offset** (pipeline processing delays) - NOT yet solved
 
 Component 2 is inherent to any dual-pipeline architecture. Even CATap doesn't solve it because mic is always a separate stream. The practical solutions are post-recording alignment or constant offset compensation.
+
+## AVAudioEngine Device-Follow Gaps (April 2026)
+
+Investigation triggered by a v0.8.0 smoke test failure: `recording survives default input device switch mid-capture` passed 2 of 4 runs on the same machine in the same 2-minute window. Root cause research uncovered a class of silent-failure cases AVAudioEngine's notification does not cover.
+
+### Finding: Same-format default-input swaps do not post `AVAudioEngineConfigurationChange`
+
+`AVAudioEngine.inputNode` binds to a hidden default-input aggregate device at tap-install time. macOS rebuilds that aggregate - and posts `AVAudioEngineConfigurationChange` - only when the new hardware forces a format change (sample rate, channel count, etc.). When the default input swaps between two devices of identical format (two 48 kHz mics, monitor auto-claiming default, same-format USB fallback), the aggregate silently re-points its HAL endpoint but the engine is never notified; the tap keeps pulling from the old endpoint, which is no longer producing samples. Mic stalls with no error.
+
+### Empirical reproduction
+
+In the v0.8.0 smoke suite, 2 of 4 consecutive `inputDeviceSwitchDuringRecording` runs stalled the mic PTS for ~4.9 s. Passing runs had alternates with different formats (AirPods HFP at 24 kHz); failing runs had alternates at 48 kHz. Failure correlates cleanly with format-match.
+
+### External evidence
+
+- **Apple Developer Forums thread 71008** - definitive community discussion of macOS aggregate-rebuild-on-format-change behavior; Apple engineer participation.
+- **AudioKit issue #2130** - concrete non-firing cases with workaround using CoreAudio property listener.
+- **Chromium `CatapAudioInputStream`** and several other shipping recorders register a `kAudioHardwarePropertyDefaultInputDevice` listener rather than relying on `AVAudioEngineConfigurationChange` alone.
+
+### What neither `AVAudioEngineConfigurationChange` nor a default-input listener catches
+
+- Virtual audio devices (BlackHole, Loopback, etc.) internally re-routing their upstream source without changing device ID or format.
+- AirPods A2DP↔HFP transport flips that preserve device ID while stalling buffer delivery.
+- `kAudioDevicePropertyDeviceIsAlive` going false on a still-default device (USB hub glitch, Continuity Mic locking, iPhone leaving Bluetooth range).
+- Unknown unknowns that the OS never signals.
+
+The only signal that is agnostic to what CoreAudio decides to tell us is **the absence of buffers themselves**. This motivates the watchdog leg of D12.
+
+### Outcome → D12
+
+Blackbox ships a three-layer mic-recovery design in v0.8.0:
+1. `AVAudioEngineConfigurationChange` observer (existing, fast, covers format-changing switches reliably).
+2. `kAudioHardwarePropertyDefaultInputDevice` listener (new, closes the same-format default-input hole proven by the smoke suite).
+3. Buffer-arrival watchdog on `audioQueue` with 2 s trip threshold (new, universal safety net - catches virtual-driver crashes, in-place transport flips, device-death-without-default-change, and unknown-unknowns).
+
+All three signals feed the same debounced teardown/reinstall path. See `specification.md` D12 for the full decision.
