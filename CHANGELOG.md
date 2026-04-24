@@ -7,41 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-24
+
 ### Added
 
 - Layered mic recovery (D12). `AVAudioEngineConfigurationChange` (existing) is now supplemented by a CoreAudio `kAudioHardwarePropertyDefaultInputDevice` listener and a 1 Hz buffer-arrival watchdog (2 s stall threshold). All three sources funnel through `requestMicReinstall(source:)` → debounced mic-tap reinstall. Catches same-format default-input swaps that the AVAudioEngine notification silently misses.
 
+### Changed
+
+- Reverted system audio capture from CoreAudio Process Tap (CATap) back to display-wide `SCStream` (ScreenCaptureKit). v0.6.0's SCStream approach had an empirical production track record with zero silent-recording reports; CATap produced three distinct silent-recording bugs in 5 days (Bluetooth HFP 24kHz pin, IO-proc stop when nothing plays, Chrome Meet routed to non-default idle output). Root cause: aggregate-device IO proc fires on a hardware output-device clock that can be idle, pinned, or stalled. SCStream's clock comes from the OS-composited mix, decoupled from any specific device.
+- System-audio track is now 2ch stereo 48 kHz 128 kbps AAC (was 1ch mono 64 kbps). Mic track remains 1ch mono 48 kHz 64 kbps. File size for a 30 min call: system track ~29 MB (was ~14 MB).
+- Gap fill (D8), leading silence, and tail padding apply to the mic track only. System track has no synthesised silence - matches v0.6.0 which shipped without system-track gap fill for weeks.
+- Onboarding now actively requests Screen Recording permission on completion via `CGRequestScreenCaptureAccess()`.
+- Settings > Permissions row relabelled "Screen & System Audio Recording"; deep-links to the Screen Recording pane; uses `CGPreflightScreenCaptureAccess()` for live TCC state instead of a "recorded once" cache.
+
 ### Fixed
 
 - Silent system-audio track on FaceTime (and any app routing through communication audio paths on macOS 26). SCStream delivers non-interleaved stereo Float32 CMSampleBuffers; the PCM round-trip helper inherited from the CATap era mis-copied non-interleaved payloads, producing system tracks with mean_volume near -66 dB. SCStream buffers are now appended directly to a stereo 128 kbps AAC writer input (v0.6.0 parity). Post-fix: FaceTime system track mean_volume -37.8 dB (from -66.4 dB); Chrome -27.1 dB.
+- Full-hour mic-only recordings when default output was idle while Chrome Meet routed call audio to a non-default output via its in-page device picker.
 - `AudioRecorder.stop()` now tears down the D12 default-input CoreAudio listener and watchdog timer (previously only removed in `deinit`'s defensive path). Closes a listener leak on `kAudioObjectSystemObject` that accumulated across recording sessions.
 - Onboarding gate now treats `CGPreflightScreenCaptureAccess()` as the source of truth on every launch. First-run denial and post-install permission revocation both re-surface onboarding; prior behaviour sticky-marked onboarding complete even when the TCC prompt was denied.
 - `mappedStartError` now routes SCStream `-3802`/`-3821` codes to `RecorderError.systemStopped` (new case), matching the in-flight `handleStreamStopped` routing.
 
-### Changed
-
-- System-audio track is now 2ch stereo 48 kHz 128 kbps AAC (was 1ch mono 64 kbps). Mic track remains 1ch mono 48 kHz 64 kbps. File size for a 30 min call: system track ~29 MB (was ~14 MB).
-- Gap fill (D8), leading silence, and tail padding apply to the mic track only. System track has no synthesised silence - matches v0.6.0 which shipped without system-track gap fill for weeks.
-- Settings > Permissions row relabelled "Screen & System Audio Recording"; deep-links to the Screen Recording pane; uses `CGPreflightScreenCaptureAccess()` for live TCC state instead of a "recorded once" cache.
-
-### Removed
-
-- `AudioRecorder.pcmBuffer(from:)` (interleaved-only PCM helper - root cause of the FaceTime silence on macOS 26), `systemFormat` cache, `systemBuffersConversionFailed` counter.
-
-## [0.8.0] - 2026-04-20
-
-### Changed
-
-- Reverted system audio capture from CoreAudio Process Tap (CATap) back to display-wide `SCStream` (ScreenCaptureKit). v0.6.0's SCStream approach had an empirical production track record with zero silent-recording reports; CATap produced three distinct silent-recording bugs in 5 days (Bluetooth HFP 24kHz pin, IO-proc stop when nothing plays, Chrome Meet routed to non-default idle output). Root cause: aggregate-device IO proc fires on a hardware output-device clock that can be idle, pinned, or stalled. SCStream's clock comes from the OS-composited mix, decoupled from any specific device.
-- Onboarding now actively requests Screen Recording permission on completion via `CGRequestScreenCaptureAccess()`.
-
-### Fixed
-
-- Full-hour mic-only recordings when default output was idle while Chrome Meet routed call audio to a non-default output via its in-page device picker.
-
 ### Removed
 
 - CATap tap/aggregate-device/IO-proc pipeline, output-device change listener, IO proc buffer pool, and mic recovery-after-device-change paths.
+- `AudioRecorder.pcmBuffer(from:)` (interleaved-only PCM helper - root cause of the FaceTime silence on macOS 26), `systemFormat` cache, `systemBuffersConversionFailed` counter.
 
 ## [0.7.0] - 2026-04-17
 
@@ -273,7 +264,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.7.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/tenequm/blackbox/compare/v0.5.0...v0.5.1
