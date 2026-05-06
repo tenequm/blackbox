@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-06
+
+### Fixed
+
+- 5h46m ghost recording / 0-byte M4A when stop arrives during `AudioRecorder.start()`. Swift actor reentrancy let `stop()` flip a single `stopped` flag while `start()` was suspended on `SCShareableContent` (~12 s); the resumed start created a live recorder no caller held, dropped every buffer, and never finalized. `AudioRecorder` is now a four-phase machine (`notStarted` -> `starting` -> `running` -> `stopped`) with a `cancelRequested` flag checked after every `await`, and a take-and-nil cleanup that's safe under reentrancy. No failure path leaves an orphan directory or zero-byte file under `~/Library/Application Support/Blackbox/Recordings/`.
+- `RecordingPipeline.start()` self-cleans on partial-init throws (metadata save, AVAssetWriter init, startWriting): the recording directory is removed before the error propagates, instead of being left behind for `pipeline.stop()` to ignore.
+- Stop arriving during startup no longer surfaces an error toast. `AudioMonitor` pattern-matches `RecorderError.cancelled` and lost-race conditions silently; permission-denied and other real errors still surface.
+- After a user-initiated stop (manual stop, force-stop on auto-recording), the same bundle no longer immediately re-triggers auto-record on the next 3 s poll. The resolved parent bundle ID is suppressed until it disappears from the active-caller set; other apps (e.g. Zoom while Chrome is suppressed) still trigger auto-record. Grace-expiry stops do not suppress, so a re-detected call still records.
+
+### Added
+
+- `RecorderError.cancelled` for stop-during-start cancellation.
+- `StartCheckpoint` test seam in `AudioRecorder` and a `StartGate` actor for deterministic recorder-race tests.
+- Docs: `docs/specification.md` D4 amended with the always-live WebRTC caveat; new D13 covers the recorder lifecycle invariant, monitor cooperation, and suppression semantics.
+
 ## [0.8.0] - 2026-04-24
 
 ### Added
@@ -264,7 +279,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.8.0...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
