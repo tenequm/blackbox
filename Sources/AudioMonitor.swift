@@ -27,6 +27,16 @@ final class AudioMonitor {
   private var settingsTask: Task<Void, Never>?
   private var elapsedTimer: Timer?
   private var graceTask: Task<Void, Never>?
+  // Track in-flight start() invocations so stopMonitoring can wait for the
+  // catch/cleanup path to unwind even if the recorder.start() awaitable
+  // returns slowly.
+  private var autoStartTask: Task<Void, Never>?
+  private var manualStartTask: Task<Void, Never>?
+  // After a user-initiated stop (manual stop, or force-stop on auto), suppress
+  // auto-restart of the same parent bundle until it disappears from the caller
+  // set for one poll. Single-bundle: covers the reported Chrome case;
+  // multi-caller suppression is speculative and out of scope.
+  private var suppressedBundleID: String?
 
   // Restart rate limiting: max 3 restarts within 30 seconds
   private var autoRestartCount = 0
@@ -101,6 +111,12 @@ final class AudioMonitor {
     stopElapsedTimer()
     cancelGracePeriod()
 
+    // Snapshot start tasks before we await anything. The Task body clears
+    // its own field via defer; awaiting the snapshot makes the wait
+    // deterministic regardless of completion order.
+    let autoTask = autoStartTask
+    let manualTask = manualStartTask
+
     if let recorder = autoRecorder {
       _ = await recorder.stop()
       autoRecorder = nil
@@ -111,6 +127,11 @@ final class AudioMonitor {
       manualRecorder = nil
       isManualRecording = false
     }
+
+    // Wait for any in-flight start() Task to unwind (success or catch path)
+    // so applicationShouldTerminate's 8s budget is honored.
+    await autoTask?.value
+    await manualTask?.value
 
     isRecording = false
     currentAppName = nil
@@ -204,10 +225,14 @@ final class AudioMonitor {
     manualRecorder = recorder
     isManualRecording = true
 
-    Task { @MainActor [weak self] in
+    self.manualStartTask = Task { @MainActor [weak self] in
       guard let self else { return }
+      defer { self.manualStartTask = nil }
       do {
         try await recorder.start()
+        // Identity guard: if stop arrived during start(), the recorder we
+        // hold is no longer the one we kicked off. Don't promote state.
+        guard self.manualRecorder === recorder else { return }
         self.permissionNeeded = false
         self.recordingStartTime = self.dependencies.now()
         self.currentAppName = "Manual recording"
@@ -215,9 +240,22 @@ final class AudioMonitor {
         self.startElapsedTimer()
         self.notifyRecordingStarted(appName: "Manual recording")
       } catch {
-        self.setError("Failed to start recording: \(error.localizedDescription)")
-        self.manualRecorder = nil
-        self.isManualRecording = false
+        // Suppress error toast for cancellations (stop during start) and
+        // lost-race situations (stop nilled the recorder before start
+        // returned). Use pattern matching to avoid requiring Equatable on
+        // RecorderError.
+        var isCancel = false
+        if let recError = error as? RecorderError, case .cancelled = recError {
+          isCancel = true
+        }
+        let lostRace = self.manualRecorder !== recorder
+        if !(isCancel || lostRace) {
+          self.setError("Failed to start recording: \(error.localizedDescription)")
+        }
+        if !lostRace {
+          self.manualRecorder = nil
+          self.isManualRecording = false
+        }
         self.updateAutoState()
       }
     }
@@ -262,11 +300,15 @@ final class AudioMonitor {
 
   func forceStopAutoRecording() {
     cancelGracePeriod()
-    stopAutoRecording()
+    stopAutoRecording(suppressBundleAfterStop: true)
   }
 
   func stopManualRecording() {
     guard let recorder = manualRecorder else { return }
+    // Snapshot before any state change so we suppress the bundle the user
+    // was just recording. Manual recordings have no `autoRecordingBundleID`,
+    // so the first currently-active resolved caller is the closest signal.
+    suppressedBundleID = firstActiveResolvedCaller()
     let appName = currentAppName ?? recorder.appName
     manualRecorder = nil
     isManualRecording = false
@@ -318,8 +360,26 @@ final class AudioMonitor {
   /// Re-evaluate call state by checking which external processes have active calls.
   /// Called from polling loop every 3 seconds.
   private func evaluateCallState() {
-    let callers = dependencies.findActiveCallingProcesses()
-    let running = !callers.isEmpty
+    let resolvedCallers = dependencies.findActiveCallingProcesses()
+      .compactMap { $0 }
+      .map(Self.resolveParentBundleID)
+
+    // Clear suppression once the suppressed bundle disappears from the full
+    // caller set. We check against `resolvedCallers` (not `eligibleCallers`)
+    // so the bundle leaving its own suppression set actually clears it.
+    if let suppressed = suppressedBundleID, !resolvedCallers.contains(suppressed) {
+      suppressedBundleID = nil
+    }
+
+    // Eligible callers exclude the suppressed bundle, so other apps (e.g.
+    // Zoom) can still trigger auto-record while Chrome is suppressed.
+    let eligibleCallers: [String]
+    if let suppressed = suppressedBundleID {
+      eligibleCallers = resolvedCallers.filter { $0 != suppressed }
+    } else {
+      eligibleCallers = resolvedCallers
+    }
+    let running = !eligibleCallers.isEmpty
 
     if running {
       consecutiveInactivePolls = 0
@@ -327,13 +387,13 @@ final class AudioMonitor {
       if running != lastKnownMicRunning {
         Log.info(
           Log.monitor, "monitor",
-          "call state changed: activeCallers=\(callers.count), running=\(running)")
+          "call state changed: eligibleCallers=\(eligibleCallers.count), running=\(running)")
         lastKnownMicRunning = true
-        let bundleID = callers.count == 1 ? callers.first ?? nil : nil
+        let bundleID = eligibleCallers.count == 1 ? eligibleCallers.first : nil
         handleMicBecameActive(appBundleID: bundleID)
       } else if autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
         Log.info(Log.monitor, "monitor", "retrying auto-recording for active call")
-        handleMicBecameActive(appBundleID: callers.first ?? nil)
+        handleMicBecameActive(appBundleID: eligibleCallers.first)
       }
       return
     }
@@ -341,7 +401,7 @@ final class AudioMonitor {
     if running != lastKnownMicRunning {
       Log.info(
         Log.monitor, "monitor",
-        "call state changed: activeCallers=\(callers.count), running=\(running)")
+        "call state changed: eligibleCallers=\(eligibleCallers.count), running=\(running)")
       lastKnownMicRunning = running
     }
 
@@ -359,6 +419,17 @@ final class AudioMonitor {
     }
 
     handleMicBecameInactive()
+  }
+
+  /// First currently-active caller resolved to its parent bundle ID. Used by
+  /// stop paths that need to seed `suppressedBundleID` when no
+  /// `autoRecordingBundleID` is available (e.g. manual stop or multi-caller
+  /// auto stop).
+  private func firstActiveResolvedCaller() -> String? {
+    dependencies.findActiveCallingProcesses()
+      .compactMap { $0 }
+      .map(Self.resolveParentBundleID)
+      .first
   }
 
   /// Resolve helper subprocess bundle IDs to the parent app.
@@ -492,10 +563,14 @@ final class AudioMonitor {
     Log.info(
       Log.monitor, "monitor", "starting auto-recording (call detected, app=\(appName))")
 
-    Task { @MainActor [weak self] in
+    self.autoStartTask = Task { @MainActor [weak self] in
       guard let self else { return }
+      defer { self.autoStartTask = nil }
       do {
         try await recorder.start()
+        // Identity guard: if stop arrived during start(), the recorder we
+        // hold is no longer the one we kicked off. Don't promote state.
+        guard self.autoRecorder === recorder else { return }
         self.permissionNeeded = false
         self.isRecording = true
         self.currentAppName = appName
@@ -503,20 +578,37 @@ final class AudioMonitor {
         self.startElapsedTimer()
         self.notifyRecordingStarted(appName: appName)
       } catch {
-        self.setError("Failed to start recording: \(error.localizedDescription)")
-        if let recError = error as? RecorderError,
-          case .permissionDenied = recError
-        {
-          self.permissionNeeded = true
+        // Pattern-match instead of relying on Equatable on RecorderError so
+        // future associated values do not silently break this branch.
+        var isCancel = false
+        if let recError = error as? RecorderError, case .cancelled = recError {
+          isCancel = true
         }
-        self.autoRecorder = nil
+        let lostRace = self.autoRecorder !== recorder
+        if !(isCancel || lostRace) {
+          self.setError("Failed to start recording: \(error.localizedDescription)")
+          if let recError = error as? RecorderError,
+            case .permissionDenied = recError
+          {
+            self.permissionNeeded = true
+          }
+        }
+        if !lostRace {
+          self.autoRecorder = nil
+        }
         self.updateAutoState()
       }
     }
   }
 
-  private func stopAutoRecording() {
+  private func stopAutoRecording(suppressBundleAfterStop: Bool = false) {
     guard let recorder = autoRecorder else { return }
+    // Suppress only on user-initiated stops (forceStopAutoRecording). Grace
+    // expiry leaves suppression alone so a re-detected call can record again
+    // without waiting for the bundle to flap absent->present.
+    if suppressBundleAfterStop {
+      suppressedBundleID = autoRecordingBundleID ?? firstActiveResolvedCaller()
+    }
     let appName = autoRecordingAppName ?? "Call"
     autoRecorder = nil
     autoRecordingAppName = nil

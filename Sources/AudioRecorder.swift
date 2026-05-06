@@ -55,7 +55,12 @@ actor AudioRecorder {
 
   // Writer state
   private var pipeline: RecordingPipeline?
-  private var stopped = false
+  // Lifecycle phase. `cancelRequested` is set synchronously by `stop()` so an
+  // in-flight `start()` resuming from any await observes the cancel and bails
+  // through `checkAlive()` regardless of which phase stop() ran in.
+  private enum Phase { case notStarted, starting, running, stopped }
+  private var phase: Phase = .notStarted
+  private var cancelRequested = false
   private var activity: NSObjectProtocol?
   private var diskSpaceTimer: DispatchSourceTimer?
   private var lowDiskSpaceWarned = false
@@ -76,6 +81,14 @@ actor AudioRecorder {
   private var lastSystemHostTime: UInt64 = 0
   private var driftStartHost: UInt64 = 0
 
+  enum StartCheckpoint: Sendable {
+    case beforeContent
+    case afterPipeline
+    case afterStreamStart
+  }
+
+  nonisolated let testStartCheckpoint: (@Sendable (StartCheckpoint) async -> Void)?
+
   init(
     bundleID: String? = nil, appName: String, micEnabled: Bool,
     saveDirectory: URL,
@@ -83,7 +96,8 @@ actor AudioRecorder {
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
     onAudioLevel: (@Sendable (Float) -> Void)? = nil,
     onLowDiskSpace: (@Sendable (Int64) -> Void)? = nil,
-    onContinuity: (@Sendable () -> Void)? = nil
+    onContinuity: (@Sendable () -> Void)? = nil,
+    testStartCheckpoint: (@Sendable (StartCheckpoint) async -> Void)? = nil
   ) {
     self.bundleID = bundleID
     self.appName = appName
@@ -94,6 +108,7 @@ actor AudioRecorder {
     self.onAudioLevel = onAudioLevel
     self.onLowDiskSpace = onLowDiskSpace
     self.onContinuity = onContinuity
+    self.testStartCheckpoint = testStartCheckpoint
   }
 
   deinit {
@@ -118,26 +133,44 @@ actor AudioRecorder {
 
   // MARK: - Start / Stop
 
+  /// Throws `.cancelled` if `stop()` arrived during `start()`. Called after
+  /// every await so a reentrant stop terminates the in-flight start before
+  /// it can register more resources.
+  private func checkAlive() throws {
+    if cancelRequested { throw RecorderError.cancelled }
+  }
+
   /// Starts capturing audio and writing to file immediately.
+  ///
+  /// Lifecycle: phase transitions notStarted -> starting -> running. If
+  /// `stop()` arrives during a startup await, `cancelRequested` flips and
+  /// the next `checkAlive()` throws `RecorderError.cancelled`; the catch
+  /// path tears down any partial state via `cleanupPartialStart()`.
   func start() async throws {
+    precondition(phase == .notStarted, "AudioRecorder.start() called more than once")
+    phase = .starting
     Log.info(Log.recorder, "recorder", "start() for \(appName) (\(bundleID ?? "all"))")
 
-    // 1. Discover a display to drive the system-audio SCStream.
-    let content = try await SCShareableContent.excludingDesktopWindows(
-      false, onScreenWindowsOnly: false)
-    guard let display = content.displays.first else {
-      Log.error(Log.recorder, "recorder", "no display found for \(appName)")
-      throw RecorderError.noDisplay
-    }
-
-    // Display-wide audio capture (no window/app exclusions). SCStream's display
-    // mix is driven by the OS-composited output path, not a specific hardware
-    // clock, so it is resilient to idle/pinned/stalled output devices.
-    let filter = SCContentFilter(
-      display: display, excludingApplications: [], exceptingWindows: [])
-    let config = makeStreamConfig()
-
     do {
+      await testStartCheckpoint?(.beforeContent)
+      try checkAlive()
+
+      // 1. Discover a display to drive the system-audio SCStream.
+      let content = try await SCShareableContent.excludingDesktopWindows(
+        false, onScreenWindowsOnly: false)
+      try checkAlive()
+      guard let display = content.displays.first else {
+        Log.error(Log.recorder, "recorder", "no display found for \(appName)")
+        throw RecorderError.noDisplay
+      }
+
+      // Display-wide audio capture (no window/app exclusions). SCStream's display
+      // mix is driven by the OS-composited output path, not a specific hardware
+      // clock, so it is resilient to idle/pinned/stalled output devices.
+      let filter = SCContentFilter(
+        display: display, excludingApplications: [], exceptingWindows: [])
+      let config = makeStreamConfig()
+
       let pipeline = RecordingPipeline(
         bundleID: bundleID,
         appName: appName,
@@ -162,8 +195,13 @@ actor AudioRecorder {
           }
         }
       )
-      try pipeline.start()
+      // Assign before pipeline.start() so a partial-init throw is reachable
+      // from cleanupPartialStart's take-and-nil sweep.
       self.pipeline = pipeline
+      try pipeline.start()
+
+      await testStartCheckpoint?(.afterPipeline)
+      try checkAlive()
 
       let proxy = SCStreamProxy(audioQueue: audioQueue)
       proxy.recorder = self
@@ -179,7 +217,15 @@ actor AudioRecorder {
       )
 
       try await stream.startCapture()
+      // Flip to .running synchronously after startCapture returns so the
+      // `phase == .running` guard on handleSystemSampleBuffer accepts buffers
+      // from first delivery. No await between here and the flip.
+      phase = .running
       Log.info(Log.recorder, "recorder", "SCStream started for \(appName)")
+
+      await testStartCheckpoint?(.afterStreamStart)
+      try checkAlive()
+
       startDiskSpaceMonitor()
       if micEnabled { startDriftMonitor() }
 
@@ -195,29 +241,84 @@ actor AudioRecorder {
       }
     } catch {
       Log.error(Log.recorder, "recorder", "recording setup failed for \(appName): \(error)")
-      stopMicCapture()
-      if let stream = displayStream {
-        try? await stream.stopCapture()
-        self.displayStream = nil
-      }
-      self.streamProxy = nil
-      if let existingPipeline = self.pipeline {
-        _ = await existingPipeline.stop()
-        self.pipeline = nil
-      }
-      if let activity {
-        ProcessInfo.processInfo.endActivity(activity)
-        self.activity = nil
-      }
+      await cleanupPartialStart()
+      phase = .stopped
       throw mappedStartError(error)
     }
+  }
+
+  /// Reentrancy-safe partial-start teardown. Snapshots resources to local
+  /// lets, nils the actor fields synchronously, then awaits teardown on the
+  /// snapshots. A second concurrent caller (e.g. stop() racing against the
+  /// catch block) sees nil fields and is a no-op. Mic teardown delegates to
+  /// `stopMicCapture()` because nilling `defaultInputListenerBlock` and
+  /// `configChangeObserver` directly would leak the registered listeners.
+  private func cleanupPartialStart() async {
+    stopMicCapture()
+
+    let stream = displayStream
+    let pipe = pipeline
+    let activitySnap = activity
+    let dskTimer = diskSpaceTimer
+    let drftTimer = driftTimer
+
+    displayStream = nil
+    streamProxy = nil
+    pipeline = nil
+    activity = nil
+    diskSpaceTimer = nil
+    driftTimer = nil
+
+    if let stream {
+      // Race stopCapture against a 3s timeout (mirrors the steady-state stop
+      // path) so a hung SCStream cannot exceed applicationShouldTerminate's
+      // 8s budget.
+      await withTaskGroup(of: Void.self) { group in
+        group.addTask { try? await stream.stopCapture() }
+        group.addTask { try? await Task.sleep(for: .seconds(3)) }
+        await group.next()
+        group.cancelAll()
+      }
+    }
+    if let pipe { _ = await pipe.stop() }
+    if let activitySnap { ProcessInfo.processInfo.endActivity(activitySnap) }
+    dskTimer?.cancel()
+    drftTimer?.cancel()
   }
 
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
-    Log.info(Log.recorder, "recorder", "stop() for \(appName)")
+    Log.info(Log.recorder, "recorder", "stop() for \(appName) (phase=\(phase))")
 
+    switch phase {
+    case .notStarted:
+      cancelRequested = true
+      phase = .stopped
+      return nil
+
+    case .starting:
+      // Synchronous flip so an in-flight start() resuming from any await
+      // observes the cancel via checkAlive() and bails into its catch path.
+      cancelRequested = true
+      await cleanupPartialStart()
+      phase = .stopped
+      return nil
+
+    case .running:
+      // Defensive: future test seams could suspend start() past .running.
+      // Setting cancelRequested ensures any such suspended start aborts.
+      cancelRequested = true
+      return await stopRunning()
+
+    case .stopped:
+      return nil
+    }
+  }
+
+  /// Steady-state teardown: stream stop with timeout, mic teardown, finalize
+  /// writer, return saved URL.
+  private func stopRunning() async -> URL? {
     if let stream = displayStream {
       // Race stopCapture against a 3s timeout so a hung SCStream (documented
       // under WindowServer stalls) cannot exceed applicationShouldTerminate's
@@ -232,11 +333,11 @@ actor AudioRecorder {
     self.displayStream = nil
     self.streamProxy = nil
 
-    stopped = true
+    phase = .stopped
 
     // Delegates to stopMicCapture so the D12 watchdog + default-input listener
     // + configChangeObserver + engine teardown all run in one place. With
-    // `stopped = true` already set above, any in-flight mic tap callback
+    // `phase = .stopped` already set above, any in-flight mic tap callback
     // arriving during the teardown short-circuits inside handleMicBuffer.
     stopMicCapture()
 
@@ -302,7 +403,7 @@ actor AudioRecorder {
   /// native 48 kHz stereo Float32 format and we append it directly to a stereo
   /// 128 kbps AAC writer input. No PCM round-trip, no downmix, no re-wrap.
   fileprivate func handleSystemSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-    guard !stopped else { return }
+    guard phase == .running else { return }
     guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
     // Host ticks of callback arrival - symmetric with the mic path, which
@@ -316,7 +417,7 @@ actor AudioRecorder {
   /// SCStream delegate reported that the stream stopped. Map the error to
   /// the recovery vocabulary `AudioMonitor` understands.
   fileprivate func handleStreamStopped(code: Int, description: String) {
-    guard !stopped else { return }
+    guard phase != .stopped else { return }
     let failure: RecorderFailure
     switch code {
     case -3801: failure = .permissionDenied
@@ -471,7 +572,7 @@ actor AudioRecorder {
 
   /// Handles mic audio buffer on audioQueue.
   private func handleMicBuffer(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
-    guard !stopped else { return }
+    guard phase == .running else { return }
     if time.isHostTimeValid {
       lastMicHostTime = time.hostTime
     }
@@ -521,7 +622,7 @@ actor AudioRecorder {
     audioQueue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
       guard let self else { return }
       self.assumeIsolated { iso in
-        guard !iso.stopped, iso.configChangeGeneration == gen else { return }
+        guard iso.phase != .stopped, iso.configChangeGeneration == gen else { return }
         iso.handleEngineConfigChange(engine: engine)
       }
     }
@@ -531,7 +632,7 @@ actor AudioRecorder {
   /// Runs on audioQueue to serialize with stopped flag and buffer handling.
   /// Reinstalls tap and restarts engine. System audio continues regardless.
   private func handleEngineConfigChange(engine: AVAudioEngine) {
-    guard !stopped else { return }
+    guard phase != .stopped else { return }
     onContinuity?()
     Log.info(Log.recorder, "recorder", "audio engine config changed, restarting mic capture")
 
@@ -604,7 +705,7 @@ actor AudioRecorder {
   /// default-input listener, watchdog) through the same debounced path. Logs
   /// the source so we can tell from logs which layer actually saved a recording.
   private func requestMicReinstall(source: String) {
-    guard !stopped else { return }
+    guard phase != .stopped else { return }
     guard let engine = audioEngine else { return }
     Log.info(Log.recorder, "recorder", "mic reinstall requested (source=\(source))")
     debounceConfigChange(engine: engine)
@@ -622,7 +723,7 @@ actor AudioRecorder {
       [weak self] _, _ in
       guard let self else { return }
       self.assumeIsolated { iso in
-        guard !iso.stopped else { return }
+        guard iso.phase != .stopped else { return }
         iso.requestMicReinstall(source: "default_input_listener")
       }
     }
@@ -674,7 +775,7 @@ actor AudioRecorder {
   }
 
   private func checkMicWatchdog() {
-    guard !stopped, audioEngine != nil else { return }
+    guard phase != .stopped, audioEngine != nil else { return }
     let now = mach_absolute_time()
     guard now > lastMicHostTime else { return }
     let elapsedTicks = now - lastMicHostTime
@@ -739,7 +840,7 @@ actor AudioRecorder {
   }
 
   private func logDrift() {
-    guard !stopped else { return }
+    guard phase != .stopped else { return }
     let now = mach_absolute_time()
     let elapsedMs = Double(AudioConvertHostTimeToNanos(now - driftStartHost)) / 1_000_000
 
@@ -782,7 +883,7 @@ actor AudioRecorder {
   }
 
   private func checkDiskSpace() {
-    guard !stopped else { return }
+    guard phase != .stopped else { return }
     let attrs = try? FileManager.default.attributesOfFileSystem(forPath: saveDirectory.path)
     guard let freeBytes = attrs?[.systemFreeSize] as? Int64 else { return }
 
@@ -921,6 +1022,7 @@ enum RecorderError: Error, LocalizedError {
   case permissionDenied
   case systemStopped
   case writerFailed
+  case cancelled
 
   var errorDescription: String? {
     switch self {
@@ -928,6 +1030,7 @@ enum RecorderError: Error, LocalizedError {
     case .permissionDenied: "Screen Recording permission denied"
     case .systemStopped: "System audio capture was stopped"
     case .writerFailed: "Failed to start audio writer"
+    case .cancelled: "Recording start was cancelled"
     }
   }
 }

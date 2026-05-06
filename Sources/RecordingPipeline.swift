@@ -185,71 +185,82 @@ final class RecordingPipeline: @unchecked Sendable {
     let dirURL = saveDirectory.appendingPathComponent(dirName)
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
-    let audioURL = dirURL.appendingPathComponent("audio.m4a")
-    Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
+    // Self-clean on any partial-init throw: metadata.save / AVAssetWriter
+    // init can fail with `dirURL` already on disk but `fileURL` never set.
+    // Without this, pipeline.stop() reads `fileURL` (nil) and leaves an
+    // orphan directory in the user's recordings folder.
+    do {
+      let audioURL = dirURL.appendingPathComponent("audio.m4a")
+      Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
 
-    let metadata = RecordingMetadata(
-      title: appName,
-      createdAt: now,
-      appName: appName,
-      speakers: [:],
-      perAppBundleID: bundleID,
-      perAppName: nil,
-      trackCount: 1 + (micEnabled ? 1 : 0)
-    )
-    try metadata.save(in: dirURL)
+      let metadata = RecordingMetadata(
+        title: appName,
+        createdAt: now,
+        appName: appName,
+        speakers: [:],
+        perAppBundleID: bundleID,
+        perAppName: nil,
+        trackCount: 1 + (micEnabled ? 1 : 0)
+      )
+      try metadata.save(in: dirURL)
 
-    // v0.6.0 parity: system track is stereo 128 kbps AAC so SCStream buffers
-    // can be appended directly. Mic track is mono 64 kbps AAC - the mic path
-    // resamples/downmixes to mono via `resampleToMono48k` before append.
-    let systemSettings: [String: Any] = [
-      AVFormatIDKey: kAudioFormatMPEG4AAC,
-      AVSampleRateKey: Self.writerSampleRate,
-      AVNumberOfChannelsKey: 2,
-      AVEncoderBitRateKey: 128_000,
-    ]
-    let micSettings: [String: Any] = [
-      AVFormatIDKey: kAudioFormatMPEG4AAC,
-      AVSampleRateKey: Self.writerSampleRate,
-      AVNumberOfChannelsKey: 1,
-      AVEncoderBitRateKey: 64_000,
-    ]
+      // v0.6.0 parity: system track is stereo 128 kbps AAC so SCStream buffers
+      // can be appended directly. Mic track is mono 64 kbps AAC - the mic path
+      // resamples/downmixes to mono via `resampleToMono48k` before append.
+      let systemSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: Self.writerSampleRate,
+        AVNumberOfChannelsKey: 2,
+        AVEncoderBitRateKey: 128_000,
+      ]
+      let micSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: Self.writerSampleRate,
+        AVNumberOfChannelsKey: 1,
+        AVEncoderBitRateKey: 64_000,
+      ]
 
-    let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
-    newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+      let newWriter = try AVAssetWriter(url: audioURL, fileType: .m4a)
+      newWriter.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
-    let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: systemSettings)
-    systemInput.expectsMediaDataInRealTime = true
-    newWriter.add(systemInput)
+      let systemInput = AVAssetWriterInput(mediaType: .audio, outputSettings: systemSettings)
+      systemInput.expectsMediaDataInRealTime = true
+      newWriter.add(systemInput)
 
-    var newMicInput: AVAssetWriterInput?
-    if micEnabled {
-      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
-      input.expectsMediaDataInRealTime = true
-      newWriter.add(input)
-      newMicInput = input
-    }
+      var newMicInput: AVAssetWriterInput?
+      if micEnabled {
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
+        input.expectsMediaDataInRealTime = true
+        newWriter.add(input)
+        newMicInput = input
+      }
 
-    guard newWriter.startWriting() else {
-      let err = newWriter.error
-      Log.error(
-        Log.recorder, "recorder",
-        "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
+      guard newWriter.startWriting() else {
+        let err = newWriter.error
+        Log.error(
+          Log.recorder, "recorder",
+          "writer startWriting failed: \(err?.localizedDescription ?? "unknown")")
+        // Explicit cleanup before throwing so the outer catch's removeItem
+        // is a no-op (try? on already-removed dir).
+        try? FileManager.default.removeItem(at: dirURL)
+        throw err ?? RecorderError.writerFailed
+      }
+
+      writer = newWriter
+      systemTrack = TrackState(input: systemInput)
+      micTrack = TrackState(input: newMicInput)
+      fileURL = dirURL
+      sessionStarted = false
+      sessionStartTime = .invalid
+      sessionPending = true
+      firstSampleWallClock = nil
+      stopped = false
+      writerFailureReported = false
+      diagnostics = RecordingDiagnostics()
+    } catch {
       try? FileManager.default.removeItem(at: dirURL)
-      throw err ?? RecorderError.writerFailed
+      throw error
     }
-
-    writer = newWriter
-    systemTrack = TrackState(input: systemInput)
-    micTrack = TrackState(input: newMicInput)
-    fileURL = dirURL
-    sessionStarted = false
-    sessionStartTime = .invalid
-    sessionPending = true
-    firstSampleWallClock = nil
-    stopped = false
-    writerFailureReported = false
-    diagnostics = RecordingDiagnostics()
   }
 
   nonisolated func appendSystemSample(_ sampleBuffer: CMSampleBuffer) {

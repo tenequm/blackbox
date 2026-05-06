@@ -225,4 +225,137 @@ struct AudioMonitorIntegrationTests {
 
     await monitor.stopMonitoring()
   }
+
+  @Test("stop during slow start cleans state without firing an error toast")
+  func monitorStopDuringSlowFakeStart_cleanState() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.recorderFactory.nextSuspendStart = true
+    harness.activeCallers = ["com.example.Chrome"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    #expect(session.startCallCount == 1)
+
+    // Drop the caller and let grace expire so the monitor calls stop()
+    // while session.start() is still suspended.
+    harness.activeCallers = []
+    harness.clock.advance(by: .seconds(3))  // first inactive poll
+    await settle()
+    harness.clock.advance(by: .seconds(3))  // second inactive poll, grace begins
+    await settle()
+    harness.clock.advance(by: .seconds(6))  // grace expires
+    await settle()
+
+    #expect(session.stopCallCount >= 1)
+
+    // Now release the suspended start. start() returns; monitor's identity
+    // guard / silent-cancel branch should suppress the error toast.
+    session.releaseStart()
+    await settle()
+
+    #expect(monitor.isRecording == false)
+    #expect(monitor.errorMessage == nil, "no error toast for cancelled startup")
+    #expect(harness.hud.errors.isEmpty)
+
+    // Monitor should accept a fresh detection on next poll.
+    harness.activeCallers = ["com.example.Chrome"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 2)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("manual stop suppresses auto-retry until the bundle disappears")
+  func manualStopSuppressesAutoRetryUntilBundleInactive() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    // Helper bundle ID exercises parent-resolution path.
+    harness.activeCallers = ["com.google.Chrome.helper.renderer"]
+    monitor.startManualRecording()
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    #expect(monitor.isManualRecording)
+
+    monitor.stopManualRecording()
+    await settle()
+    #expect(!monitor.isManualRecording)
+
+    // Chrome still active; auto-record must NOT fire.
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    // Chrome disappears -> suppression clears on the poll.
+    harness.activeCallers = []
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    // Chrome reappears -> auto-record resumes.
+    harness.activeCallers = ["com.google.Chrome.helper.renderer"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 2)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("suppression filters one bundle but lets other apps trigger auto-record")
+  func suppressionDoesNotBlockOtherApps() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    harness.activeCallers = ["com.google.Chrome", "com.zoom.us"]
+    monitor.startManualRecording()
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    monitor.stopManualRecording()
+    await settle()
+
+    // Chrome is suppressed; Zoom should still trigger auto-record.
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    #expect(harness.recorderFactory.createdSessions.count == 2)
+    let autoSession = try #require(harness.recorderFactory.createdSessions.last)
+    #expect(autoSession.configuration.bundleID == "com.zoom.us")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("permissionDenied surfaces an error and is not silent-cancelled")
+  func permissionDeniedStillSurfacesWhenNotCancel() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.recorderFactory.nextStartError = RecorderError.permissionDenied
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    // Intentionally do not advance the clock here. setupCallDetection runs
+    // synchronously and fires the failing start. Advancing the poll clock
+    // would trigger a retry and clear permissionNeeded on a successful
+    // second attempt, masking the assertion we want to make.
+    await settle(times: 20)
+
+    #expect(monitor.errorMessage != nil)
+    #expect(monitor.permissionNeeded == true)
+
+    await monitor.stopMonitoring()
+  }
 }

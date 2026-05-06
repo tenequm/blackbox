@@ -108,14 +108,57 @@ final class FakeHUD: AudioMonitorHUD {
   }
 }
 
+/// Async gate used by AudioRecorder race tests to deterministically suspend
+/// `start()` at a specific checkpoint, run a stop() against the same actor,
+/// and then release. Two-sided rendezvous: one waiter on the start side
+/// (suspending the recorder), one on the test side (waiting until the
+/// recorder has actually entered the suspended state).
+actor StartGate {
+  private var suspended: CheckedContinuation<Void, Never>?
+  private var observer: CheckedContinuation<Void, Never>?
+  private var didSuspend = false
+  private var didRelease = false
+
+  func suspend() async {
+    didSuspend = true
+    if let observer {
+      observer.resume()
+      self.observer = nil
+    }
+    if didRelease { return }
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+      suspended = cont
+    }
+  }
+
+  func waitForSuspended() async {
+    if didSuspend { return }
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+      observer = cont
+    }
+  }
+
+  func release() {
+    didRelease = true
+    let s = suspended
+    suspended = nil
+    s?.resume()
+  }
+}
+
 @MainActor
 final class TestRecorderSession: RecorderSession {
   let configuration: RecorderSessionConfiguration
 
   var startError: Error?
   var stopURL: URL?
+  /// When true, `start()` suspends on a CheckedContinuation and waits for
+  /// `releaseStart()`. Lets tests deterministically interleave a stop()
+  /// arriving while start() is in flight.
+  var suspendStart = false
   private(set) var startCallCount = 0
   private(set) var stopCallCount = 0
+  private var startSuspension: CheckedContinuation<Void, Never>?
 
   private let onFailure: (@Sendable (RecorderFailure) -> Void)?
   private let onContinuity: (@Sendable () -> Void)?
@@ -134,7 +177,18 @@ final class TestRecorderSession: RecorderSession {
 
   func start() async throws {
     startCallCount += 1
+    if suspendStart {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        startSuspension = continuation
+      }
+    }
     if let startError { throw startError }
+  }
+
+  func releaseStart() {
+    let cont = startSuspension
+    startSuspension = nil
+    cont?.resume()
   }
 
   func stop() async -> URL? {
@@ -156,6 +210,10 @@ final class TestRecorderFactory: RecorderSessionFactory {
   private(set) var createdSessions: [TestRecorderSession] = []
   var nextStartError: Error?
   var stopURL: URL?
+  /// If true, the next created session will suspend in `start()` until the
+  /// test calls `releaseStart()` on it. One-shot - resets after the next
+  /// session is produced.
+  var nextSuspendStart = false
 
   func makeRecorder(
     configuration: RecorderSessionConfiguration,
@@ -171,8 +229,10 @@ final class TestRecorderFactory: RecorderSessionFactory {
     )
     session.startError = nextStartError
     session.stopURL = stopURL
+    session.suspendStart = nextSuspendStart
     createdSessions.append(session)
     nextStartError = nil
+    nextSuspendStart = false
     return session
   }
 }

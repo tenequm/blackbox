@@ -171,6 +171,8 @@ Architectural decisions with reasoning and alternatives considered.
 
 **Why both:** Input+output together identifies processes that are both capturing mic and playing audio - the defining characteristic of a call. Filters out most false positives without maintaining a hardcoded list of known call apps.
 
+**Caveat:** Always-live WebRTC tabs (Chrome "metaverse office", Discord, etc.) can hold both flags continuously even when no human is talking. The detection check itself cannot rule those out, so the recorder lifecycle (D13) and post-stop suppression carry the burden: stop is honored regardless of caller flap, and a manually-stopped bundle is filtered from the eligible-caller set until it actually disappears for one poll.
+
 ### D5: CATap for system audio (replaces dual SCStream) [SUPERSEDED by D10 in v0.8.0]
 
 **Decision:** Use CoreAudio Process Tap via Swift wrappers (`AudioHardwareSystem.shared.makeProcessTap`) and an aggregate device for all system audio capture. Replaces the previous dual-SCStream architecture (display-wide + per-app).
@@ -363,3 +365,17 @@ File-size trade-off: stereo 128 kbps vs mono 64 kbps means the system track roug
 **Observability:** Each restart logs its source (`avaudioengine_notification` / `default_input_listener` / `watchdog_mic_stall`). Log data over time is the basis for deciding whether any source can be dropped, or whether new listeners need adding.
 
 **Lifecycle:** Listener registered in the mic start path and removed in the mic stop path; the `AudioObjectPropertyListenerBlock` reference is stored so deregistration uses the same block (HAL API requirement). Watchdog timer created at mic start, cancelled at mic stop and in `deinit`. Both guard with the `stopped` flag.
+
+### D13: Recorder lifecycle invariant - no zero-byte artifacts, no silent stop
+
+**Decision:** `AudioRecorder` is a four-phase actor (`notStarted` -> `starting` -> `running` -> `stopped`) with a `cancelRequested` flag set synchronously by `stop()`. Buffer-handling sites guard on `phase == .running`; lifecycle sites guard on `phase != .stopped`; in-flight start sites guard on `cancelRequested` via `checkAlive()` after every await. `phase = .running` is set the instant `SCStream.startCapture()` returns (before mic startup) so initial system-audio buffers are accepted on legitimate starts.
+
+**Why:** A tester observed a 5h46m "ghost" recording that wrote a 0-byte M4A and made the Stop menu item silently fail. Root cause: Swift actor reentrancy. `start()` had two await points (`SCShareableContent` ~12 s, `stream.startCapture()`); a `stop()` flipping a single `stopped` flag mid-await let `start()` resume past the await and create a live recorder no caller held a reference to. Every audio buffer hit `guard !stopped`, was dropped, and the writer never finalized. The phase machine + cancellation flag closes that race.
+
+**Cleanup contract:** A recording is either a finalized playable M4A or no on-disk artifact - never zero bytes. Cancellation cleanup uses a take-and-nil pattern (snapshot resources to locals, nil actor fields synchronously, then await teardown on the locals) so a reentrant second caller sees nil fields and is a no-op. Mic-side teardown delegates to `stopMicCapture()` because nilling `defaultInputListenerBlock` / `configChangeObserver` directly leaks the registered observer with the OS. SCStream `stopCapture` races against a 3 s timeout so a hung WindowServer cannot exceed `applicationShouldTerminate`'s 8 s budget.
+
+**Pipeline self-clean:** `RecordingPipeline.start()` wraps the post-`createDirectory` body in a do/catch that removes the recording directory on any partial-init throw (`metadata.save`, `AVAssetWriter` init, `startWriting`). Combined with the cancellation cleanup, no failure path leaves an orphan dir or zero-byte file in `~/Library/Application Support/Blackbox/Recordings/`.
+
+**Monitor cooperation:** `AudioMonitor` tracks the in-flight `start()` Task per recorder kind (`autoStartTask`, `manualStartTask`). The Task body uses an identity guard (`autoRecorder === recorder`) before promoting state, so a stop-during-startup race lands silently in the catch path - no error toast on legit user-initiated stop. `RecorderError.cancelled` and lost-race conditions are matched as silent. `stopMonitoring` snapshots both start tasks before awaiting recorder stops, then awaits the Task bodies so the 8 s termination budget covers the full unwind.
+
+**Suppression:** After a user-initiated stop (manual stop, force-stop on auto), `AudioMonitor` records the resolved parent bundle ID in `suppressedBundleID: String?`. `evaluateCallState` filters that bundle out of the eligible-caller set; suppression clears the first poll the bundle disappears from the full caller set. Grace-expiry stops do not suppress - the bundle has already left, and re-detection should be free to record again. Single-bundle by design: covers the reported Chrome case; multi-bundle suppression is speculative and out of scope.
