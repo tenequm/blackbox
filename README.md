@@ -14,9 +14,15 @@ Detects when your microphone becomes active (e.g. during calls) and records syst
 
 ## Install
 
-Download the latest `.dmg` from [Releases](https://github.com/tenequm/blackbox/releases), open it, and drag Blackbox to Applications.
+Via [Homebrew](https://brew.sh):
 
-On first launch, grant Screen Recording and Microphone permissions when prompted.
+```bash
+brew install --cask tenequm/tap/blackbox
+```
+
+Or download the latest `.dmg` from [Releases](https://github.com/tenequm/blackbox/releases), open it, and drag Blackbox to Applications.
+
+Requires macOS 26.1 or later. On first launch, grant Screen Recording and Microphone permissions when prompted.
 
 ## Features
 
@@ -36,7 +42,7 @@ make install
 open /Applications/Blackbox.app
 ```
 
-Requires macOS 15+ and Swift 6.2+ (Xcode 16+).
+Requires macOS 26.1+ and Swift 6.2+ (Xcode 26+).
 
 ## Acknowledgments
 
