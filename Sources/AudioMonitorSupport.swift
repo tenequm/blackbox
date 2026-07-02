@@ -67,6 +67,7 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnStart: Bool
   var notifyOnSaved: Bool
   var notifyOnError: Bool
+  var excludedBundleIDs: Set<String> = []
 }
 
 struct AudioMonitorDependencies {
@@ -99,6 +100,11 @@ struct AudioMonitorDependencies {
 
       let defaults = UserDefaults.standard
       let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
+      let excludedBundleIDs =
+        (defaults.string(forKey: "excludedBundleIDs") ?? "")
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
       return AudioMonitorSettings(
         autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
         gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
@@ -106,7 +112,8 @@ struct AudioMonitorDependencies {
         saveDirectory: URL(fileURLWithPath: path),
         notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
         notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true
+        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
+        excludedBundleIDs: Set(excludedBundleIDs)
       )
     },
     microphoneAuthorizationStatus: {

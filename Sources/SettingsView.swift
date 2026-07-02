@@ -14,6 +14,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
+  @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
   @State private var audioRecordingGranted = false
@@ -24,6 +25,7 @@ struct SettingsView: View {
   var body: some View {
     Form {
       generalSection
+      excludedAppsSection
       permissionsSection
       recordingsSection
       transcriptionSection
@@ -85,6 +87,92 @@ struct SettingsView: View {
       Text("Keeps recording briefly after the microphone stops, in case the call resumes")
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+  }
+
+  // MARK: - Excluded Apps
+
+  private var excludedBundleIDs: [String] {
+    excludedBundleIDsRaw
+      .split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
+
+  private func addExcludedApp(bundleID: String) {
+    var ids = excludedBundleIDs
+    guard !ids.contains(bundleID) else { return }
+    ids.append(bundleID)
+    excludedBundleIDsRaw = ids.joined(separator: ",")
+  }
+
+  private func removeExcludedApp(bundleID: String) {
+    excludedBundleIDsRaw = excludedBundleIDs.filter { $0 != bundleID }.joined(separator: ",")
+  }
+
+  private func appDisplayName(forBundleID bundleID: String) -> String {
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+      let bundle = Bundle(url: url)
+    else { return bundleID }
+    return (bundle.infoDictionary?["CFBundleDisplayName"] as? String)
+      ?? (bundle.infoDictionary?["CFBundleName"] as? String)
+      ?? bundleID
+  }
+
+  /// Currently-running apps (not already excluded) available to add. Includes
+  /// menu-bar/accessory apps (e.g. dictation tools like TypeWhisper) alongside
+  /// regular apps, since those are exactly what trigger false-positive call
+  /// detection (mic + speaker briefly active together).
+  private var addableRunningApps: [(name: String, bundleID: String)] {
+    let excluded = Set(excludedBundleIDs)
+    let myBundleID = Bundle.main.bundleIdentifier
+    return
+      NSWorkspace.shared.runningApplications
+      .filter { $0.activationPolicy != .prohibited }
+      .compactMap { app -> (String, String)? in
+        guard let bundleID = app.bundleIdentifier, bundleID != myBundleID,
+          !excluded.contains(bundleID)
+        else { return nil }
+        return (app.localizedName ?? bundleID, bundleID)
+      }
+      .sorted { $0.0 < $1.0 }
+      .map { (name: $0.0, bundleID: $0.1) }
+  }
+
+  private var excludedAppsSection: some View {
+    Section("Excluded Apps") {
+      Text("Apps in this list never trigger automatic recording, even during a call.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+      ForEach(excludedBundleIDs, id: \.self) { bundleID in
+        HStack {
+          Text(appDisplayName(forBundleID: bundleID))
+          Text(bundleID)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Spacer()
+          Button {
+            removeExcludedApp(bundleID: bundleID)
+          } label: {
+            Image(systemName: "minus.circle.fill")
+              .foregroundStyle(.secondary)
+          }
+          .buttonStyle(.plain)
+        }
+      }
+
+      Menu("Add App…") {
+        if addableRunningApps.isEmpty {
+          Text("No other running apps")
+        } else {
+          ForEach(addableRunningApps, id: \.bundleID) { app in
+            Button(app.name) {
+              addExcludedApp(bundleID: app.bundleID)
+            }
+          }
+        }
+      }
     }
   }
 

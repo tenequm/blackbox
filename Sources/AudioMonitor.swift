@@ -58,6 +58,7 @@ final class AudioMonitor {
   var notifyOnStart: Bool = true
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
+  var excludedBundleIDs: Set<String> = []
 
   private var errorGeneration = 0
 
@@ -333,7 +334,11 @@ final class AudioMonitor {
   // MARK: - Call Detection (macOS 14.2+)
 
   private func setupCallDetection() {
-    let callers = dependencies.findActiveCallingProcesses()
+    let callers =
+      dependencies.findActiveCallingProcesses()
+      .compactMap { $0 }
+      .map(Self.resolveParentBundleID)
+      .filter { !excludedBundleIDs.contains($0) }
     lastKnownMicRunning = !callers.isEmpty
     Log.info(
       Log.monitor, "monitor",
@@ -363,6 +368,7 @@ final class AudioMonitor {
     let resolvedCallers = dependencies.findActiveCallingProcesses()
       .compactMap { $0 }
       .map(Self.resolveParentBundleID)
+      .filter { !excludedBundleIDs.contains($0) }
 
     // Clear suppression once the suppressed bundle disappears from the full
     // caller set. We check against `resolvedCallers` (not `eligibleCallers`)
@@ -711,6 +717,9 @@ final class AudioMonitor {
     if notifyOnStart != settings.notifyOnStart { notifyOnStart = settings.notifyOnStart }
     if notifyOnSaved != settings.notifyOnSaved { notifyOnSaved = settings.notifyOnSaved }
     if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }
+    if excludedBundleIDs != settings.excludedBundleIDs {
+      excludedBundleIDs = settings.excludedBundleIDs
+    }
 
     let nextMicPermissionNeeded =
       micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
