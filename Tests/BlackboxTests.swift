@@ -763,6 +763,23 @@ struct NamePrefixFormattingTests {
   }
 }
 
+@Suite("Recording Waveform Meter")
+struct RecordingWaveformMeterTests {
+  @Test("conversational mic speech registers on the meter")
+  func speechRegisters() {
+    // ~-36 dBFS RMS, typical conversational level on the mic track
+    #expect(recordingWaveformIcon(level: 0.015) == "waveform.mid")
+    // ~-28 dBFS, loud speech burst
+    #expect(recordingWaveformIcon(level: 0.04) == "waveform")
+  }
+
+  @Test("silence and zero level stay at the low bucket")
+  func silenceStaysLow() {
+    #expect(recordingWaveformIcon(level: 0.001) == "waveform.low")
+    #expect(recordingWaveformIcon(level: 0) == "waveform.low")
+  }
+}
+
 @Suite("Bundle ID List Parsing")
 struct BundleIDListParsingTests {
   @Test("trims whitespace and drops empties")

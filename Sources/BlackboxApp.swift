@@ -335,10 +335,13 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
 
 /// Maps audio RMS level to a waveform SF Symbol.
 /// Thresholds tuned for typical call audio.
-private func recordingWaveformIcon(level: Float) -> String {
-  if level > 0.05 {
+/// Buckets by dBFS, not linear RMS: conversational mic speech sits around
+/// -36 dBFS RMS, which a linear 0.05 threshold (-26 dBFS) never registers.
+func recordingWaveformIcon(level: Float) -> String {
+  let dbfs = level > 0 ? 20 * log10(level) : -Float.infinity
+  if dbfs > -30 {
     return "waveform"
-  } else if level > 0.01 {
+  } else if dbfs > -45 {
     return "waveform.mid"
   } else {
     return "waveform.low"
