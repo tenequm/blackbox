@@ -142,14 +142,13 @@ struct SettingsView: View {
     return
       NSWorkspace.shared.runningApplications
       .filter { $0.activationPolicy != .prohibited }
-      .compactMap { app -> (String, String)? in
+      .compactMap { app -> (name: String, bundleID: String)? in
         guard let bundleID = app.bundleIdentifier, bundleID != myBundleID,
           !excluded.contains(bundleID)
         else { return nil }
-        return (app.localizedName ?? bundleID, bundleID)
+        return (name: app.localizedName ?? bundleID, bundleID: bundleID)
       }
-      .sorted { $0.0 < $1.0 }
-      .map { (name: $0.0, bundleID: $0.1) }
+      .sorted { $0.name < $1.name }
   }
 
   private var excludedAppsSection: some View {
@@ -176,12 +175,13 @@ struct SettingsView: View {
       }
 
       Menu("Add App…") {
-        ForEach(addableRunningApps, id: \.bundleID) { app in
+        let apps = addableRunningApps
+        ForEach(apps, id: \.bundleID) { app in
           Button(app.name) {
             addExcludedApp(bundleID: app.bundleID)
           }
         }
-        if !addableRunningApps.isEmpty {
+        if !apps.isEmpty {
           Divider()
         }
         Button("Other…") {

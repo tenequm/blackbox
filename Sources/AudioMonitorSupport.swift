@@ -94,7 +94,6 @@ func formatNamePrefix(template: String, date: Date) -> String {
     .replacingOccurrences(of: "YY", with: String(format: "%02d", year % 100))
     .replacingOccurrences(of: "MM", with: String(format: "%02d", parts.month ?? 0))
     .replacingOccurrences(of: "DD", with: String(format: "%02d", parts.day ?? 0))
->>>>>>> main
 }
 
 struct AudioMonitorDependencies {
