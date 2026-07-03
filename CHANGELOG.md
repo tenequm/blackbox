@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-03
+
 ### Fixed
 
 - Menu bar level meter was effectively deaf to voice: it bucketed raw linear RMS with a -26 dBFS top threshold that conversational speech (~-36 dBFS) never reached, so it only reacted to loud system audio. Now bucketed by dBFS (full above -30, mid above -45), so your own voice visibly drives the indicator while recording.
