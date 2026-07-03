@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Menu bar level meter was effectively deaf to voice: it bucketed raw linear RMS with a -26 dBFS top threshold that conversational speech (~-36 dBFS) never reached, so it only reacted to loud system audio. Now bucketed by dBFS (full above -30, mid above -45), so your own voice visibly drives the indicator while recording.
+- Inaudible mic track during FaceTime calls. When FaceTime's voice processing is active, the shared input device switches to a multichannel layout (3ch deinterleaved) where only channel 0 carries the mic and the extra channels are AEC metadata; the mono downmix averaged channel 0 with a near-silent metadata channel. Additionally, the VP raw pathway bypasses the device's automatic gain control, leaving the signal ~23 dB quieter than the normal pathway. Buffers with more than 2 channels now take channel 0 only with +20 dB makeup gain (hard-clamped), stereo still averages L/R, and a one-shot per-channel RMS diagnostic is logged when a multichannel layout appears.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

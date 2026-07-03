@@ -676,6 +676,66 @@ struct ResampleTests {
         "\(rate)Hz: \(inCount) in -> expected \(expectedOut) out, got \(result.frameLength)")
     }
   }
+
+  /// Create a buffer with a distinct constant value per channel.
+  private func makeMultichannelBuffer(
+    sampleRate: Double, frameCount: Int, channelValues: [Float], interleaved: Bool
+  ) -> AVAudioPCMBuffer {
+    let channels = channelValues.count
+    let layout = AVAudioChannelLayout(
+      layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels))!
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+      interleaved: interleaved, channelLayout: layout)
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frameCount))!
+    buf.frameLength = AVAudioFrameCount(frameCount)
+    if interleaved {
+      let data = buf.floatChannelData![0]
+      for i in 0..<frameCount {
+        for c in 0..<channels { data[i * channels + c] = channelValues[c] }
+      }
+    } else {
+      for c in 0..<channels {
+        let data = buf.floatChannelData![c]
+        for i in 0..<frameCount { data[i] = channelValues[c] }
+      }
+    }
+    return buf
+  }
+
+  @Test("3ch deinterleaved voice-processing layout takes channel 0 with makeup gain")
+  func threeChannelDeinterleavedTakesChannelZero() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.05, 0.9, 0.4], interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    // 0.05 * voiceProcessingMakeupGain (10) = 0.5; averaging with the 0.9
+    // metadata channel would have produced a different value.
+    assertConstantOutput(result, expected: 0.5, context: "3ch deinterleaved channel-0 pick + gain")
+  }
+
+  @Test("3ch interleaved voice-processing layout takes channel 0 with correct stride")
+  func threeChannelInterleavedTakesChannelZero() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.05, 0.9, 0.4], interleaved: true)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "3ch interleaved channel-0 pick + gain")
+  }
+
+  @Test("voice-processing makeup gain clamps instead of clipping past full scale")
+  func makeupGainClamps() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 256, channelValues: [0.5, 0.0, 0.0], interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    // 0.5 * 10 = 5.0, clamped to 1.0
+    assertConstantOutput(result, expected: 1.0, context: "makeup gain hard clamp")
+  }
 }
 
 @Suite("Name Prefix Formatting")
@@ -700,6 +760,23 @@ struct NamePrefixFormattingTests {
   @Test("literal text without tokens passes through")
   func literalTemplate() {
     #expect(formatNamePrefix(template: "call_", date: date) == "call_")
+  }
+}
+
+@Suite("Recording Waveform Meter")
+struct RecordingWaveformMeterTests {
+  @Test("conversational mic speech registers on the meter")
+  func speechRegisters() {
+    // ~-36 dBFS RMS, typical conversational level on the mic track
+    #expect(recordingWaveformIcon(level: 0.015) == "waveform.mid")
+    // ~-28 dBFS, loud speech burst
+    #expect(recordingWaveformIcon(level: 0.04) == "waveform")
+  }
+
+  @Test("silence and zero level stay at the low bucket")
+  func silenceStaysLow() {
+    #expect(recordingWaveformIcon(level: 0.001) == "waveform.low")
+    #expect(recordingWaveformIcon(level: 0) == "waveform.low")
   }
 }
 

@@ -79,6 +79,12 @@ actor AudioRecorder {
   // skew or drift during a live recording.
   private var driftTimer: DispatchSourceTimer?
   private var lastMicHostTime: UInt64 = 0
+
+  // Per-channel RMS diagnostic for voice-processing layouts (>2ch, e.g.
+  // FaceTime active): logged once per episode to identify the mic channel.
+  private var micDiagSumSq: [Double] = []
+  private var micDiagFrames = 0
+  private var micDiagLogged = false
   private var lastSystemHostTime: UInt64 = 0
   private var driftStartHost: UInt64 = 0
 
@@ -581,6 +587,14 @@ actor AudioRecorder {
       lastMicHostTime = time.hostTime
     }
 
+    if buffer.format.channelCount > 2 {
+      if !micDiagLogged { accumulateMicChannelDiag(buffer) }
+    } else if micDiagLogged || micDiagFrames > 0 {
+      micDiagSumSq = []
+      micDiagFrames = 0
+      micDiagLogged = false
+    }
+
     // D9: apply cached latency offset (in host ticks) to the mic PTS.
     let adjustedTime: AVAudioTime
     if micLatencyOffsetTicks > 0, time.isHostTimeValid {
@@ -616,6 +630,54 @@ actor AudioRecorder {
       return
     }
     pipeline?.appendMicSample(sampleBuffer)
+  }
+
+  /// Accumulates ~2s of per-channel energy from multichannel mic buffers,
+  /// then logs RMS dBFS per channel so a live call can confirm which channel
+  /// carries the mic in voice-processing layouts.
+  private func accumulateMicChannelDiag(_ buffer: AVAudioPCMBuffer) {
+    guard let data = buffer.floatChannelData else { return }
+    let channels = Int(buffer.format.channelCount)
+    let frames = Int(buffer.frameLength)
+    guard frames > 0 else { return }
+    if micDiagSumSq.count != channels {
+      micDiagSumSq = Array(repeating: 0, count: channels)
+      micDiagFrames = 0
+    }
+    if buffer.format.isInterleaved {
+      let p = data[0]
+      for c in 0..<channels {
+        var sum = 0.0
+        for f in 0..<frames {
+          let v = Double(p[f * channels + c])
+          sum += v * v
+        }
+        micDiagSumSq[c] += sum
+      }
+    } else {
+      for c in 0..<channels {
+        let p = data[c]
+        var sum = 0.0
+        for f in 0..<frames {
+          let v = Double(p[f])
+          sum += v * v
+        }
+        micDiagSumSq[c] += sum
+      }
+    }
+    micDiagFrames += frames
+    guard micDiagFrames >= 96_000 else { return }
+    let dbfs = micDiagSumSq.map { sumSq -> String in
+      let rms = (sumSq / Double(micDiagFrames)).squareRoot()
+      return rms > 0 ? String(format: "%.1f", 20 * log10(rms)) : "-inf"
+    }
+    Log.info(
+      Log.recorder, "recorder",
+      "mic multichannel diagnostic: \(channels)ch, rms dBFS per channel: [\(dbfs.joined(separator: ", "))]"
+    )
+    micDiagLogged = true
+    micDiagSumSq = []
+    micDiagFrames = 0
   }
 
   /// Debounces rapid config change notifications (e.g. Krisp device switching).
