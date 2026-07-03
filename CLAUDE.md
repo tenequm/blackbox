@@ -71,7 +71,7 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 - **Run**: `make test` or `swift test`
 - **Test target**: `BlackboxTests` in `Tests/` directory
 - **Isolation**: Same `defaultIsolation(MainActor.self)` as production code
-- Tests require CLT framework search paths (configured in Package.swift via unsafeFlags)
+- Tests find Testing.framework via the xcode-select'd toolchain; do NOT add CLT framework search paths to Package.swift (a version-mismatched CLT breaks every @Test macro with sourceLocation/sourceBounds errors)
 
 ### Test categories
 - **Unit tests** (`make test`): PCM conversion, gap filling, resample, AEC processing, RecordingPipeline integration. Run without special permissions.

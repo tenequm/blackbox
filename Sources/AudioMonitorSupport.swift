@@ -14,6 +14,7 @@ struct RecorderSessionConfiguration: Sendable {
   var micEnabled: Bool
   var saveDirectory: URL
   var isManualRecording: Bool
+  var titlePrefix: String = ""
 }
 
 protocol RecorderSessionFactory {
@@ -40,6 +41,7 @@ struct LiveRecorderSessionFactory: RecorderSessionFactory {
       micEnabled: configuration.micEnabled,
       saveDirectory: configuration.saveDirectory,
       isManualRecording: configuration.isManualRecording,
+      titlePrefix: configuration.titlePrefix,
       onFailure: onFailure,
       onAudioLevel: onAudioLevel,
       onLowDiskSpace: onLowDiskSpace,
@@ -67,7 +69,32 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnStart: Bool
   var notifyOnSaved: Bool
   var notifyOnError: Bool
+  var namePrefixTemplate: String = ""
   var excludedBundleIDs: Set<String> = []
+
+  /// Parses the comma-separated `excludedBundleIDs` UserDefaults value.
+  /// Single source of truth for the storage format (also written by SettingsView).
+  static func parseBundleIDList(_ raw: String) -> [String] {
+    raw.split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
+}
+
+/// Resolves a recording-name prefix template into a concrete string.
+/// Plain substitution of YYYY/YY/MM/DD tokens - deliberately not DateFormatter,
+/// where uppercase YY/DD mean week-based year and day-of-year.
+func formatNamePrefix(template: String, date: Date) -> String {
+  guard !template.isEmpty else { return "" }
+  let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
+  let year = parts.year ?? 0
+  return
+    template
+    .replacingOccurrences(of: "YYYY", with: String(format: "%04d", year))
+    .replacingOccurrences(of: "YY", with: String(format: "%02d", year % 100))
+    .replacingOccurrences(of: "MM", with: String(format: "%02d", parts.month ?? 0))
+    .replacingOccurrences(of: "DD", with: String(format: "%02d", parts.day ?? 0))
+>>>>>>> main
 }
 
 struct AudioMonitorDependencies {
@@ -94,17 +121,13 @@ struct AudioMonitorDependencies {
             ?? URL(fileURLWithPath: defaultSaveDirectoryPath),
           notifyOnStart: false,
           notifyOnSaved: false,
-          notifyOnError: false
+          notifyOnError: false,
+          namePrefixTemplate: ""
         )
       }
 
       let defaults = UserDefaults.standard
       let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
-      let excludedBundleIDs =
-        (defaults.string(forKey: "excludedBundleIDs") ?? "")
-        .split(separator: ",")
-        .map { $0.trimmingCharacters(in: .whitespaces) }
-        .filter { !$0.isEmpty }
       return AudioMonitorSettings(
         autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
         gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
@@ -113,7 +136,10 @@ struct AudioMonitorDependencies {
         notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
         notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
         notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
-        excludedBundleIDs: Set(excludedBundleIDs)
+        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
+        excludedBundleIDs: Set(
+          AudioMonitorSettings.parseBundleIDList(
+            defaults.string(forKey: "excludedBundleIDs") ?? ""))
       )
     },
     microphoneAuthorizationStatus: {

@@ -31,3 +31,6 @@ DerivedData/
 
 # Collab scratch (specs, codex output)
 .collab/
+
+# npx skills: .claude/skills is a symlink to the .agents/skills store
+.claude/skills

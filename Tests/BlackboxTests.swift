@@ -677,3 +677,28 @@ struct ResampleTests {
     }
   }
 }
+
+@Suite("Name Prefix Formatting")
+struct NamePrefixFormattingTests {
+  private let date = Calendar.current.date(from: DateComponents(year: 2026, month: 7, day: 3))!
+
+  @Test("substitutes YY, MM, DD tokens")
+  func defaultTemplate() {
+    #expect(formatNamePrefix(template: "YYMM-DD-", date: date) == "2607-03-")
+  }
+
+  @Test("substitutes YYYY before YY")
+  func fullYearTemplate() {
+    #expect(formatNamePrefix(template: "YYYY-MM-DD ", date: date) == "2026-07-03 ")
+  }
+
+  @Test("empty template produces no prefix")
+  func emptyTemplate() {
+    #expect(formatNamePrefix(template: "", date: date) == "")
+  }
+
+  @Test("literal text without tokens passes through")
+  func literalTemplate() {
+    #expect(formatNamePrefix(template: "call_", date: date) == "call_")
+  }
+}

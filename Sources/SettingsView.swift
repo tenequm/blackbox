@@ -3,6 +3,7 @@ import CoreGraphics
 import Security
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
 
 struct SettingsView: View {
@@ -11,6 +12,7 @@ struct SettingsView: View {
   @AppStorage("gracePeriod") private var gracePeriod: Double = 5
   @AppStorage("micEnabled") private var micEnabled = true
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
+  @AppStorage("namePrefixTemplate") private var namePrefixTemplate = "YYMM-DD-"
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
@@ -93,10 +95,7 @@ struct SettingsView: View {
   // MARK: - Excluded Apps
 
   private var excludedBundleIDs: [String] {
-    excludedBundleIDsRaw
-      .split(separator: ",")
-      .map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty }
+    AudioMonitorSettings.parseBundleIDList(excludedBundleIDsRaw)
   }
 
   private func addExcludedApp(bundleID: String) {
@@ -108,6 +107,20 @@ struct SettingsView: View {
 
   private func removeExcludedApp(bundleID: String) {
     excludedBundleIDsRaw = excludedBundleIDs.filter { $0 != bundleID }.joined(separator: ",")
+  }
+
+  /// Covers apps the running-apps menu can't show: not currently running, or
+  /// background-only (`activationPolicy == .prohibited`).
+  private func addExcludedAppViaOpenPanel() {
+    let panel = NSOpenPanel()
+    panel.allowedContentTypes = [.applicationBundle]
+    panel.allowsMultipleSelection = false
+    panel.directoryURL = URL(fileURLWithPath: "/Applications")
+    panel.message = "Choose an app to exclude from automatic recording"
+    guard panel.runModal() == .OK, let url = panel.url,
+      let bundleID = Bundle(url: url)?.bundleIdentifier
+    else { return }
+    addExcludedApp(bundleID: bundleID)
   }
 
   private func appDisplayName(forBundleID bundleID: String) -> String {
@@ -163,14 +176,16 @@ struct SettingsView: View {
       }
 
       Menu("Add App…") {
-        if addableRunningApps.isEmpty {
-          Text("No other running apps")
-        } else {
-          ForEach(addableRunningApps, id: \.bundleID) { app in
-            Button(app.name) {
-              addExcludedApp(bundleID: app.bundleID)
-            }
+        ForEach(addableRunningApps, id: \.bundleID) { app in
+          Button(app.name) {
+            addExcludedApp(bundleID: app.bundleID)
           }
+        }
+        if !addableRunningApps.isEmpty {
+          Divider()
+        }
+        Button("Other…") {
+          addExcludedAppViaOpenPanel()
         }
       }
     }
@@ -260,6 +275,13 @@ struct SettingsView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
       }
+
+      TextField("Name prefix", text: $namePrefixTemplate)
+      Text(
+        "Prepended to new recording names, e.g. \"\(formatNamePrefix(template: namePrefixTemplate, date: Date()))Zoom\". Tokens: YYYY, YY, MM, DD. Leave empty for no prefix."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 

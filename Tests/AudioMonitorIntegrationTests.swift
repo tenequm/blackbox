@@ -33,6 +33,26 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("recorder configuration carries the resolved name prefix")
+  func recorderConfigurationCarriesNamePrefix() async throws {
+    let harness = MonitorHarness()
+    harness.settings.namePrefixTemplate = "YYMM-DD-"
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Zoom"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    let expected = formatNamePrefix(template: "YYMM-DD-", date: harness.clock.now())
+    #expect(!expected.isEmpty)
+    #expect(session.configuration.titlePrefix == expected)
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("manual recording blocks auto-recording while active")
   func manualRecordingBlocksAutoRecording() async {
     let harness = MonitorHarness()

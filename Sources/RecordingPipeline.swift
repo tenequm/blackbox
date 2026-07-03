@@ -96,6 +96,7 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated let appName: String
   nonisolated let micEnabled: Bool
   nonisolated let saveDirectory: URL
+  nonisolated let titlePrefix: String
   nonisolated let alignmentMode: SessionAlignmentMode
 
   nonisolated let onFailure: (@Sendable (RecorderFailure) -> Void)?
@@ -147,6 +148,7 @@ final class RecordingPipeline: @unchecked Sendable {
     appName: String,
     micEnabled: Bool,
     saveDirectory: URL,
+    titlePrefix: String = "",
     alignmentMode: SessionAlignmentMode,
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
     onAudioLevel: (@Sendable (Float) -> Void)? = nil,
@@ -156,6 +158,7 @@ final class RecordingPipeline: @unchecked Sendable {
     self.appName = appName
     self.micEnabled = micEnabled
     self.saveDirectory = saveDirectory
+    self.titlePrefix = titlePrefix
     self.alignmentMode = alignmentMode
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
@@ -194,7 +197,7 @@ final class RecordingPipeline: @unchecked Sendable {
       Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
 
       let metadata = RecordingMetadata(
-        title: appName,
+        title: titlePrefix + appName,
         createdAt: now,
         appName: appName,
         speakers: [:],

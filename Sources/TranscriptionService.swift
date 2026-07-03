@@ -299,9 +299,8 @@ final class TranscriptionService {
     fileId: String, enableDiarization: Bool
   ) async throws -> String {
     var config: [String: Any] = [
-      "model": "stt-async-v4",
+      "model": "stt-async-v5",
       "file_id": fileId,
-      "language_hints": ["en"],
       "enable_language_identification": true,
     ]
     if enableDiarization {
@@ -401,7 +400,7 @@ final class TranscriptionService {
       // Skip translation tokens
       if token["translation_status"] as? String == "translation" { continue }
 
-      // Soniox v4 returns speaker as String ("1", "2"), v3 returned Int
+      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
       let speaker: Int
       if let s = token["speaker"] as? Int {
         speaker = s
