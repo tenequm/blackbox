@@ -676,6 +676,54 @@ struct ResampleTests {
         "\(rate)Hz: \(inCount) in -> expected \(expectedOut) out, got \(result.frameLength)")
     }
   }
+
+  /// Create a buffer with a distinct constant value per channel.
+  private func makeMultichannelBuffer(
+    sampleRate: Double, frameCount: Int, channelValues: [Float], interleaved: Bool
+  ) -> AVAudioPCMBuffer {
+    let channels = channelValues.count
+    let layout = AVAudioChannelLayout(
+      layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels))!
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+      interleaved: interleaved, channelLayout: layout)
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frameCount))!
+    buf.frameLength = AVAudioFrameCount(frameCount)
+    if interleaved {
+      let data = buf.floatChannelData![0]
+      for i in 0..<frameCount {
+        for c in 0..<channels { data[i * channels + c] = channelValues[c] }
+      }
+    } else {
+      for c in 0..<channels {
+        let data = buf.floatChannelData![c]
+        for i in 0..<frameCount { data[i] = channelValues[c] }
+      }
+    }
+    return buf
+  }
+
+  @Test("3ch deinterleaved voice-processing layout takes channel 0 only")
+  func threeChannelDeinterleavedTakesChannelZero() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.5, 0.9, 0.1], interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "3ch deinterleaved channel-0 pick")
+  }
+
+  @Test("3ch interleaved voice-processing layout takes channel 0 with correct stride")
+  func threeChannelInterleavedTakesChannelZero() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.5, 0.9, 0.1], interleaved: true)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    #expect(result.format.channelCount == 1)
+    #expect(Int(result.frameLength) == 1024)
+    assertConstantOutput(result, expected: 0.5, context: "3ch interleaved channel-0 pick")
+  }
 }
 
 @Suite("Name Prefix Formatting")

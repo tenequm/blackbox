@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inaudible mic track during FaceTime calls. When FaceTime's voice processing is active, the shared input device switches to a multichannel layout (3ch deinterleaved) where only channel 0 carries the mic and the extra channels are AEC metadata; the mono downmix averaged channel 0 with a near-silent metadata channel. Buffers with more than 2 channels now take channel 0 only (stereo still averages L/R), and a one-shot per-channel RMS diagnostic is logged when a multichannel layout appears.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

@@ -778,52 +778,38 @@ final class RecordingPipeline: @unchecked Sendable {
       let outData = monoBuffer.floatChannelData?[0]
     else { return nil }
 
-    if inChannels >= 2 {
+    // Mono extractor per frame. Stereo averages L/R. More than 2 channels is
+    // a voice-processing layout (e.g. FaceTime active on the same input
+    // device): channel 0 is the mic, the rest are AEC metadata channels that
+    // must not be averaged in (they attenuate the mic toward silence).
+    let mono: (Int) -> Float
+    if inChannels == 2 {
       if isInterleaved {
-        if needsResample {
-          for i in 0..<outFrames {
-            let srcIdx = Double(i) / ratio
-            let lo = Int(srcIdx)
-            let hi = min(lo + 1, inFrames - 1)
-            let frac = Float(srcIdx - Double(lo))
-            let loMono = (inData[lo * 2] + inData[lo * 2 + 1]) * 0.5
-            let hiMono = (inData[hi * 2] + inData[hi * 2 + 1]) * 0.5
-            outData[i] = loMono * (1 - frac) + hiMono * frac
-          }
-        } else {
-          for i in 0..<inFrames {
-            outData[i] = (inData[i * 2] + inData[i * 2 + 1]) * 0.5
-          }
-        }
+        mono = { (inData[$0 * 2] + inData[$0 * 2 + 1]) * 0.5 }
       } else {
         guard let rightData = buffer.floatChannelData?[1] else { return nil }
-        if needsResample {
-          for i in 0..<outFrames {
-            let srcIdx = Double(i) / ratio
-            let lo = Int(srcIdx)
-            let hi = min(lo + 1, inFrames - 1)
-            let frac = Float(srcIdx - Double(lo))
-            let loMono = (inData[lo] + rightData[lo]) * 0.5
-            let hiMono = (inData[hi] + rightData[hi]) * 0.5
-            outData[i] = loMono * (1 - frac) + hiMono * frac
-          }
-        } else {
-          for i in 0..<inFrames {
-            outData[i] = (inData[i] + rightData[i]) * 0.5
-          }
-        }
+        mono = { (inData[$0] + rightData[$0]) * 0.5 }
       }
+    } else if inChannels > 2, isInterleaved {
+      mono = { inData[$0 * inChannels] }
     } else {
-      if needsResample {
-        for i in 0..<outFrames {
-          let srcIdx = Double(i) / ratio
-          let lo = Int(srcIdx)
-          let hi = min(lo + 1, inFrames - 1)
-          let frac = Float(srcIdx - Double(lo))
-          outData[i] = inData[lo] * (1 - frac) + inData[hi] * frac
-        }
-      } else {
-        memcpy(outData, inData, inFrames * MemoryLayout<Float>.size)
+      // 1ch, or >2ch deinterleaved (floatChannelData[0] is channel 0)
+      mono = { inData[$0] }
+    }
+
+    if needsResample {
+      for i in 0..<outFrames {
+        let srcIdx = Double(i) / ratio
+        let lo = Int(srcIdx)
+        let hi = min(lo + 1, inFrames - 1)
+        let frac = Float(srcIdx - Double(lo))
+        outData[i] = mono(lo) * (1 - frac) + mono(hi) * frac
+      }
+    } else if inChannels == 1 {
+      memcpy(outData, inData, inFrames * MemoryLayout<Float>.size)
+    } else {
+      for i in 0..<inFrames {
+        outData[i] = mono(i)
       }
     }
     monoBuffer.frameLength = AVAudioFrameCount(outFrames)
