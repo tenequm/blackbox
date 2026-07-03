@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-03
+
+### Added
+
+- Excluded Apps list in Settings: apps in the list never trigger automatic recording, even when they show call-like audio activity (mic + speaker active together). Excluding a parent app also covers its helper processes (e.g. Chrome helpers). Apps can be added from the running-apps menu (including menu-bar/accessory apps such as dictation tools) or via an "Other..." file picker for apps that aren't currently running. Contributed by @mugoosse (#12).
+- Configurable date prefix for recording names (Settings > General): YYYY/YY/MM/DD tokens, default `YYMM-DD-`.
+
+### Changed
+
+- Transcription upgraded to Soniox `stt-async-v5` and no longer biases language detection toward English.
+
+### Fixed
+
+- Caller resolution is now a single shared pipeline, so app exclusion applies everywhere including suppression seeding, and a ~5s window where a just-excluded app could still start a recording is closed.
+
 ## [0.8.1] - 2026-05-06
 
 ### Fixed
