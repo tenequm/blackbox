@@ -70,6 +70,15 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnSaved: Bool
   var notifyOnError: Bool
   var namePrefixTemplate: String = ""
+  var excludedBundleIDs: Set<String> = []
+
+  /// Parses the comma-separated `excludedBundleIDs` UserDefaults value.
+  /// Single source of truth for the storage format (also written by SettingsView).
+  static func parseBundleIDList(_ raw: String) -> [String] {
+    raw.split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
 }
 
 /// Resolves a recording-name prefix template into a concrete string.
@@ -126,7 +135,10 @@ struct AudioMonitorDependencies {
         notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
         notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
         notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
-        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-"
+        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
+        excludedBundleIDs: Set(
+          AudioMonitorSettings.parseBundleIDList(
+            defaults.string(forKey: "excludedBundleIDs") ?? ""))
       )
     },
     microphoneAuthorizationStatus: {

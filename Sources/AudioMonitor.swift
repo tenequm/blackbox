@@ -59,6 +59,7 @@ final class AudioMonitor {
   var notifyOnStart: Bool = true
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
+  var excludedBundleIDs: Set<String> = []
 
   private var errorGeneration = 0
 
@@ -335,7 +336,7 @@ final class AudioMonitor {
   // MARK: - Call Detection (macOS 14.2+)
 
   private func setupCallDetection() {
-    let callers = dependencies.findActiveCallingProcesses()
+    let callers = resolvedActiveCallers()
     lastKnownMicRunning = !callers.isEmpty
     Log.info(
       Log.monitor, "monitor",
@@ -362,9 +363,7 @@ final class AudioMonitor {
   /// Re-evaluate call state by checking which external processes have active calls.
   /// Called from polling loop every 3 seconds.
   private func evaluateCallState() {
-    let resolvedCallers = dependencies.findActiveCallingProcesses()
-      .compactMap { $0 }
-      .map(Self.resolveParentBundleID)
+    let resolvedCallers = resolvedActiveCallers()
 
     // Clear suppression once the suppressed bundle disappears from the full
     // caller set. We check against `resolvedCallers` (not `eligibleCallers`)
@@ -423,15 +422,22 @@ final class AudioMonitor {
     handleMicBecameInactive()
   }
 
+  /// Active callers resolved to parent bundle IDs, with excluded apps removed.
+  /// Single source for "who is calling" - exclusion must also apply to
+  /// suppression seeding, so an excluded bundle never occupies the slot.
+  private func resolvedActiveCallers() -> [String] {
+    dependencies.findActiveCallingProcesses()
+      .compactMap { $0 }
+      .map(Self.resolveParentBundleID)
+      .filter { !excludedBundleIDs.contains($0) }
+  }
+
   /// First currently-active caller resolved to its parent bundle ID. Used by
   /// stop paths that need to seed `suppressedBundleID` when no
   /// `autoRecordingBundleID` is available (e.g. manual stop or multi-caller
   /// auto stop).
   private func firstActiveResolvedCaller() -> String? {
-    dependencies.findActiveCallingProcesses()
-      .compactMap { $0 }
-      .map(Self.resolveParentBundleID)
-      .first
+    resolvedActiveCallers().first
   }
 
   /// Resolve helper subprocess bundle IDs to the parent app.
@@ -488,6 +494,12 @@ final class AudioMonitor {
     autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
     loadSettings()
+    // Re-check against the freshly loaded set: the poll that got us here may
+    // have filtered with exclusions up to 5s stale.
+    if let bundleID = autoRecordingBundleID, excludedBundleIDs.contains(bundleID) {
+      Log.info(Log.monitor, "monitor", "auto-recording skipped: \(bundleID) is excluded")
+      return
+    }
     startAutoRecording()
   }
 
@@ -717,6 +729,9 @@ final class AudioMonitor {
     if notifyOnStart != settings.notifyOnStart { notifyOnStart = settings.notifyOnStart }
     if notifyOnSaved != settings.notifyOnSaved { notifyOnSaved = settings.notifyOnSaved }
     if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }
+    if excludedBundleIDs != settings.excludedBundleIDs {
+      excludedBundleIDs = settings.excludedBundleIDs
+    }
 
     let nextMicPermissionNeeded =
       micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
