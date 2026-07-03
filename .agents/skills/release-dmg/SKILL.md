@@ -60,7 +60,9 @@ make release
 
 This runs: `make dmg` -> `xcrun notarytool submit --wait` -> `xcrun stapler staple`.
 
-Verify the DMG exists at `build/Blackbox-X.Y.Z.dmg` and report its file size.
+If notarization fails with HTTP 403 "A required agreement is missing or has expired": the user must accept the updated Apple Developer agreement at developer.apple.com/account (sometimes App Store Connect). Acceptance takes a few minutes to propagate - retry `xcrun notarytool submit build/Blackbox-X.Y.Z.dmg --keychain-profile blackbox --wait` every ~60s until Accepted, then `xcrun stapler staple` manually.
+
+Verify the DMG exists at `build/Blackbox-X.Y.Z.dmg` and report its file size. Then verify Gatekeeper end-to-end: `xcrun stapler validate` on the DMG, and mount it + `spctl -a -t exec -v /Volumes/Blackbox/Blackbox.app` -> must report `Notarized Developer ID`. (`spctl -t open` on the DMG itself reports "no usable signature" - expected; the DMG container is unsigned, the app inside is what matters.)
 
 ## Step 4: Sparkle Signature
 
@@ -121,17 +123,35 @@ gh release create vX.Y.Z build/Blackbox-X.Y.Z.dmg appcast.xml \
 
 Use a heredoc for the notes to preserve formatting.
 
-## Step 8: Cleanup
+## Step 8: Homebrew Tap Bump
+
+A GitHub release does NOT update Homebrew - the cask is pinned in tenequm/homebrew-tap.
+
+```bash
+cd ~/Projects/homebrew-tap && git pull
+curl -sL https://github.com/tenequm/blackbox/releases/download/vX.Y.Z/Blackbox-X.Y.Z.dmg | shasum -a 256
+```
+
+Update `Casks/blackbox.rb`: `version "X.Y.Z"` and the new `sha256`. Always hash the **published GitHub asset** (curl above), not the local file, so the cask matches what brew downloads. Then:
+
+```bash
+git add Casks/blackbox.rb && git commit -m "chore(blackbox): bump to X.Y.Z" && git push
+```
+
+Keep `auto_updates true` in the cask: Sparkle self-updates the app, so plain `brew upgrade` intentionally skips it (users can force with `--greedy`). Removing it would let a lagging cask downgrade a Sparkle-updated install.
+
+## Step 9: Cleanup
 
 ```bash
 rm -f appcast.xml
 ```
 
-## Step 9: Summary
+## Step 10: Summary
 
 Report:
 - Version released: X.Y.Z
 - DMG: file size
 - GitHub release URL (from `gh release view vX.Y.Z --json url -q .url`)
-- Sparkle appcast: attached to release
+- Sparkle appcast: attached to release; verify the feed serves the new version: `curl -sL https://github.com/tenequm/blackbox/releases/latest/download/appcast.xml`
 - Notarization: stapled
+- Homebrew cask: bumped

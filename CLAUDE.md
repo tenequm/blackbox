@@ -110,6 +110,9 @@ Version is tracked in two places that must stay in sync:
 
 Notary uses keychain profile `blackbox` (configured via `xcrun notarytool store-credentials`).
 Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/appcast.xml`.
+A GitHub release does NOT update Homebrew: bump `Casks/blackbox.rb` in tenequm/homebrew-tap
+(version + sha256 of the published DMG). The cask keeps `auto_updates true` because Sparkle
+self-updates. Both steps are covered by `/release-dmg`.
 
 ## Key Architecture Decisions
 
