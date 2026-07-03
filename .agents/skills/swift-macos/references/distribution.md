@@ -48,14 +48,19 @@ codesign --verify --deep --strict MyApp.app
 spctl --assess --type execute MyApp.app
 ```
 
+### Dev-loop gotcha: `SIGKILL (Code Signature Invalid)`
+
+If a running signed app is killed at idle right after a rebuild (e.g. a `make run` loop that replaces the `.app` under the running process), the crash is `SIGKILL` with `EXC_CRASH (Code Signature Invalid)` - not a bug in your code. macOS validates memory-mapped code pages against the on-disk signature lazily; overwriting the bundle invalidates the pages the kernel later faults in, so it terminates the process. Quit the old instance before replacing the bundle, or launch from a copied path.
+
 ## App Store Distribution
 
 ### Requirements
 - Active Apple Developer Program membership ($99/year)
 - App Store Connect listing with metadata, screenshots
-- Xcode 26 SDK required by April 28, 2026
+- **Starting April 28, 2026**: uploads to App Store Connect must be built with **Xcode 26 and the iOS 26 / iPadOS 26 / tvOS 26 / visionOS 26 / watchOS 26 SDK**. Pure macOS apps are **not** in Apple's list as of 2026-04-24; Mac Catalyst and Designed-for-iPad builds inherit the iOS 26 SDK requirement. Source: https://developer.apple.com/news/?id=ueeok6yw and https://developer.apple.com/news/upcoming-requirements
 - Sandbox entitlement required
 - App Review compliance
+- Audit `PrivacyInfo.xcprivacy` against the current required-reason APIs list (https://developer.apple.com/documentation/bundleresources/privacy_manifest_files/describing_use_of_required_reason_api) — Apple updates it periodically
 
 ### Workflow
 1. Archive: Product > Archive in Xcode
@@ -206,6 +211,25 @@ xcrun notarytool submit MyApp.dmg \
 ```
 
 ## Notarization Gotchas
+
+### notarytool 403 "A required agreement is missing or has expired"
+
+A 403 from `xcrun notarytool submit` is almost never a code-signing problem - it's an Apple agreement that needs acceptance. Two flavors, both easy to miss:
+
+**(a) Apple Developer Program License Agreement.** Must be accepted by the **Account Holder** (not team admin, not developer). Log in at `developer.apple.com/account` with the Account Holder's Apple ID; a banner prompts acceptance.
+
+**(b) Digital Services Act (DSA) banner on App Store Connect.** Even when distributing via Developer ID + GitHub Releases (nothing on the App Store), an unanswered DSA compliance banner at `appstoreconnect.apple.com` can hold the account in incomplete state and cause notarytool to 403. Click "Business → Agreements, Tax, and Banking" and complete any outstanding prompts. For non-App-Store distribution, "I'm not a trader under the DSA or I don't plan to distribute in the EU" is the appropriate answer.
+
+**Propagation lag**: after accepting, notarytool may still 403 for several minutes. Don't retry in a tight loop - check both `developer.apple.com/account` and the "Agreements, Tax, and Banking" page for any remaining unsigned items, then wait 5-10 minutes before resubmitting.
+
+### TCC is keyed by code-signature CDHash - reinstalls can degrade without error
+
+TCC grants are keyed by the app's CDHash + bundle ID + Developer ID. When a release-channel app is replaced via a force-recursive delete of `/Applications/App.app` followed by `cp -R ./export/App.app /Applications/` (common in `make install` / CI workflows), TCC may remember the grant **but deliver degraded content** - permission reads as authorized, capture APIs start without error, buffers flow at zero amplitude. Direct-reading `~/Library/Application Support/com.apple.TCC/TCC.db` is blocked by SIP, so there is no programmatic recovery.
+
+The user-visible remediation: System Settings → Privacy & Security → toggle the permission off, then on again. To prevent the issue:
+- Prefer in-place overwrite (let the OS handle inode swap) over force-recursive replace (rm&#8209;rf + cp&#8209;R).
+- `killall App` before replacing the bundle - otherwise the still-running process keeps executing from its unlinked inode and `open -a` activates the stale instance instead of launching the new one.
+- For dev scripts, consider `tccutil reset ScreenCapture $BUNDLE_ID` after install so the user gets a fresh prompt rather than a degraded cached grant.
 
 ### Nested framework bundles must be deep-signed
 
