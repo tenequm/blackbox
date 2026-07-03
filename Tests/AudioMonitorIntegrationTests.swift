@@ -378,4 +378,77 @@ struct AudioMonitorIntegrationTests {
 
     await monitor.stopMonitoring()
   }
+
+  // MARK: - Excluded Apps
+
+  @Test("excluded app never triggers auto recording")
+  func excludedAppDoesNotTriggerAutoRecording() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.example.Dictation"]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Dictation"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("excluded app active at launch does not start recording")
+  func excludedAppActiveAtLaunchDoesNotRecord() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.example.Dictation"]
+    harness.activeCallers = ["com.example.Dictation"]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("exclusion is scoped to the excluded bundle ID")
+  func exclusionDoesNotAffectOtherCallers() async throws {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.example.Dictation"]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Dictation", "com.example.Zoom"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    #expect(session.configuration.bundleID == "com.example.Zoom")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("excluding a parent app also covers its helper processes")
+  func exclusionCoversHelperProcesses() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.example.Dictation"]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Dictation.helper.renderer"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
 }

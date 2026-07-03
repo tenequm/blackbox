@@ -702,3 +702,14 @@ struct NamePrefixFormattingTests {
     #expect(formatNamePrefix(template: "call_", date: date) == "call_")
   }
 }
+
+@Suite("Bundle ID List Parsing")
+struct BundleIDListParsingTests {
+  @Test("trims whitespace and drops empties")
+  func trimsAndDropsEmpties() {
+    #expect(
+      AudioMonitorSettings.parseBundleIDList(" com.a.App , com.b.App,,com.c.App ")
+        == ["com.a.App", "com.b.App", "com.c.App"])
+    #expect(AudioMonitorSettings.parseBundleIDList("").isEmpty)
+  }
+}
