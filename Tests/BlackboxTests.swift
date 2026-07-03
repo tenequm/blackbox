@@ -703,26 +703,38 @@ struct ResampleTests {
     return buf
   }
 
-  @Test("3ch deinterleaved voice-processing layout takes channel 0 only")
+  @Test("3ch deinterleaved voice-processing layout takes channel 0 with makeup gain")
   func threeChannelDeinterleavedTakesChannelZero() {
     let input = makeMultichannelBuffer(
-      sampleRate: 48000, frameCount: 1024, channelValues: [0.5, 0.9, 0.1], interleaved: false)
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.05, 0.9, 0.4], interleaved: false)
     let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
 
     #expect(result.format.channelCount == 1)
     #expect(Int(result.frameLength) == 1024)
-    assertConstantOutput(result, expected: 0.5, context: "3ch deinterleaved channel-0 pick")
+    // 0.05 * voiceProcessingMakeupGain (10) = 0.5; averaging with the 0.9
+    // metadata channel would have produced a different value.
+    assertConstantOutput(result, expected: 0.5, context: "3ch deinterleaved channel-0 pick + gain")
   }
 
   @Test("3ch interleaved voice-processing layout takes channel 0 with correct stride")
   func threeChannelInterleavedTakesChannelZero() {
     let input = makeMultichannelBuffer(
-      sampleRate: 48000, frameCount: 1024, channelValues: [0.5, 0.9, 0.1], interleaved: true)
+      sampleRate: 48000, frameCount: 1024, channelValues: [0.05, 0.9, 0.4], interleaved: true)
     let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
 
     #expect(result.format.channelCount == 1)
     #expect(Int(result.frameLength) == 1024)
-    assertConstantOutput(result, expected: 0.5, context: "3ch interleaved channel-0 pick")
+    assertConstantOutput(result, expected: 0.5, context: "3ch interleaved channel-0 pick + gain")
+  }
+
+  @Test("voice-processing makeup gain clamps instead of clipping past full scale")
+  func makeupGainClamps() {
+    let input = makeMultichannelBuffer(
+      sampleRate: 48000, frameCount: 256, channelValues: [0.5, 0.0, 0.0], interleaved: false)
+    let result = RecordingPipeline.resampleToMono48k(input, sourceRate: 48000)!
+
+    // 0.5 * 10 = 5.0, clamped to 1.0
+    assertConstantOutput(result, expected: 1.0, context: "makeup gain hard clamp")
   }
 }
 

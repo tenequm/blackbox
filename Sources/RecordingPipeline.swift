@@ -92,6 +92,11 @@ final class RecordingPipeline: @unchecked Sendable {
     interleaved: true
   )!
 
+  /// +20 dB makeup gain for mic buffers in a voice-processing layout (>2ch).
+  /// The VP raw pathway bypasses the device AGC; measured deficit vs the
+  /// normal 1ch pathway was ~23 dB (FaceTime, built-in mic, macOS 26.1).
+  nonisolated static let voiceProcessingMakeupGain: Float = 10
+
   nonisolated let bundleID: String?
   nonisolated let appName: String
   nonisolated let micEnabled: Bool
@@ -781,7 +786,10 @@ final class RecordingPipeline: @unchecked Sendable {
     // Mono extractor per frame. Stereo averages L/R. More than 2 channels is
     // a voice-processing layout (e.g. FaceTime active on the same input
     // device): channel 0 is the mic, the rest are AEC metadata channels that
-    // must not be averaged in (they attenuate the mic toward silence).
+    // must not be averaged in (they attenuate the mic toward silence). The
+    // VP raw pathway also bypasses the device's AGC (~20+ dB below the
+    // normal 1ch pathway, measured), so those buffers get makeup gain with
+    // a hard clamp.
     let mono: (Int) -> Float
     if inChannels == 2 {
       if isInterleaved {
@@ -790,10 +798,10 @@ final class RecordingPipeline: @unchecked Sendable {
         guard let rightData = buffer.floatChannelData?[1] else { return nil }
         mono = { (inData[$0] + rightData[$0]) * 0.5 }
       }
-    } else if inChannels > 2, isInterleaved {
-      mono = { inData[$0 * inChannels] }
+    } else if inChannels > 2 {
+      let stride = isInterleaved ? inChannels : 1
+      mono = { min(max(inData[$0 * stride] * voiceProcessingMakeupGain, -1), 1) }
     } else {
-      // 1ch, or >2ch deinterleaved (floatChannelData[0] is channel 0)
       mono = { inData[$0] }
     }
 
