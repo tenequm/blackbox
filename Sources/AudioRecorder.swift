@@ -18,6 +18,7 @@ import ObjCExceptionCatcher
 actor AudioRecorder {
   nonisolated let bundleID: String?
   nonisolated let appName: String
+  nonisolated let titlePrefix: String
   nonisolated let micEnabled: Bool
   nonisolated let saveDirectory: URL
   nonisolated let isManualRecording: Bool
@@ -93,6 +94,7 @@ actor AudioRecorder {
     bundleID: String? = nil, appName: String, micEnabled: Bool,
     saveDirectory: URL,
     isManualRecording: Bool = false,
+    titlePrefix: String = "",
     onFailure: (@Sendable (RecorderFailure) -> Void)? = nil,
     onAudioLevel: (@Sendable (Float) -> Void)? = nil,
     onLowDiskSpace: (@Sendable (Int64) -> Void)? = nil,
@@ -104,6 +106,7 @@ actor AudioRecorder {
     self.micEnabled = micEnabled
     self.saveDirectory = saveDirectory
     self.isManualRecording = isManualRecording
+    self.titlePrefix = titlePrefix
     self.onFailure = onFailure
     self.onAudioLevel = onAudioLevel
     self.onLowDiskSpace = onLowDiskSpace
@@ -176,6 +179,7 @@ actor AudioRecorder {
         appName: appName,
         micEnabled: micEnabled,
         saveDirectory: saveDirectory,
+        titlePrefix: titlePrefix,
         alignmentMode: isManualRecording ? .preserveAllContent : .waitForAllTracks,
         onFailure: onFailure,
         onAudioLevel: onAudioLevel,

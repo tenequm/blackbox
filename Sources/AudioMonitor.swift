@@ -55,6 +55,7 @@ final class AudioMonitor {
   var gracePeriod: TimeInterval = 5
   var micEnabled: Bool = true
   var saveDirectory: URL = URL(fileURLWithPath: defaultSaveDirectoryPath)
+  var namePrefixTemplate: String = ""
   var notifyOnStart: Bool = true
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
@@ -214,7 +215,8 @@ final class AudioMonitor {
         appName: "Manual recording",
         micEnabled: useMic,
         saveDirectory: saveDirectory,
-        isManualRecording: true
+        isManualRecording: true,
+        titlePrefix: formatNamePrefix(template: namePrefixTemplate, date: dependencies.now())
       ),
       onFailure: makeFailureHandler(isManual: true),
       onAudioLevel: makeAudioLevelHandler(),
@@ -551,7 +553,8 @@ final class AudioMonitor {
         appName: appName,
         micEnabled: useMic,
         saveDirectory: saveDirectory,
-        isManualRecording: false
+        isManualRecording: false,
+        titlePrefix: formatNamePrefix(template: namePrefixTemplate, date: dependencies.now())
       ),
       onFailure: makeFailureHandler(isManual: false),
       onAudioLevel: makeAudioLevelHandler(),
@@ -708,6 +711,9 @@ final class AudioMonitor {
     if gracePeriod != settings.gracePeriod { gracePeriod = settings.gracePeriod }
     if micEnabled != settings.micEnabled { micEnabled = settings.micEnabled }
     if saveDirectory != settings.saveDirectory { saveDirectory = settings.saveDirectory }
+    if namePrefixTemplate != settings.namePrefixTemplate {
+      namePrefixTemplate = settings.namePrefixTemplate
+    }
     if notifyOnStart != settings.notifyOnStart { notifyOnStart = settings.notifyOnStart }
     if notifyOnSaved != settings.notifyOnSaved { notifyOnSaved = settings.notifyOnSaved }
     if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }

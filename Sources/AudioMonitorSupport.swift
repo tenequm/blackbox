@@ -14,6 +14,7 @@ struct RecorderSessionConfiguration: Sendable {
   var micEnabled: Bool
   var saveDirectory: URL
   var isManualRecording: Bool
+  var titlePrefix: String = ""
 }
 
 protocol RecorderSessionFactory {
@@ -40,6 +41,7 @@ struct LiveRecorderSessionFactory: RecorderSessionFactory {
       micEnabled: configuration.micEnabled,
       saveDirectory: configuration.saveDirectory,
       isManualRecording: configuration.isManualRecording,
+      titlePrefix: configuration.titlePrefix,
       onFailure: onFailure,
       onAudioLevel: onAudioLevel,
       onLowDiskSpace: onLowDiskSpace,
@@ -67,6 +69,22 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnStart: Bool
   var notifyOnSaved: Bool
   var notifyOnError: Bool
+  var namePrefixTemplate: String = ""
+}
+
+/// Resolves a recording-name prefix template into a concrete string.
+/// Plain substitution of YYYY/YY/MM/DD tokens - deliberately not DateFormatter,
+/// where uppercase YY/DD mean week-based year and day-of-year.
+func formatNamePrefix(template: String, date: Date) -> String {
+  guard !template.isEmpty else { return "" }
+  let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
+  let year = parts.year ?? 0
+  return
+    template
+    .replacingOccurrences(of: "YYYY", with: String(format: "%04d", year))
+    .replacingOccurrences(of: "YY", with: String(format: "%02d", year % 100))
+    .replacingOccurrences(of: "MM", with: String(format: "%02d", parts.month ?? 0))
+    .replacingOccurrences(of: "DD", with: String(format: "%02d", parts.day ?? 0))
 }
 
 struct AudioMonitorDependencies {
@@ -93,7 +111,8 @@ struct AudioMonitorDependencies {
             ?? URL(fileURLWithPath: defaultSaveDirectoryPath),
           notifyOnStart: false,
           notifyOnSaved: false,
-          notifyOnError: false
+          notifyOnError: false,
+          namePrefixTemplate: ""
         )
       }
 
@@ -106,7 +125,8 @@ struct AudioMonitorDependencies {
         saveDirectory: URL(fileURLWithPath: path),
         notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
         notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true
+        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
+        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-"
       )
     },
     microphoneAuthorizationStatus: {

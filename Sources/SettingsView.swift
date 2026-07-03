@@ -11,6 +11,7 @@ struct SettingsView: View {
   @AppStorage("gracePeriod") private var gracePeriod: Double = 5
   @AppStorage("micEnabled") private var micEnabled = true
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
+  @AppStorage("namePrefixTemplate") private var namePrefixTemplate = "YYMM-DD-"
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
@@ -172,6 +173,13 @@ struct SettingsView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
       }
+
+      TextField("Name prefix", text: $namePrefixTemplate)
+      Text(
+        "Prepended to new recording names, e.g. \"\(formatNamePrefix(template: namePrefixTemplate, date: Date()))Zoom\". Tokens: YYYY, YY, MM, DD. Leave empty for no prefix."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
