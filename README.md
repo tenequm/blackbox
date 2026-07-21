@@ -17,7 +17,7 @@ Detects when your microphone becomes active (e.g. during calls) and records syst
 Via [Homebrew](https://brew.sh):
 
 ```bash
-brew install --cask tenequm/tap/blackbox
+brew install --cask tenequm/tap/blackbox-recorder
 ```
 
 Or download the latest `.dmg` from [Releases](https://github.com/tenequm/blackbox/releases), open it, and drag Blackbox to Applications.

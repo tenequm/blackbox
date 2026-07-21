@@ -132,10 +132,10 @@ cd ~/Projects/homebrew-tap && git pull
 curl -sL https://github.com/tenequm/blackbox/releases/download/vX.Y.Z/Blackbox-X.Y.Z.dmg | shasum -a 256
 ```
 
-Update `Casks/blackbox.rb`: `version "X.Y.Z"` and the new `sha256`. Always hash the **published GitHub asset** (curl above), not the local file, so the cask matches what brew downloads. Then:
+Update `Casks/blackbox-recorder.rb`: `version "X.Y.Z"` and the new `sha256`. Always hash the **published GitHub asset** (curl above), not the local file, so the cask matches what brew downloads. Then:
 
 ```bash
-git add Casks/blackbox.rb && git commit -m "chore(blackbox): bump to X.Y.Z" && git push
+git add Casks/blackbox-recorder.rb && git commit -m "chore(blackbox): bump to X.Y.Z" && git push
 ```
 
 Keep `auto_updates true` in the cask: Sparkle self-updates the app, so plain `brew upgrade` intentionally skips it (users can force with `--greedy`). Removing it would let a lagging cask downgrade a Sparkle-updated install.
