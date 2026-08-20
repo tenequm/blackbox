@@ -219,6 +219,9 @@ actor AudioRecorder {
 
       let stream = SCStream(filter: filter, configuration: config, delegate: proxy)
       try stream.addStreamOutput(proxy, type: .audio, sampleHandlerQueue: audioQueue)
+      // Subscribe the (ignored) screen output too, otherwise SCStream logs
+      // "stream output NOT found. Dropping frame" for every video frame.
+      try stream.addStreamOutput(proxy, type: .screen, sampleHandlerQueue: audioQueue)
       self.displayStream = stream
 
       activity = ProcessInfo.processInfo.beginActivity(
@@ -283,12 +286,7 @@ actor AudioRecorder {
       // Race stopCapture against a 3s timeout (mirrors the steady-state stop
       // path) so a hung SCStream cannot exceed applicationShouldTerminate's
       // 8s budget.
-      await withTaskGroup(of: Void.self) { group in
-        group.addTask { try? await stream.stopCapture() }
-        group.addTask { try? await Task.sleep(for: .seconds(3)) }
-        await group.next()
-        group.cancelAll()
-      }
+      await Self.stopCaptureWithTimeout(stream, appName: appName)
     }
     if let pipe { _ = await pipe.stop() }
     if let activitySnap { ProcessInfo.processInfo.endActivity(activitySnap) }
@@ -333,12 +331,7 @@ actor AudioRecorder {
       // Race stopCapture against a 3s timeout so a hung SCStream (documented
       // under WindowServer stalls) cannot exceed applicationShouldTerminate's
       // 8s budget and corrupt the recording.
-      await withTaskGroup(of: Void.self) { group in
-        group.addTask { try? await stream.stopCapture() }
-        group.addTask { try? await Task.sleep(for: .seconds(3)) }
-        await group.next()
-        group.cancelAll()
-      }
+      await Self.stopCaptureWithTimeout(stream, appName: appName)
     }
     self.displayStream = nil
     self.streamProxy = nil
@@ -386,16 +379,42 @@ actor AudioRecorder {
     return savedURL
   }
 
+  /// Races `stopCapture` against a 3s timeout so a hung SCStream (documented
+  /// under WindowServer stalls) cannot exceed applicationShouldTerminate's 8s
+  /// budget. On timeout the stream reference is dropped while the stream may
+  /// keep running system-side, so log it loudly for diagnosis.
+  private static func stopCaptureWithTimeout(_ stream: SCStream, appName: String) async {
+    let stopped = await withTaskGroup(of: Bool.self) { group in
+      group.addTask {
+        try? await stream.stopCapture()
+        return true
+      }
+      group.addTask {
+        try? await Task.sleep(for: .seconds(3))
+        return false
+      }
+      let first = await group.next() ?? false
+      group.cancelAll()
+      return first
+    }
+    if !stopped {
+      Log.error(
+        Log.recorder, "recorder",
+        "SCStream stopCapture timed out after 3s for \(appName); stream may remain running")
+    }
+  }
+
   // MARK: - SCStream Configuration
 
-  /// Builds the audio-only SCStreamConfiguration. The tiny 2x2 frame and
-  /// infinite `minimumFrameInterval` suppress video pipeline overhead; only
-  /// the `.audio` output is subscribed.
+  /// Builds the audio-only SCStreamConfiguration. The tiny 2x2 frame and a
+  /// 1 fps `minimumFrameInterval` keep video pipeline overhead negligible.
+  /// A near-zero interval (1/Int32.max) means *maximum* frame rate: SCStream
+  /// recomposites the display at refresh rate and drops every frame (issue #17).
   private func makeStreamConfig() -> SCStreamConfiguration {
     let config = SCStreamConfiguration()
     config.width = 2
     config.height = 2
-    config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+    config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
     config.showsCursor = false
     config.capturesAudio = true
     config.sampleRate = Int(RecordingPipeline.writerSampleRate)
