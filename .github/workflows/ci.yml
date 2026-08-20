@@ -45,18 +45,24 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
-      - name: Probe - AAC decode on the runner
+      - name: Probe - cooperative pool during the AEC stall
+        env:
+          BLACKBOX_AEC_CPU_ONLY: "1"
         run: |
           set +e
-          swiftc -O -o /tmp/decode Scripts/ci-decode-probe.swift 2>&1 | grep -v warning
-          F=Tests/Fixtures/Recordings/2026-03-11-092853-2FD4/audio.m4a
-          echo "--- afinfo ---"; afinfo "$F" | head -4
-          echo "--- afconvert to LPCM (AudioToolbox) ---"; time afconvert -f WAVE -d LEI16 "$F" /tmp/out.wav && ls -la /tmp/out.wav
-          echo "--- AVAudioFile ---"; /tmp/decode "$F" avaudiofile
-          echo "--- AVAssetReader ---"; /tmp/decode "$F" assetreader
-          echo "--- two readers interleaved (AECProcessor pattern) ---"; /tmp/decode "$F" tworeaders
-          echo "--- two readers, 4 runs back to back ---"; for _ in 1 2 3 4; do /tmp/decode "$F" tworeaders | tail -1; done
-          echo "--- audio devices ---"; system_profiler SPAudioDataType 2>/dev/null | head -20
+          sysctl -n hw.ncpu hw.logicalcpu
+          swift test --disable-xctest --skip-build --filter AECProcessingTests > /tmp/aec.log 2>&1 &
+          P=$!
+          for _ in $(seq 1 6); do sleep 10; kill -0 $P 2>/dev/null || { echo "AEC: exited"; break; }; done
+          if kill -0 $P 2>/dev/null; then
+            H=$(pgrep -f swiftpm-testing-helper | head -1)
+            sample "$H" 2 -mayDie -file /tmp/aec.sample >/dev/null 2>&1
+            echo "=== every cooperative-pool thread, full stack ==="
+            awk '/Thread_.*cooperative/{p=1} /^    [0-9]+ Thread_/ && !/cooperative/{p=0} p' /tmp/aec.sample | cut -c1-160
+            echo "=== main thread ==="
+            awk '/Thread_.*main-thread/{p=1} /^    [0-9]+ Thread_/ && !/main-thread/{p=0} p' /tmp/aec.sample | head -30 | cut -c1-160
+            kill -9 $P; pkill -9 -f swiftpm-testing-helper
+          fi
           true
 
       - name: Test
