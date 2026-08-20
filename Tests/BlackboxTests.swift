@@ -83,13 +83,7 @@ struct PCMConversionTests {
 
 // MARK: - AEC Processing Tests
 
-/// DTLN CoreML inference stalls indefinitely on virtualized CI runners (no
-/// Neural Engine): the suite never completes and never times out on its own.
-/// Set BLACKBOX_SKIP_COREML=1 to skip it there; it runs by default locally.
-private nonisolated let coreMLDisabled: Bool =
-  ProcessInfo.processInfo.environment["BLACKBOX_SKIP_COREML"] == "1"
-
-@Suite("AEC Processing", .disabled(if: coreMLDisabled, "BLACKBOX_SKIP_COREML=1"))
+@Suite("AEC Processing")
 struct AECProcessingTests {
   /// Short dual-track recording (5.9s) with known-good reference processed file
   private static let testRecording = "2026-03-11-092853-2FD4"

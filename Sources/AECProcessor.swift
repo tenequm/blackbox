@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreML
 import CoreMedia
 import DTLNAec256
 import DTLNAecCoreML
@@ -8,6 +9,14 @@ import DTLNAecCoreML
 /// system audio as the far-end reference, writes `audio-processed.m4a` with both
 /// tracks at 16kHz mono AAC. Original file is preserved for fallback.
 enum AECProcessor {
+
+  /// CoreML inference on the Neural Engine stalls indefinitely on virtualized
+  /// machines that have no ANE (GitHub-hosted runners). `BLACKBOX_AEC_CPU_ONLY=1`
+  /// pins inference to the CPU so the real model still runs there.
+  nonisolated static var computeUnits: MLComputeUnits {
+    ProcessInfo.processInfo.environment["BLACKBOX_AEC_CPU_ONLY"] == "1"
+      ? .cpuOnly : .cpuAndNeuralEngine
+  }
 
   /// Process a recording directory. No-op if already processed or single-track.
   /// Fire-and-forget: errors are logged, original file is never modified.
@@ -108,8 +117,8 @@ enum AECProcessor {
     }
     writer.startSession(atSourceTime: .zero)
 
-    // AEC processor
-    let processor = DTLNAecEchoProcessor(modelSize: .medium)
+    let processor = DTLNAecEchoProcessor(
+      config: DTLNAecConfig(modelSize: .medium, computeUnits: computeUnits))
     try processor.loadModels(from: DTLNAec256.bundle)
 
     guard
