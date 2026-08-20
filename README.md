@@ -4,9 +4,21 @@
 
 <h1 align="center">Blackbox</h1>
 
-<p align="center">macOS menu bar app that automatically records audio from your calls.</p>
+<p align="center">Records your calls. Starts by itself. Files stay on your Mac.</p>
 
-Detects when your microphone becomes active (e.g. during calls) and records system audio automatically. Works with any app - Zoom, Meet, Teams, Discord, FaceTime, Telegram, and more. Saves M4A files locally.
+You join a call. Blackbox notices and starts recording. You hang up. It stops
+and saves an M4A. It works with Zoom, Meet, Teams, Discord, FaceTime, Telegram
+and any other app that uses your microphone.
+
+- **No bot, no extension, no account.** Nothing joins your meeting. Nothing
+  leaves your Mac unless you ask for a transcript.
+- **Both sides, on separate tracks.** System audio and your microphone are
+  captured by independent pipelines, so one failing never loses the other.
+  Echo is removed from the mic track on-device.
+- **Built to not lose a recording.** Microphone swaps, dropped buffers and
+  app crashes are detected and repaired while the call is still running.
+- **Optional transcription.** Add a Soniox API key in Settings and one click
+  transcribes a finished recording. Without a key, no audio leaves your Mac.
 
 <p align="center">
   <img src="Assets/screenshot.png" width="720" alt="Blackbox recordings window">
@@ -26,11 +38,10 @@ Requires macOS 26.1 or later. On first launch, grant Screen Recording and Microp
 
 ## Features
 
-- Auto-records when your microphone becomes active (any calling app)
-- Manual record/stop for on-demand system audio capture
-- Dual-track M4A (system audio + microphone in manual recordings)
-- Notification when recording is saved (click to reveal in Finder)
-- Configurable grace period, save location, and notification preferences
+- Manual record/stop for system audio outside a call
+- Excluded apps: dictation tools and others never trigger a recording
+- Notification when a recording is saved; click to reveal in Finder
+- Configurable grace period, save folder, file-name date prefix
 - Auto-updates
 
 ## Build from source
