@@ -31,26 +31,27 @@ jobs:
       # kill it. A `sample` of the hung process is the only thing that says
       # *where* it blocks; CI stdout is a pipe, so Swift Testing's output is
       # block-buffered and invisible until the process exits.
-      - name: Run tests with stack sampling on hang
+      - name: Run tests with a pty and xunit output
         run: |
           set +e
-          swift test --disable-xctest --skip-build -v > test.log 2>&1 &
+          # `script` allocates a pty so stdio is line-buffered: with a file
+          # redirect the tail of the log is lost when the process is killed.
+          # --xunit-output is written only when the run completes, so its
+          # presence distinguishes "tests stalled" from "tests done, process
+          # will not exit".
+          script -q /dev/null swift test --disable-xctest --skip-build \
+            --xunit-output "$PWD/results.xml" &
           SWIFTPID=$!
-          for i in $(seq 1 24); do
+          for i in $(seq 1 30); do
             sleep 10
-            if ! kill -0 $SWIFTPID 2>/dev/null; then echo "exited after ~$((i*10))s"; break; fi
+            if ! kill -0 $SWIFTPID 2>/dev/null; then echo "=== EXITED after ~$((i*10))s ==="; break; fi
           done
           if kill -0 $SWIFTPID 2>/dev/null; then
-            echo "=== STILL RUNNING after 240s - sampling ==="
-            ps -Axo pid,etime,command | grep -i blackbox | grep -v grep
-            for p in $(pgrep -f "BlackboxPackageTests|xctest|swift-testing"); do
-              echo "=== sample $p ==="
-              sample "$p" 5 -mayDie 2>&1 | head -120
-            done
-            kill -9 $SWIFTPID 2>/dev/null
-            pkill -9 -f BlackboxPackageTests 2>/dev/null
+            echo "=== STILL RUNNING after 300s ==="
+            echo "results.xml present? $([ -f results.xml ] && echo YES || echo NO)"
+            pkill -QUIT -f swiftpm-testing-helper
+            sleep 5
+            kill -9 $SWIFTPID 2>/dev/null; pkill -9 -f swiftpm-testing-helper 2>/dev/null
           fi
-          echo "=== test.log (first 200 lines) ==="
-          head -200 test.log
-          echo "=== test.log (last 100 lines) ==="
-          tail -100 test.log
+          echo "=== results.xml ==="
+          if [ -f results.xml ]; then head -5 results.xml; grep -oE 'tests="[0-9]+" failures="[0-9]+"' results.xml | head -2; else echo "NOT WRITTEN"; fi
