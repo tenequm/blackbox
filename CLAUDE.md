@@ -21,16 +21,18 @@ Sources/
   RecordingHUD.swift                       - Floating NSPanel toast (top-right), recording start + save with click-to-reveal
   Log.swift                                - OSLog + file logging, debug export
 Info.plist                                 - LSUIElement, NSAudioCaptureUsageDescription, NSMicrophoneUsageDescription
-Makefile                                   - build, bundle, dmg, release, install, run, format, test, check, smoke, clean
+Makefile                                   - build, bundle, dmg, release, install, run, format, format-check, test, check, smoke, clean
+.github/workflows/ci.yml                   - CI on macos-26: format lint, build, test (~40s warm)
 Tests/
   BlackboxTests.swift                      - PCM conversion, AEC processing, gap filling, resample tests
   AudioMonitorIntegrationTests.swift       - AudioMonitor integration tests with fake dependencies
   RecordingPipelineIntegrationTests.swift  - RecordingPipeline file output, gap fill, tail padding tests
+  AudioRecorderRaceTests.swift             - Start/stop race tests (live SCK gated by BLACKBOX_RUN_LIVE_SCK)
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
   Fixtures/Recordings/                     - Reference recordings for AEC regression tests
-.claude/skills/
-  release-dmg/SKILL.md                     - /release-dmg slash command for full release automation
+.agents/skills/
+  release-dmg/SKILL.md                     - full release pipeline (not model-invocable; read the file directly)
 ```
 
 ## Build & Run
@@ -100,7 +102,9 @@ Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
 
 ## Release Process
 
-Use the `/release-dmg <version>` slash command to automate the full release pipeline.
+Follow `.agents/skills/release-dmg/SKILL.md` for the full release pipeline. It is marked
+`disable-model-invocation`, so the Skill tool cannot load it - read the file and execute its
+steps directly. `.claude/skills/` holds only symlinks into `.agents/skills/`.
 
 The command handles: version bump (Makefile + Info.plist + CHANGELOG.md), format + build + test, DMG creation, Sparkle signing, git commit + push + tag, GitHub release with changelog notes and appcast.xml.
 
@@ -112,12 +116,12 @@ Notary uses keychain profile `blackbox` (configured via `xcrun notarytool store-
 Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/appcast.xml`.
 A GitHub release does NOT update Homebrew: bump `Casks/blackbox-recorder.rb` in tenequm/homebrew-tap
 (version + sha256 of the published DMG). The cask keeps `auto_updates true` because Sparkle
-self-updates. Both steps are covered by `/release-dmg`.
+self-updates. Both steps are covered by the release-dmg skill file.
 
 ## Key Architecture Decisions
 
 - **Polling-only call detection** drives recording lifecycle. Every 3 seconds, CoreAudio Swift wrappers (`AudioHardwareSystem.shared.processes`) enumerate processes with BOTH `isRunningInput` AND `isRunningOutput` (filtering out own PID). Input+output check identifies actual calls, filtering out dictation/Siri/voice memos. No CoreAudio property listeners - polling-only eliminates ~140 lines of listener management code.
-- **SCStream system audio capture**: Single display-wide `SCStream` (ScreenCaptureKit) captures the OS-composited audio mix, excluding own PID via `excludesCurrentProcessAudio = true`. Video disabled (2x2, max frame interval). `SCStreamOutput` callback delivers stereo 48kHz Float32 CMSampleBuffer on `audioQueue` and is appended **directly** to a stereo 128 kbps AAC writer input (v0.6.0 parity) - no PCM round-trip, no downmix. `SCStreamDelegate.didStopWithError` maps NSError codes (−3801 permission, −3802/−3821 stopped) to `RecorderFailure`. Requires Screen Recording permission (on macOS 26.1+, this also grants audio capture).
+- **SCStream system audio capture**: Single display-wide `SCStream` (ScreenCaptureKit) captures the OS-composited audio mix, excluding own PID via `excludesCurrentProcessAudio = true`. Video throttled to 2x2 at 1 fps - `minimumFrameInterval` is a *minimum interval*, so a near-zero value (e.g. `1/Int32.max`) means maximum frame rate, not none (issue #17). The ignored `.screen` output is subscribed on its own queue, otherwise SCStream logs a dropped frame per video frame. `SCStreamOutput` callback delivers stereo 48kHz Float32 CMSampleBuffer on `audioQueue` and is appended **directly** to a stereo 128 kbps AAC writer input (v0.6.0 parity) - no PCM round-trip, no downmix. `SCStreamDelegate.didStopWithError` maps NSError codes (−3801 permission, −3802/−3821 stopped) to `RecorderFailure`. Requires Screen Recording permission (on macOS 26.1+, this also grants audio capture).
 - **AVAudioEngine mic capture**: Independent mic pipeline via `inputNode.installTap()`. Can fail without affecting system audio. Device following via `AVAudioEngineConfigurationChange` notification (reinstalls tap, sub-second gap, same file). Device latency offset (D9) applied as PTS shift to align mic with system audio.
 - **AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor.** All actor-isolated state runs on `audioQueue`. SCStream and AVAudioEngine tap callbacks dispatch to `audioQueue` and use `assumeIsolated` to bridge into actor isolation. No `nonisolated(unsafe)` needed.
 - **RecordingPipeline** (`@unchecked Sendable`) handles AVAssetWriter management, gap filling, tail padding, and audio level metering. Extracted from AudioRecorder for testability. All access serialized by AudioRecorder's `audioQueue` - the pipeline has no internal synchronization. `nonisolated(unsafe)` state is safe because AudioRecorder guarantees single-threaded access.

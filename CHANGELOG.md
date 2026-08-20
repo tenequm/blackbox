@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-20
+
+### Fixed
+
+- Recording burned significant CPU and forced the window server to recomposite the whole screen 60+ times a second. The system-audio capture stream requested video at the display's native refresh rate instead of throttling it, then discarded every frame, because only the audio output was ever consumed. On a 5K display this cost roughly a sixth of a CPU core between Blackbox and `replayd` for the entire duration of a call, plus compositor overhead on top. Measured over a 12 second capture: 871 discarded frames before, zero after.
+- A recording could be truncated when quitting mid-call. Stopping the capture stream was meant to be bounded by a 3 second timeout, but the timeout never actually applied: a hung stream blocked for its full duration (measured 8.5 seconds for an 8 second stall), which could exceed the shutdown budget and get the app killed before the file was finalized.
+
 ## [0.9.1] - 2026-07-03
 
 ### Fixed
@@ -301,7 +308,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.8.1...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/tenequm/blackbox/compare/v0.9.1...v0.9.2
 [0.8.1]: https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
