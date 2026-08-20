@@ -1,49 +1,56 @@
 name: CI
 
+# DISABLED: `swift test` hangs on the runner (>30 min, no output) while it takes
+# 3s locally. Dispatch-only until that is understood - see the diagnose job.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
-    # macos-26 is required: Package.swift targets macOS 26.1, and a binary with
-    # that minimum refuses to launch on macos-15, so `swift test` would fail at
-    # exec time even though it compiles.
+  diagnose:
+    # macos-26 is required: Package.swift targets macOS 26.1, so a test binary
+    # with that minimum will not launch on macos-15.
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
 
-      - name: Show toolchain
-        id: toolchain
+      - name: Show toolchain and environment
         run: |
           swift --version
-          echo "version=$(swift --version | head -1 | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          sw_vers
+          echo "--- audio devices ---"
+          system_profiler SPAudioDataType 2>&1 | head -30 || true
 
-      # `make build` (release) and `make test` (debug) each compile Sparkle and
-      # dtln-aec-coreml from source - ~20 min cold. The key rolls per commit so
-      # each run refreshes the cache; restore-keys fall back to the newest
-      # entry for the same dependencies, keeping the rebuild incremental.
-      - name: Cache SwiftPM build
-        uses: actions/cache@v4
-        with:
-          path: |
-            .build
-            ~/Library/Caches/org.swift.swiftpm
-          key: spm-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Package.resolved') }}-${{ github.sha }}
-          restore-keys: |
-            spm-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Package.resolved') }}-
-            spm-${{ steps.toolchain.outputs.version }}-
+      - name: Build tests
+        run: swift build --build-tests
 
-      - name: Lint formatting
-        run: make format-check
-
-      - name: Build
-        run: make build
-
-      - name: Test
-        run: make test
+      # Run the suite detached, sample the stack while it is still alive, then
+      # kill it. A `sample` of the hung process is the only thing that says
+      # *where* it blocks; CI stdout is a pipe, so Swift Testing's output is
+      # block-buffered and invisible until the process exits.
+      - name: Run tests with stack sampling on hang
+        run: |
+          set +e
+          swift test --disable-xctest --skip-build -v > test.log 2>&1 &
+          SWIFTPID=$!
+          for i in $(seq 1 24); do
+            sleep 10
+            if ! kill -0 $SWIFTPID 2>/dev/null; then echo "exited after ~$((i*10))s"; break; fi
+          done
+          if kill -0 $SWIFTPID 2>/dev/null; then
+            echo "=== STILL RUNNING after 240s - sampling ==="
+            ps -Axo pid,etime,command | grep -i blackbox | grep -v grep
+            for p in $(pgrep -f "BlackboxPackageTests|xctest|swift-testing"); do
+              echo "=== sample $p ==="
+              sample "$p" 5 -mayDie 2>&1 | head -120
+            done
+            kill -9 $SWIFTPID 2>/dev/null
+            pkill -9 -f BlackboxPackageTests 2>/dev/null
+          fi
+          echo "=== test.log (first 200 lines) ==="
+          head -200 test.log
+          echo "=== test.log (last 100 lines) ==="
+          tail -100 test.log
