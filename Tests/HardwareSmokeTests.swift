@@ -30,6 +30,7 @@ struct HardwareSmokeTests {
       !snapshot.isRecording && !snapshot.isSaving
     }
 
+    let logMarker = Date()
     client.post(.startManualRecording)
     _ = try await client.waitUntil(description: "manual recording started") { snapshot in
       snapshot.isRecording && snapshot.isManualRecording
@@ -38,6 +39,7 @@ struct HardwareSmokeTests {
     try client.playSystemAudioFixture()
     try? await Task.sleep(for: .seconds(4))
 
+    let captureWindowEnd = Date()
     client.post(.stopManualRecording)
     let finalSnapshot = try await client.waitUntil(description: "recording saved") { snapshot in
       !snapshot.isRecording && !snapshot.isSaving && snapshot.lastSavedRecordingPath != nil
@@ -57,6 +59,17 @@ struct HardwareSmokeTests {
 
     let duration = try await asset.load(.duration).seconds
     #expect(duration > 2.5, "Expected non-trivial recording duration, got \(duration)s")
+
+    // Regression guard for #17: a near-zero minimumFrameInterval makes SCStream
+    // recomposite the display at refresh rate and drop every frame, because only
+    // the audio output consumes samples. Each dropped frame costs a full-screen
+    // recomposite in WindowServer.
+    let droppedFrames = UnifiedLogProbe.droppedFrameCount(
+      from: logMarker, to: captureWindowEnd)
+    #expect(
+      droppedFrames == 0,
+      "SCStream dropped \(droppedFrames) video frames during capture - check minimumFrameInterval and the .screen output subscription"
+    )
 
     var trackDurations: [Double] = []
     for track in tracks {
@@ -370,6 +383,79 @@ enum CoreAudioDevices {
 }
 
 // MARK: - Log file probe
+
+extension HardwareSmokeTests {
+  @Test(
+    "idle app starts no capture and holds no screen-recording stream",
+    .tags(.hardware),
+    .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
+    .timeLimit(.minutes(1))
+  )
+  func idleAppStartsNoCapture() async throws {
+    let client = try BlackboxSmokeClient()
+    defer {
+      client.terminate()
+      try? FileManager.default.removeItem(at: client.saveDirectory)
+    }
+
+    try client.launch()
+    let snapshot = try await client.waitUntil(description: "app test channel ready") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving
+    }
+    try #require(
+      !snapshot.isRecording,
+      "App auto-recorded at launch - quit any app holding mic + speaker (Zoom, Meet, Discord) and retry"
+    )
+
+    let logMarker = Date()
+    try await Task.sleep(for: .seconds(20))
+    let idleWindowEnd = Date()
+
+    #expect(
+      !BlackboxLogProbe.containsAfter("SCStream started", since: logMarker),
+      "App started an SCStream while idle - a capture with no call in progress"
+    )
+    let droppedFrames = UnifiedLogProbe.droppedFrameCount(from: logMarker, to: idleWindowEnd)
+    #expect(droppedFrames == 0, "Idle app produced \(droppedFrames) dropped video frames")
+
+    let idleSnapshot = try await client.waitUntil(description: "still idle") { _ in true }
+    #expect(!idleSnapshot.isRecording, "App began recording during the idle window")
+  }
+}
+
+/// Reads the unified system log (`log show`) for entries ScreenCaptureKit emits
+/// inside the Blackbox process. Our own file log cannot see these - they come
+/// from the framework, not from `Log`.
+enum UnifiedLogProbe {
+  /// Counts "Dropping frame" entries attributed to Blackbox in a time window.
+  /// Invokes `/usr/bin/log` by absolute path: a shell function or alias named
+  /// `log` otherwise shadows it and silently yields an empty result.
+  static func droppedFrameCount(from start: Date, to end: Date) -> Int {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+    process.arguments = [
+      "show",
+      "--start", formatter.string(from: start.addingTimeInterval(-1)),
+      "--end", formatter.string(from: end.addingTimeInterval(1)),
+      "--predicate", #"process == "Blackbox" AND eventMessage CONTAINS "Dropping frame""#,
+      "--style", "compact",
+    ]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+
+    guard (try? process.run()) != nil else { return 0 }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    let output = String(decoding: data, as: UTF8.self)
+    return output.split(separator: "\n").count { $0.contains("Dropping frame") }
+  }
+}
 
 enum BlackboxLogProbe {
   /// Polls `blackbox.log` for `pattern` on any line with a timestamp at or after

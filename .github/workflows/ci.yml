@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # macos-26 is required: Package.swift targets macOS 26.1, so a test binary
+    # with that minimum will not launch on macos-15 even though it compiles.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        id: toolchain
+        run: |
+          swift --version
+          echo "hash=$(swift --version | head -1 | shasum -a 256 | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      # Keyed on toolchain + resolved dependencies only: a per-commit key would
+      # write a fresh ~300MB entry every run, and PR caches are scoped to the
+      # merge ref, so they would never be reused. PRs read main's cache.
+      - name: Cache SwiftPM
+        uses: actions/cache@v6
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-
+
+      - name: Lint formatting
+        run: make format-check
+
+      # --build-tests builds the test bundle in one pass; `make test-ci` then
+      # runs with --skip-build. Debug only - the release build is verified on
+      # main, not on every PR, since it doubles compile time for the same code.
+      - name: Build tests
+        run: swift build --build-tests
+
+      - name: Test
+        # CoreML inference hangs forever on the runner (no Neural Engine); the
+        # AEC suite is skipped here and covered locally by `make test`.
+        env:
+          BLACKBOX_SKIP_COREML: "1"
+        run: make test
+
+      - name: Release build
+        if: github.ref == 'refs/heads/main'
+        run: make build
