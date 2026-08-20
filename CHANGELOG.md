@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-20
+
+### Fixed
+
+- Recordings ended early when the display went to sleep. System audio is captured through a display-wide stream, and macOS tears that stream down the moment the display sleeps. Auto-recorded calls lost their system audio at the first sleep with no attempt to resume; manual recordings tried to resume immediately, found no display because the screen was still off, and stopped for good. A 10 minute recording with two screen sleeps kept only the first 7 minutes. Blackbox now keeps the display awake while recording (as call apps do - this matters most for audio-only calls and manual recordings, where nothing else does), treats display loss as recoverable rather than fatal, and waits for the screen to come back before resuming. The same 10 minute test now keeps 605 of 613 seconds, with the two tracks staying in sync throughout.
+- Echo cancellation could hang after a recording, leaving the processed file unwritten. The decode loop ran on a thread pool that it then blocked, so with two recordings finishing at once on a machine with few cores, nothing could make progress. It now runs on its own thread.
+
 ## [0.9.2] - 2026-08-20
 
 ### Fixed
@@ -308,7 +315,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sparkle auto-update support
 - Developer ID code signing
 
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.9.2...HEAD
+[unreleased]: https://github.com/tenequm/blackbox/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/tenequm/blackbox/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/tenequm/blackbox/compare/v0.9.1...v0.9.2
 [0.8.1]: https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0

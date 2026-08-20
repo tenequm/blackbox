@@ -1,5 +1,5 @@
 APP_NAME = Blackbox
-VERSION = 0.9.2
+VERSION = 0.9.3
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
 DMG_NAME = $(APP_NAME)-$(VERSION).dmg
