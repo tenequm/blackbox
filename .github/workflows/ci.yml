@@ -54,6 +54,8 @@ jobs:
           echo "--- afconvert to LPCM (AudioToolbox) ---"; time afconvert -f WAVE -d LEI16 "$F" /tmp/out.wav && ls -la /tmp/out.wav
           echo "--- AVAudioFile ---"; /tmp/decode "$F" avaudiofile
           echo "--- AVAssetReader ---"; /tmp/decode "$F" assetreader
+          echo "--- two readers interleaved (AECProcessor pattern) ---"; /tmp/decode "$F" tworeaders
+          echo "--- two readers, 4 runs back to back ---"; for _ in 1 2 3 4; do /tmp/decode "$F" tworeaders | tail -1; done
           echo "--- audio devices ---"; system_profiler SPAudioDataType 2>/dev/null | head -20
           true
 
