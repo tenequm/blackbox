@@ -289,6 +289,12 @@ final class AudioMonitor {
     case .lowDiskSpace:
       setError("Recording stopped - not enough disk space")
       updateAutoState()
+    case .displayLost:
+      // Display sleep, not a fault: restart unconditionally. start() waits for
+      // a display to come back, so this does not spin against the budget.
+      Log.info(Log.monitor, "monitor", "display lost during manual recording, restarting")
+      setError("Display slept - resuming recording...")
+      startManualRecording(resetRestartBudget: false)
     case .systemStopped, .other:
       if shouldAllowRestart(
         count: &manualRestartCount, windowStart: &manualRestartWindowStart)
@@ -667,6 +673,9 @@ final class AudioMonitor {
       autoRecordingAppName = nil
       autoRecordingBundleID = nil
       updateAutoState()
+    case .displayLost:
+      Log.info(Log.monitor, "monitor", "display lost during auto-recording, restarting")
+      startAutoRecording(resetRestartBudget: false)
     case .systemStopped:
       if shouldAllowRestart(
         count: &autoRestartCount, windowStart: &autoRestartWindowStart)

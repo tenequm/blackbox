@@ -135,6 +135,56 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("display loss restarts auto-recording without consuming the restart budget")
+  func displayLostRestartsAutoRecordingUnbounded() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    // The systemStopped budget is 3 restarts per 30s. Display sleep is not a
+    // recorder fault: well past that many losses must still restart.
+    for expectedCount in 2...8 {
+      let current = try #require(harness.recorderFactory.createdSessions.last)
+      current.emitFailure(.displayLost)
+      await settle()
+      #expect(harness.recorderFactory.createdSessions.count == expectedCount)
+      #expect(monitor.isRecording, "auto-recording must resume after display loss")
+    }
+    #expect(monitor.errorMessage != "Recording failed repeatedly")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("display loss restarts manual recording")
+  func displayLostRestartsManualRecording() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    monitor.startManualRecording()
+    await settle()
+    #expect(monitor.isManualRecording)
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    for expectedCount in 2...6 {
+      let current = try #require(harness.recorderFactory.createdSessions.last)
+      current.emitFailure(.displayLost)
+      await settle()
+      #expect(harness.recorderFactory.createdSessions.count == expectedCount)
+      #expect(monitor.isManualRecording, "manual recording must resume after display loss")
+    }
+
+    monitor.stopManualRecording()
+    await settle()
+    await monitor.stopMonitoring()
+  }
+
   @Test("multiple simultaneous callers records with nil bundleID")
   func multipleSimultaneousCallersRecordsWithNilBundleID() async throws {
     let harness = MonitorHarness()
