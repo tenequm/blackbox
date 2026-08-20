@@ -45,32 +45,7 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
-      - name: Probe - cooperative pool during the AEC stall
-        env:
-          BLACKBOX_AEC_CPU_ONLY: "1"
-        run: |
-          set +e
-          sysctl -n hw.ncpu hw.logicalcpu
-          swift test --disable-xctest --skip-build --filter AECProcessingTests > /tmp/aec.log 2>&1 &
-          P=$!
-          for _ in $(seq 1 6); do sleep 10; kill -0 $P 2>/dev/null || { echo "AEC: exited"; break; }; done
-          if kill -0 $P 2>/dev/null; then
-            H=$(pgrep -f swiftpm-testing-helper | head -1)
-            sample "$H" 2 -mayDie -file /tmp/aec.sample >/dev/null 2>&1
-            echo "=== every cooperative-pool thread, full stack ==="
-            awk '/Thread_.*cooperative/{p=1} /^    [0-9]+ Thread_/ && !/cooperative/{p=0} p' /tmp/aec.sample | cut -c1-160
-            echo "=== main thread ==="
-            awk '/Thread_.*main-thread/{p=1} /^    [0-9]+ Thread_/ && !/main-thread/{p=0} p' /tmp/aec.sample | head -30 | cut -c1-160
-            kill -9 $P; pkill -9 -f swiftpm-testing-helper
-          fi
-          true
-
       - name: Test
-        # The runner has no Neural Engine and CoreML stalls on the ANE path;
-        # pin the AEC model to CPU so the suite runs for real instead of
-        # being skipped.
-        env:
-          BLACKBOX_AEC_CPU_ONLY: "1"
         run: make test
 
       - name: Release build

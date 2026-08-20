@@ -10,13 +10,14 @@ import DTLNAecCoreML
 /// tracks at 16kHz mono AAC. Original file is preserved for fallback.
 enum AECProcessor {
 
-  /// CoreML inference on the Neural Engine stalls indefinitely on virtualized
-  /// machines that have no ANE (GitHub-hosted runners). `BLACKBOX_AEC_CPU_ONLY=1`
-  /// pins inference to the CPU so the real model still runs there.
-  nonisolated static var computeUnits: MLComputeUnits {
-    ProcessInfo.processInfo.environment["BLACKBOX_AEC_CPU_ONLY"] == "1"
-      ? .cpuOnly : .cpuAndNeuralEngine
-  }
+  /// The decode/inference loop blocks its thread for the whole recording
+  /// (`copyNextSampleBuffer` is synchronous). It must run here, not on the
+  /// Swift cooperative pool: AVAssetReader delivers samples via libdispatch,
+  /// and with every pool thread blocked inside it - e.g. two recordings
+  /// finishing together on a 3-core machine, or parallel tests - delivery
+  /// never gets a thread and the reads deadlock.
+  private static let workQueue = DispatchQueue(
+    label: "com.tenequm.blackbox.aec", qos: .utility)
 
   /// Process a recording directory. No-op if already processed or single-track.
   /// Fire-and-forget: errors are logged, original file is never modified.
@@ -27,9 +28,13 @@ enum AECProcessor {
     guard !FileManager.default.fileExists(atPath: outputURL.path) else { return }
 
     do {
-      try await Task.detached {
-        try await Self.run(inputURL: inputURL, outputURL: outputURL)
-      }.value
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, Error>) in
+        workQueue.async {
+          continuation.resume(
+            with: Result { try Self.run(inputURL: inputURL, outputURL: outputURL) })
+        }
+      }
 
       Log.info(Log.recorder, "aec", "echo cancellation complete")
     } catch {
@@ -40,14 +45,12 @@ enum AECProcessor {
 
   // MARK: - Streaming Pipeline (background thread)
 
-  nonisolated private static func run(
-    inputURL: URL, outputURL: URL
-  ) async throws {
+  nonisolated private static func run(inputURL: URL, outputURL: URL) throws {
     let sampleRate: Double = 16000
     let chunkSize = 1024
 
     let asset = AVURLAsset(url: inputURL)
-    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    let tracks = try loadAudioTracksBlocking(asset)
     guard tracks.count >= 2 else {
       Log.info(Log.recorder, "aec", "single-track recording, skipping")
       return
@@ -117,8 +120,7 @@ enum AECProcessor {
     }
     writer.startSession(atSourceTime: .zero)
 
-    let processor = DTLNAecEchoProcessor(
-      config: DTLNAecConfig(modelSize: .medium, computeUnits: computeUnits))
+    let processor = DTLNAecEchoProcessor(modelSize: .medium)
     try processor.loadModels(from: DTLNAec256.bundle)
 
     guard
@@ -197,7 +199,9 @@ enum AECProcessor {
 
     sysInput.markAsFinished()
     micInput.markAsFinished()
-    await writer.finishWriting()
+    let finished = DispatchSemaphore(value: 0)
+    writer.finishWriting { finished.signal() }
+    finished.wait()
 
     guard writer.status == .completed else {
       throw AECError.writeFailed(writer.error?.localizedDescription ?? "writer failed")
@@ -205,6 +209,22 @@ enum AECProcessor {
   }
 
   // MARK: - Helpers
+
+  /// Synchronous track load for the blocking work queue. The async
+  /// `loadTracks` would resume on the cooperative pool, which is exactly what
+  /// this path must stay off of.
+  nonisolated private static func loadAudioTracksBlocking(_ asset: AVURLAsset) throws
+    -> [AVAssetTrack]
+  {
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: Result<[AVAssetTrack], Error>?
+    asset.loadTracks(withMediaType: .audio) { tracks, error in
+      result = tracks.map(Result.success) ?? .failure(error ?? AECError.readFailed("no tracks"))
+      done.signal()
+    }
+    done.wait()
+    return try result!.get()
+  }
 
   nonisolated private static func extractSamples(from sampleBuffer: CMSampleBuffer) -> [Float] {
     guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return [] }
