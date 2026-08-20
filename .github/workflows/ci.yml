@@ -19,7 +19,25 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Show toolchain
-        run: swift --version && xcodebuild -version
+        id: toolchain
+        run: |
+          swift --version
+          echo "version=$(swift --version | head -1 | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      # `make build` (release) and `make test` (debug) each compile Sparkle and
+      # dtln-aec-coreml from source - ~20 min cold. The key rolls per commit so
+      # each run refreshes the cache; restore-keys fall back to the newest
+      # entry for the same dependencies, keeping the rebuild incremental.
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            spm-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Package.resolved') }}-
+            spm-${{ steps.toolchain.outputs.version }}-
 
       - name: Lint formatting
         run: make format-check
