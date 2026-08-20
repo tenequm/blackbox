@@ -45,19 +45,25 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
-      - name: Probe - pure logic suite only
+      - name: Probe - bisect suites
         run: |
           set +e
-          swift test --disable-xctest --skip-build --filter "BundleIDListParsingTests" &
-          P=$!; for i in $(seq 1 12); do sleep 5; kill -0 $P 2>/dev/null || { echo "PURE-LOGIC: exited ~$((i*5))s"; break; }; done
-          kill -0 $P 2>/dev/null && { echo "PURE-LOGIC: STALLED"; kill -9 $P; pkill -9 -f swiftpm-testing-helper; }
-          true
-      - name: Probe - dispatch main executor env var
-        run: |
-          set +e
-          SWIFT_USE_DISPATCH_MAIN_EXECUTOR=1 swift test --disable-xctest --skip-build --filter "BundleIDListParsingTests" &
-          P=$!; for i in $(seq 1 12); do sleep 5; kill -0 $P 2>/dev/null || { echo "DISPATCH-EXEC: exited ~$((i*5))s"; break; }; done
-          kill -0 $P 2>/dev/null && { echo "DISPATCH-EXEC: STALLED"; kill -9 $P; pkill -9 -f swiftpm-testing-helper; }
+          for suite in BundleIDListParsingTests NamePrefixFormattingTests PCMConversionTests ResampleTests GapFillingTests RecordingWaveformMeterTests RecordingPipelineIntegrationTests AudioRecorderRaceTests AECProcessingTests AudioMonitorIntegrationTests; do
+            swift test --disable-xctest --skip-build --filter "$suite" > "/tmp/$suite.log" 2>&1 &
+            P=$!
+            ok=""
+            for i in $(seq 1 12); do
+              sleep 5
+              kill -0 $P 2>/dev/null || { ok="exited ~$((i*5))s"; break; }
+            done
+            if [ -z "$ok" ]; then
+              echo "SUITE $suite : STALLED"
+              kill -9 $P 2>/dev/null; pkill -9 -f swiftpm-testing-helper 2>/dev/null
+              echo "  last lines:"; grep -E '✔|✘|◇ Test ' "/tmp/$suite.log" | tail -3 | sed 's/^/    /'
+            else
+              echo "SUITE $suite : OK ($ok)"
+            fi
+          done
           true
 
       - name: Test
