@@ -1,57 +1,53 @@
 name: CI
 
-# DISABLED: `swift test` hangs on the runner (>30 min, no output) while it takes
-# 3s locally. Dispatch-only until that is understood - see the diagnose job.
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  diagnose:
+  check:
     # macos-26 is required: Package.swift targets macOS 26.1, so a test binary
-    # with that minimum will not launch on macos-15.
+    # with that minimum will not launch on macos-15 even though it compiles.
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
 
-      - name: Show toolchain and environment
+      - name: Toolchain
+        id: toolchain
         run: |
           swift --version
-          sw_vers
-          echo "--- audio devices ---"
-          system_profiler SPAudioDataType 2>&1 | head -30 || true
+          echo "hash=$(swift --version | head -1 | shasum -a 256 | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
+      # Keyed on toolchain + resolved dependencies only: a per-commit key would
+      # write a fresh ~300MB entry every run, and PR caches are scoped to the
+      # merge ref, so they would never be reused. PRs read main's cache.
+      - name: Cache SwiftPM
+        uses: actions/cache@v6
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-
+
+      - name: Lint formatting
+        run: make format-check
+
+      # --build-tests builds the test bundle in one pass; `make test-ci` then
+      # runs with --skip-build. Debug only - the release build is verified on
+      # main, not on every PR, since it doubles compile time for the same code.
       - name: Build tests
         run: swift build --build-tests
 
-      # Run the suite detached, sample the stack while it is still alive, then
-      # kill it. A `sample` of the hung process is the only thing that says
-      # *where* it blocks; CI stdout is a pipe, so Swift Testing's output is
-      # block-buffered and invisible until the process exits.
-      - name: Run tests with a pty and xunit output
-        run: |
-          set +e
-          # `script` allocates a pty so stdio is line-buffered: with a file
-          # redirect the tail of the log is lost when the process is killed.
-          # --xunit-output is written only when the run completes, so its
-          # presence distinguishes "tests stalled" from "tests done, process
-          # will not exit".
-          script -q /dev/null swift test --disable-xctest --skip-build \
-            --xunit-output "$PWD/results.xml" &
-          SWIFTPID=$!
-          for i in $(seq 1 30); do
-            sleep 10
-            if ! kill -0 $SWIFTPID 2>/dev/null; then echo "=== EXITED after ~$((i*10))s ==="; break; fi
-          done
-          if kill -0 $SWIFTPID 2>/dev/null; then
-            echo "=== STILL RUNNING after 300s ==="
-            echo "results.xml present? $([ -f results.xml ] && echo YES || echo NO)"
-            pkill -QUIT -f swiftpm-testing-helper
-            sleep 5
-            kill -9 $SWIFTPID 2>/dev/null; pkill -9 -f swiftpm-testing-helper 2>/dev/null
-          fi
-          echo "=== results.xml ==="
-          if [ -f results.xml ]; then head -5 results.xml; grep -oE 'tests="[0-9]+" failures="[0-9]+"' results.xml | head -2; else echo "NOT WRITTEN"; fi
+      - name: Test
+        run: make test-ci
+
+      - name: Release build
+        if: github.ref == 'refs/heads/main'
+        run: make build
