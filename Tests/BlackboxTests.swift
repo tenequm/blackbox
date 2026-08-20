@@ -83,7 +83,13 @@ struct PCMConversionTests {
 
 // MARK: - AEC Processing Tests
 
-@Suite("AEC Processing")
+/// DTLN CoreML inference stalls indefinitely on virtualized CI runners (no
+/// Neural Engine): the suite never completes and never times out on its own.
+/// Set BLACKBOX_SKIP_COREML=1 to skip it there; it runs by default locally.
+private nonisolated let coreMLDisabled: Bool =
+  ProcessInfo.processInfo.environment["BLACKBOX_SKIP_COREML"] == "1"
+
+@Suite("AEC Processing", .disabled(if: coreMLDisabled, "BLACKBOX_SKIP_COREML=1"))
 struct AECProcessingTests {
   /// Short dual-track recording (5.9s) with known-good reference processed file
   private static let testRecording = "2026-03-11-092853-2FD4"
@@ -116,7 +122,7 @@ struct AECProcessingTests {
     return (tmpDir, tmpDir.appending(path: "audio-processed.m4a"))
   }
 
-  @Test("produces dual-track 16kHz mono output with matching duration")
+  @Test("produces dual-track 16kHz mono output with matching duration", .timeLimit(.minutes(2)))
   func outputFormat() async throws {
     let (tmpDir, outputURL) = try await processInTemp(Self.testRecording)
     defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -147,7 +153,7 @@ struct AECProcessingTests {
       "Duration mismatch: input=\(inputDur)s, output=\(outputDur)s")
   }
 
-  @Test("output properties match reference processed file")
+  @Test("output properties match reference processed file", .timeLimit(.minutes(2)))
   func matchesReference() async throws {
     let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")
@@ -179,7 +185,7 @@ struct AECProcessingTests {
       "File size: ref=\(refSize), out=\(outSize), ratio=\(String(format: "%.2f", ratio))")
   }
 
-  @Test("processed mic track contains non-silent audio")
+  @Test("processed mic track contains non-silent audio", .timeLimit(.minutes(2)))
   func micTrackNotSilent() async throws {
     let (tmpDir, outputURL) = try await processInTemp(Self.testRecording)
     defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -218,7 +224,7 @@ struct AECProcessingTests {
     #expect(peakLevel > 0.001, "Mic track appears silent (peak=\(peakLevel))")
   }
 
-  @Test("per-second RMS of mic track matches reference within tolerance")
+  @Test("per-second RMS of mic track matches reference within tolerance", .timeLimit(.minutes(2)))
   func micRMSMatchesReference() async throws {
     let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")

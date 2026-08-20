@@ -45,29 +45,12 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
-      - name: Probe - bisect suites
-        run: |
-          set +e
-          for suite in BundleIDListParsingTests NamePrefixFormattingTests PCMConversionTests ResampleTests GapFillingTests RecordingWaveformMeterTests RecordingPipelineIntegrationTests AudioRecorderRaceTests AECProcessingTests AudioMonitorIntegrationTests; do
-            swift test --disable-xctest --skip-build --filter "$suite" > "/tmp/$suite.log" 2>&1 &
-            P=$!
-            ok=""
-            for i in $(seq 1 12); do
-              sleep 5
-              kill -0 $P 2>/dev/null || { ok="exited ~$((i*5))s"; break; }
-            done
-            if [ -z "$ok" ]; then
-              echo "SUITE $suite : STALLED"
-              kill -9 $P 2>/dev/null; pkill -9 -f swiftpm-testing-helper 2>/dev/null
-              echo "  last lines:"; grep -E '✔|✘|◇ Test ' "/tmp/$suite.log" | tail -3 | sed 's/^/    /'
-            else
-              echo "SUITE $suite : OK ($ok)"
-            fi
-          done
-          true
-
       - name: Test
-        run: make test-ci
+        # CoreML inference hangs forever on the runner (no Neural Engine); the
+        # AEC suite is skipped here and covered locally by `make test`.
+        env:
+          BLACKBOX_SKIP_COREML: "1"
+        run: make test
 
       - name: Release build
         if: github.ref == 'refs/heads/main'

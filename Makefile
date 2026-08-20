@@ -7,7 +7,7 @@ SPARKLE_PATH = $(shell find .build/artifacts -name "Sparkle.framework" -path "*/
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format format-check test test-ci check dmg release smoke-install smoke-test smoke
+.PHONY: build bundle install run clean format format-check test check dmg release smoke-install smoke-test smoke
 
 build:
 	swift build -c release
@@ -82,34 +82,6 @@ smoke-test: bundle
 
 smoke: smoke-test
 
-# CI test gate. The test process can complete its run and then fail to exit:
-# Swift Testing writes the xunit report, but the main run loop stays alive and
-# the process hangs forever (seen only on GitHub runners, not locally). Gate on
-# the report rather than the exit code, then kill the straggler.
-CI_RESULTS = .build/ci-results.xml
-test-ci:
-	@rm -f $(CI_RESULTS)
-	@swift test --disable-xctest --skip-build --xunit-output $(CI_RESULTS) & \
-	  pid=$$!; \
-	  for i in $$(seq 1 300); do \
-	    kill -0 $$pid 2>/dev/null || { echo "test process exited on its own"; break; }; \
-	    if grep -q "</testsuites>" $(CI_RESULTS) 2>/dev/null; then \
-	      echo "run complete after $${i}s; report written, reaping process"; \
-	      sleep 1; kill -9 $$pid 2>/dev/null; \
-	      pkill -9 -f swiftpm-testing-helper 2>/dev/null; \
-	      break; \
-	    fi; \
-	    sleep 1; \
-	  done; \
-	  true
-	@python3 -c "import sys,xml.etree.ElementTree as E; \
-	r=E.parse('$(CI_RESULTS)').getroot(); \
-	s=[t for t in r.iter('testsuite')] or [r]; \
-	n=sum(int(x.get('tests',0)) for x in s); \
-	f=sum(int(x.get('failures',0)) for x in s); \
-	e=sum(int(x.get('errors',0)) for x in s); \
-	print(f'tests={n} failures={f} errors={e}'); \
-	sys.exit(1) if n==0 or f or e else None"
 
 check: format build test
 	@echo "All checks passed."
