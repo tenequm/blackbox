@@ -7,7 +7,7 @@ SPARKLE_PATH = $(shell find .build/artifacts -name "Sparkle.framework" -path "*/
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format test check dmg release smoke-install smoke-test smoke
+.PHONY: build bundle install run clean format format-check test check dmg release smoke-install smoke-test smoke
 
 build:
 	swift build -c release
@@ -87,6 +87,11 @@ check: format build test
 
 format:
 	swift-format --recursive Sources/ Tests/ --in-place
+
+# Lint-only: `format` rewrites in place, so it can never fail a CI run.
+# Uses the toolchain-bundled formatter so CI needs no Homebrew install.
+format-check:
+	swift format lint --recursive Sources/ Tests/ --strict
 
 clean:
 	swift package clean

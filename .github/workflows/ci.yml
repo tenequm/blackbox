@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # macos-26 is required: Package.swift targets macOS 26.1, and a binary with
+    # that minimum refuses to launch on macos-15, so `swift test` would fail at
+    # exec time even though it compiles.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: swift --version && xcodebuild -version
+
+      - name: Lint formatting
+        run: make format-check
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
