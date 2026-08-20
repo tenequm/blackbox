@@ -219,9 +219,16 @@ actor AudioRecorder {
 
       let stream = SCStream(filter: filter, configuration: config, delegate: proxy)
       try stream.addStreamOutput(proxy, type: .audio, sampleHandlerQueue: audioQueue)
-      // Subscribe the (ignored) screen output too, otherwise SCStream logs
-      // "stream output NOT found. Dropping frame" for every video frame.
-      try stream.addStreamOutput(proxy, type: .screen, sampleHandlerQueue: audioQueue)
+      // Subscribe the (ignored) screen output on its own queue, otherwise
+      // SCStream logs "stream output NOT found. Dropping frame" per video
+      // frame. Best-effort: losing it costs log noise, never a recording.
+      do {
+        try stream.addStreamOutput(proxy, type: .screen, sampleHandlerQueue: Self.videoQueue)
+      } catch {
+        Log.error(
+          Log.recorder, "recorder",
+          "screen output subscribe failed for \(appName): \(error.localizedDescription)")
+      }
       self.displayStream = stream
 
       activity = ProcessInfo.processInfo.beginActivity(
@@ -283,9 +290,6 @@ actor AudioRecorder {
     driftTimer = nil
 
     if let stream {
-      // Race stopCapture against a 3s timeout (mirrors the steady-state stop
-      // path) so a hung SCStream cannot exceed applicationShouldTerminate's
-      // 8s budget.
       await Self.stopCaptureWithTimeout(stream, appName: appName)
     }
     if let pipe { _ = await pipe.stop() }
@@ -328,9 +332,6 @@ actor AudioRecorder {
   /// writer, return saved URL.
   private func stopRunning() async -> URL? {
     if let stream = displayStream {
-      // Race stopCapture against a 3s timeout so a hung SCStream (documented
-      // under WindowServer stalls) cannot exceed applicationShouldTerminate's
-      // 8s budget and corrupt the recording.
       await Self.stopCaptureWithTimeout(stream, appName: appName)
     }
     self.displayStream = nil
@@ -379,23 +380,23 @@ actor AudioRecorder {
     return savedURL
   }
 
-  /// Races `stopCapture` against a 3s timeout so a hung SCStream (documented
-  /// under WindowServer stalls) cannot exceed applicationShouldTerminate's 8s
-  /// budget. On timeout the stream reference is dropped while the stream may
-  /// keep running system-side, so log it loudly for diagnosis.
+  /// Waits up to 3s for `stopCapture` so a hung SCStream (documented under
+  /// WindowServer stalls) cannot exceed applicationShouldTerminate's 8s budget
+  /// and truncate the recording. The stop runs detached: `withTaskGroup` awaits
+  /// every child before returning, and `stopCapture` ignores cancellation, so a
+  /// grouped race would still block for the full hang.
   private static func stopCaptureWithTimeout(_ stream: SCStream, appName: String) async {
-    let stopped = await withTaskGroup(of: Bool.self) { group in
-      group.addTask {
+    let race = StopCaptureRace()
+    let stopped = await withCheckedContinuation {
+      (continuation: CheckedContinuation<Bool, Never>) in
+      Task.detached {
         try? await stream.stopCapture()
-        return true
+        await race.settle(continuation, with: true)
       }
-      group.addTask {
+      Task.detached {
         try? await Task.sleep(for: .seconds(3))
-        return false
+        await race.settle(continuation, with: false)
       }
-      let first = await group.next() ?? false
-      group.cancelAll()
-      return first
     }
     if !stopped {
       Log.error(
@@ -403,6 +404,11 @@ actor AudioRecorder {
         "SCStream stopCapture timed out after 3s for \(appName); stream may remain running")
     }
   }
+
+  /// Serial queue for the discarded `.screen` output, kept off `audioQueue` so
+  /// video delivery can never delay an audio buffer.
+  private static let videoQueue = DispatchQueue(
+    label: "com.tenequm.blackbox.video", qos: .utility)
 
   // MARK: - SCStream Configuration
 
@@ -985,6 +991,20 @@ actor AudioRecorder {
   /// Resolve CoreAudio device ID to its human-readable name.
   nonisolated private static func audioDeviceName(for deviceID: AudioDeviceID) -> String? {
     try? AudioHardwareDevice(id: deviceID).name
+  }
+}
+
+// MARK: - StopCaptureRace
+
+/// Guards the stop-vs-timeout continuation so whichever finishes first resumes
+/// it exactly once; resuming a CheckedContinuation twice traps.
+private actor StopCaptureRace {
+  private var settled = false
+
+  func settle(_ continuation: CheckedContinuation<Bool, Never>, with value: Bool) {
+    guard !settled else { return }
+    settled = true
+    continuation.resume(returning: value)
   }
 }
 
