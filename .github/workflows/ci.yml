@@ -46,10 +46,6 @@ jobs:
         run: swift build --build-tests
 
       - name: Test
-        # CoreML inference hangs forever on the runner (no Neural Engine); the
-        # AEC suite is skipped here and covered locally by `make test`.
-        env:
-          BLACKBOX_SKIP_COREML: "1"
         run: make test
 
       - name: Release build
