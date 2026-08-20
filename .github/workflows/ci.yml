@@ -45,6 +45,26 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
+      - name: Probe - sample the AEC suite where it stalls
+        env:
+          BLACKBOX_AEC_CPU_ONLY: "1"
+        run: |
+          set +e
+          swift test --disable-xctest --skip-build --filter AECProcessingTests > /tmp/aec.log 2>&1 &
+          P=$!
+          for i in $(seq 1 9); do sleep 10; kill -0 $P 2>/dev/null || { echo "AEC: exited ~$((i*10))s"; break; }; done
+          if kill -0 $P 2>/dev/null; then
+            echo "=== AEC STALLED at 90s - full-process sample ==="
+            H=$(pgrep -f swiftpm-testing-helper | head -1)
+            sample "$H" 3 -mayDie -file /tmp/aec.sample 2>&1 | tail -1
+            echo "--- threads doing anything other than idle wait ---"
+            # Print every thread's top-of-stack chain, trimmed
+            awk '/^    [0-9]+ Thread_/{t=$0} /AEC|DTLN|MLModel|CoreML|Espresso|ANE|MPS|Metal|AVAsset|swift_task|semaphore|ulock|dispatch_group|pthread_cond/{print t; print "      "$0}' /tmp/aec.sample | awk '!seen[$0]++' | head -120
+            kill -9 $P; pkill -9 -f swiftpm-testing-helper
+          fi
+          echo "=== last log lines ==="; tail -5 /tmp/aec.log
+          true
+
       - name: Test
         # The runner has no Neural Engine and CoreML stalls on the ANE path;
         # pin the AEC model to CPU so the suite runs for real instead of
