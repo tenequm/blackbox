@@ -13,11 +13,6 @@ name: Release dry run
 
 on:
   workflow_dispatch:
-  # TEMPORARY, remove before merge: workflow_dispatch only works once the file
-  # is on the default branch, so this is the only way to prove the release path
-  # from the PR that introduces it.
-  pull_request:
-    branches: [main]
 
 jobs:
   dry-run:
