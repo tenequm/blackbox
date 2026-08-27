@@ -6,7 +6,9 @@ import SwiftUI
 @main
 struct BlackboxApp: App {
   @NSApplicationDelegateAdaptor private var delegate: AppDelegate
-  @State private var monitor = AudioMonitor()
+  // Declared without an initial value: Xcode 27 reimplements @State as a macro that
+  // rejects pairing a declaration initial value with assignment in an initializer.
+  @State private var monitor: AudioMonitor
   @State private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
@@ -14,6 +16,8 @@ struct BlackboxApp: App {
   init() {
     LogFile.rotateIfNeeded()
     Log.info(Log.app, "app", "launched")
+    let monitor = AudioMonitor()
+    self.monitor = monitor
     // Set monitor reference on delegate for graceful shutdown and startup.
     delegate.monitor = monitor
   }
