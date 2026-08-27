@@ -39,6 +39,13 @@ jobs:
       - name: Lint formatting
         run: make format-check
 
+      # Catches workflow errors that only surface as a run with zero jobs and no
+      # log - a step-level `if` referencing the secrets context, for instance.
+      - name: Lint workflows
+        run: |
+          brew install actionlint
+          actionlint
+
       - uses: ./.github/actions/signed-bundle
         with:
           p12-base64: ${{ secrets.APPLE_P12_BASE64 }}
@@ -64,6 +71,8 @@ jobs:
     concurrency:
       group: release-${{ github.ref }}
       cancel-in-progress: false
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       release_pr: ${{ steps.rp.outputs.pr }}
@@ -135,7 +144,7 @@ jobs:
       # separate repo, which needs a token GITHUB_TOKEN cannot provide. Skipped
       # rather than failed when the secret is absent, so the release still ships.
       - name: Bump the Homebrew cask
-        if: steps.rp.outputs.release_created == 'true' && secrets.HOMEBREW_TAP_TOKEN != ''
+        if: steps.rp.outputs.release_created == 'true' && env.TAP_TOKEN != ''
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAG: ${{ steps.rp.outputs.tag_name }}
