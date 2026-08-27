@@ -1,0 +1,50 @@
+name: Grant recording permission
+description: Pre-authorize Screen Recording and Microphone for the built app bundle.
+
+# A hosted runner has no one to click the consent dialog, so the permissions are
+# written straight into the TCC databases. The runner-images maintainers point
+# people here deliberately - the images ship with SIP disabled and allow runtime
+# TCC updates for exactly this reason (actions/runner-images#9529).
+#
+# The grant is keyed on the bundle's designated requirement, so it matches any
+# build signed by the same team with the same bundle identifier - it does not
+# have to be re-seeded when the binary changes. Screen Recording is a
+# system-scope service and Microphone is user-scope, hence the two databases.
+
+runs:
+  using: composite
+  steps:
+    - name: Seed the TCC databases
+      shell: bash
+      run: |
+        set -euo pipefail
+        APP=build/Blackbox.app
+        [ -d "$APP" ] || { echo "$APP not found - run the signed-bundle action first" >&2; exit 1; }
+
+        REQ="$(codesign -d -r- "$APP" 2>/dev/null | sed -n 's/^designated => //p')"
+        [ -n "$REQ" ] || { echo "could not read the designated requirement" >&2; exit 1; }
+        echo "$REQ" | csreq -r- -b "$RUNNER_TEMP/req.bin"
+        HEX="$(xxd -p "$RUNNER_TEMP/req.bin" | tr -d '\n')"
+
+        SYS="/Library/Application Support/com.apple.TCC/TCC.db"
+        USR="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+        NOW="$(date +%s)"
+        # Named columns, not positional: the access table has grown a column at a
+        # time across releases (17 on macOS 26) and a positional insert breaks
+        # silently on the next one.
+        seed() {
+          sudo sqlite3 "$1" \
+            "INSERT OR REPLACE INTO access
+             (service,client,client_type,auth_value,auth_reason,auth_version,csreq,last_modified)
+             VALUES('$2','com.tenequm.Blackbox',0,2,4,1,X'$HEX',$NOW);"
+        }
+        seed "$SYS" kTCCServiceScreenCapture
+        seed "$USR" kTCCServiceMicrophone
+
+        # auth_value 2 is "allowed"; anything else means the write landed but the
+        # app will still be denied, which is worth failing on now rather than
+        # debugging as a capture timeout later.
+        got="$(sudo sqlite3 "$SYS" "SELECT auth_value FROM access WHERE service='kTCCServiceScreenCapture' AND client='com.tenequm.Blackbox';")"
+        [ "$got" = "2" ] || { echo "screen recording grant not applied (auth_value=$got)" >&2; exit 1; }
+        got="$(sudo sqlite3 "$USR" "SELECT auth_value FROM access WHERE service='kTCCServiceMicrophone' AND client='com.tenequm.Blackbox';")"
+        [ "$got" = "2" ] || { echo "microphone grant not applied (auth_value=$got)" >&2; exit 1; }

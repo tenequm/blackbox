@@ -1,0 +1,93 @@
+# git-cliff owns CHANGELOG.md and the GitHub release body. release-please owns
+# everything else about a release - the version, the release PR, Info.plist, the
+# tag - and runs with `skip-changelog: true` so the two never write the same file.
+#
+# Why not release-please's own changelog: it discards commit bodies before
+# rendering, so no configuration can put a release note under a bullet. That
+# prose is the whole point.
+#
+# Ported from cuttle, which took it from pond's release-plz template.
+
+[changelog]
+# Explicit header so new sections insert after this exact text - without it each
+# release glues onto `# Changelog` and eats a newline per release.
+header = """# Changelog
+"""
+# The entry is generated from squash-commit messages alone, so it survives every
+# release-PR refresh (the release PR is regenerated on each main push - hand
+# edits there are lost by design). The squash body is the full PR description,
+# landed by the repo's squash defaults, so the template extracts what it needs
+# itself. Per commit: a `## Release notes` section renders as indented prose
+# under that commit's bullet, and nothing else ever does - the rest of the
+# description never reaches the changelog. A section after a lone
+# `[release-note]` line is hoisted to the top of the entry.
+#
+# Prose comes from `raw_message`, not `body`: the conventional parser eats a
+# trailer-shaped FINAL paragraph into `footers`, silently dropping it from
+# `body` - raw_message keeps every line, and the line filter below strips the
+# real trailers instead.
+body = """## {% if version %}[{{ version | trim_start_matches(pat="v") }}]({% if previous.version %}https://github.com/tenequm/blackbox/compare/{{ previous.version }}...{{ version }}{% else %}https://github.com/tenequm/blackbox/releases/tag/{{ version }}{% endif %}) - {{ timestamp | date(format="%Y-%m-%d") }}{% else %}Unreleased{% endif %}
+{%- for commit in commits %}
+{%- if commit.raw_message is containing("\n## Release notes") %}{% set hoist_src = commit.raw_message | split(pat="\n## Release notes") | last | split(pat="\n## ") | first %}{% else %}{% set hoist_src = commit.raw_message %}{% endif %}
+{%- if hoist_src is containing("[release-note]") %}
+{% set note = hoist_src | split(pat="[release-note]") | last | trim %}
+{%- for line in note | split(pat="\n") %}
+{%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
+{{ line }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}{% endfor %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/tenequm/blackbox/commit/{{ commit.id }}))
+{%- if commit.raw_message is containing("\n## Release notes") %}
+{%- set prose_src = commit.raw_message | split(pat="\n## Release notes") | last | split(pat="\n## ") | first %}
+{%- else %}
+{%- set prose_src = "" %}
+{%- endif %}
+{%- set prose = prose_src | split(pat="[release-note]") | first | trim %}
+{%- if prose %}
+{%- for line in prose | split(pat="\n") %}
+{%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
+{% if line %}  {{ line }}{% endif %}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{% endfor %}{% endfor %}{% if previous.version %}
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/{{ previous.version }}...{{ version }}
+
+{% endif %}"""
+trim = false
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+protect_breaking_commits = true
+commit_preprocessors = [
+  # FIRST, before the PR-link rewrite below: it needs the bare `(#N)` in the
+  # subject to find the PR. Recovers a `## Release notes` section from the pull
+  # request when the squash commit landed without one.
+  { pattern = '(?s)^.*$', replace_command = ".github/scripts/release-note-from-pr.sh" },
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tenequm/blackbox/pull/${1}))" },
+]
+# These decide changelog SECTIONS only. Whether a release happens at all is
+# release-please's call, from its own hidden-type rules.
+commit_parsers = [
+  { footer = "^changelog: ?ignore", skip = true },
+  { message = "^chore: release", skip = true },
+  # This job's own commit, which otherwise enters the changelog it just wrote and
+  # makes every subsequent run produce a change - forever.
+  { message = "^chore: regenerate the changelog", skip = true },
+  { message = "^chore\\(main\\): release", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking Changes" },
+  { body = "^BREAKING CHANGE", group = "<!-- 0 -->Breaking Changes" },
+  { message = "^feat", group = "<!-- 1 -->New Features" },
+  { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^refactor", group = "<!-- 4 -->Refactor" },
+  { message = "^docs", group = "<!-- 5 -->Documentation" },
+  { message = "^chore|^ci|^build|^test", group = "<!-- 6 -->Chores" },
+  { message = "^.*", group = "<!-- 7 -->Other" },
+]

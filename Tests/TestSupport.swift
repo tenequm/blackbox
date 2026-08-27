@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import CoreGraphics
 import Foundation
 import Testing
 
@@ -28,6 +29,7 @@ enum TestFixtures {
 
 enum HardwareSmokeError: Error, CustomStringConvertible {
   case missingAppPath
+  case missingPermission(String)
   case launchFailed(String)
   case systemAudioPlaybackFailed(String)
   case timedOut(String)
@@ -36,6 +38,8 @@ enum HardwareSmokeError: Error, CustomStringConvertible {
     switch self {
     case .missingAppPath:
       "BLACKBOX_SMOKE_APP_PATH is not set or does not exist"
+    case .missingPermission(let detail):
+      detail
     case .launchFailed(let detail):
       "Failed to launch smoke app: \(detail)"
     case .systemAudioPlaybackFailed(let detail):
@@ -94,17 +98,25 @@ final class FakeHUD: AudioMonitorHUD {
   private(set) var startedApps: [String] = []
   private(set) var savedApps: [String] = []
   private(set) var errors: [String] = []
+  private(set) var lastToast: HUDToast?
 
   func showRecordingStarted(appName: String) {
     startedApps.append(appName)
+    record(title: HUDToast.startedTitle, subtitle: appName)
   }
 
   func showRecordingSaved(appName: String) {
     savedApps.append(appName)
+    record(title: HUDToast.savedTitle, subtitle: appName)
   }
 
   func showError(message: String) {
     errors.append(message)
+    record(title: HUDToast.errorTitle, subtitle: message)
+  }
+
+  private func record(title: String, subtitle: String) {
+    lastToast = HUDToast(title: title, subtitle: subtitle)
   }
 }
 
@@ -314,6 +326,20 @@ final class BlackboxSmokeClient {
       throw HardwareSmokeError.missingAppPath
     }
 
+    // Fail with the sentence that fixes it. Without these the app launches,
+    // never captures, and the wait for "recording started" dies on a timeout
+    // that says nothing about permissions.
+    guard CGPreflightScreenCaptureAccess() else {
+      throw HardwareSmokeError.missingPermission(
+        "Screen Recording permission is required. Grant it in System Settings > Privacy & Security > Screen & System Audio Recording, then retry."
+      )
+    }
+    guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+      throw HardwareSmokeError.missingPermission(
+        "Microphone permission is required. Grant it in System Settings > Privacy & Security > Microphone, then retry."
+      )
+    }
+
     appURL = URL(fileURLWithPath: appPath)
     saveDirectory = FileManager.default.temporaryDirectory
       .appending(path: "blackbox-hardware-smoke-\(runID)")
@@ -421,7 +447,7 @@ final class BlackboxSmokeClient {
   }
 
   private func terminateRunningApps() {
-    // Kill any Blackbox instance — including an installed /Applications copy —
+    // Kill any Blackbox instance - including an installed /Applications copy -
     // so two tap/aggregate owners don't contend for the same system audio.
     for app in NSRunningApplication.runningApplications(
       withBundleIdentifier: "com.tenequm.Blackbox")

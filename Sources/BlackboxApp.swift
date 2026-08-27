@@ -6,6 +6,8 @@ import SwiftUI
 @main
 struct BlackboxApp: App {
   @NSApplicationDelegateAdaptor private var delegate: AppDelegate
+  // Declared without an initial value: Xcode 27 reimplements @State as a macro that
+  // rejects pairing a declaration initial value with assignment in an initializer.
   @State private var monitor: AudioMonitor
   @State private var transcriptionCoordinator: TranscriptionCoordinator
   @State private var selectedTab: MainTab = .recordings
@@ -18,11 +20,11 @@ struct BlackboxApp: App {
 
     let coordinator = TranscriptionCoordinator()
     var dependencies = AudioMonitorDependencies.live
-    // Not wired under `--ui-test-mode`. The smoke suite records real audio on a
-    // developer's machine, and this hook reads the real setting and the real
-    // Keychain key - so with auto-transcribe on, `make smoke-test` would upload
-    // its own test recordings and bill the developer's Soniox account. They are
-    // 4s and ~12s, both over the duration floor.
+    // Not wired under `--ui-test-mode`. The hardware suite that `make test`
+    // runs records real audio on a developer's machine, and this hook reads the
+    // real auto-transcribe setting and the real Keychain key - so leaving it
+    // wired sends those test recordings to a third party. They are 4s and ~12s,
+    // both over the duration floor.
     if !BlackboxTestMode.isEnabled {
       dependencies.onRecordingSaved = { [weak coordinator] url in
         coordinator?.recordingFinished(audioFileURL: url)
@@ -31,8 +33,8 @@ struct BlackboxApp: App {
     let monitor = AudioMonitor(dependencies: dependencies)
     coordinator.isRecordingActive = { [weak monitor] in monitor?.isRecording ?? false }
 
-    _monitor = State(initialValue: monitor)
-    _transcriptionCoordinator = State(initialValue: coordinator)
+    self.monitor = monitor
+    self.transcriptionCoordinator = coordinator
 
     // Set references on delegate for graceful shutdown and startup.
     delegate.monitor = monitor

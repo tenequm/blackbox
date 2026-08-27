@@ -1,5 +1,5 @@
 {
-  "originHash" : "f02d1b06da5914ec9757af4da0eaa58ac89d06c25ef4f19477024d63596a814a",
+  "originHash" : "60258561d474e86d17fa824f9e81d3ed3bbb397651b1d201ead00a7d7953e8de",
   "pins" : [
     {
       "identity" : "dtln-aec-coreml",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sparkle-project/Sparkle",
       "state" : {
-        "revision" : "21d8df80440b1ca3b65fa82e40782f1e5a9e6ba2",
-        "version" : "2.9.0"
+        "revision" : "ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a",
+        "version" : "2.9.6"
       }
     }
   ],

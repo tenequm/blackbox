@@ -46,6 +46,8 @@ nonisolated struct BlackboxTestSnapshot: Codable, Sendable {
   var permissionNeeded: Bool
   var micPermissionNeeded: Bool
   var lastSavedRecordingPath: String?
+  var hudTitle: String?
+  var hudSubtitle: String?
 }
 
 nonisolated struct BlackboxTestResponse: Codable, Sendable {

@@ -7,22 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Transcribe recordings automatically. Turn on "Transcribe recordings automatically" in Settings > Transcription and every finished call longer than three seconds is sent to Soniox as soon as it is saved, with the transcript waiting when you open it. Off by default and unavailable without an API key, because it means your call audio leaves the machine on its own. Transcription is now owned by the app rather than by the recording window, so a transcript keeps going when you close the window, queues up behind whatever is already running, and picks up where it left off after a quit or a crash instead of re-uploading. Recordings that end because of a permission loss or a quit are transcribed too, not just cleanly stopped ones.
-
-### Changed
-
-- The recordings list shows transcription progress and failures per recording, and a failed transcription can be retried from the recording itself.
-- Transcription no longer runs its heavy work on the main thread - uploading, mixing, polling and reading the response all move off it - so the app stays responsive while a long recording is being prepared. Transcription also waits for a call to finish before it starts, so it does not begin competing with the recorder for the machine.
-- Recordings are cleaned up off Soniox. Finishing, failing, being cancelled and being dropped all now delete the audio that was already uploaded, where before a failure could leave a recording sitting on the server indefinitely. A delete that does not go through is written to the log rather than passed over in silence, and a cleanup that cannot run at all - because the API key was cleared or rotated while a transcription was in flight - keeps its record and finishes at the next launch, or at the first launch after you put a key back. A transcription that ran out of retries while offline deliberately leaves its audio in place, so the next launch can pick it up rather than paying to upload it again.
-- Turning auto-transcribe off stops recordings that were already queued, and stops one that is waiting between retries, including a recording that has been uploaded but not yet charged for - its audio is deleted rather than transcribed. A request already in flight finishes that step first. A transcription that has already been paid for still finishes, because throwing it away helps nobody. Asking for a transcription by hand always goes ahead, whatever the setting says, and takes precedence over an automatic one already queued for the same recording.
-- Recordings shorter than three seconds are never transcribed automatically: a recording that failed the moment it started would otherwise be uploaded and charged for without asking. You can still transcribe one by hand from its detail view.
-- A transcription that runs out of retries because you are offline says so on the recording rather than leaving it looking untranscribed, and retrying from there gets a full budget rather than the remains of the last one.
-- Polling a transcription now backs off instead of asking every two seconds for up to half an hour, and scratch files left by a quit mid-transcription are cleaned up on the next launch.
-- Settings can verify a Soniox API key on the spot, so a wrong key is caught when you paste it rather than by a recording that quietly fails to transcribe hours later. The Soniox model is now a setting too, defaulting to stt-async-v5, so a model retirement does not need an app update.
-- Transcription failures are reported accurately. A transcript that was ready a moment later used to be thrown away as a permanent failure; an exhausted Soniox balance is now named as such instead of appearing as a generic error; and every failure logs the request id that Soniox support asks for. Transcripts also record which service and model produced them.
-
 ## [0.9.3] - 2026-08-20
 
 ### Fixed

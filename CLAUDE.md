@@ -24,7 +24,13 @@ Sources/
   Log.swift                                - OSLog + file logging, debug export
 Info.plist                                 - LSUIElement, NSAudioCaptureUsageDescription, NSMicrophoneUsageDescription
 Makefile                                   - build, bundle, dmg, release, install, run, format, format-check, test, check, smoke, clean
-.github/workflows/ci.yml                   - CI on macos-26: format lint, build, test (~40s warm)
+.github/workflows/ci.yml                   - CI on macos-26: lint, full test suite, release-please, DMG publish
+.github/workflows/release-note.yml         - Lints PR title + `## Release notes` section (they become the changelog)
+.github/actions/signed-bundle/             - Imports the Developer ID cert and builds a signed .app
+.github/actions/grant-recording/           - Seeds Screen Recording + Microphone into the TCC databases
+.github/cliff.toml                         - git-cliff config; owns CHANGELOG.md and the release body
+.github/release-please-config.json         - Version/tag/release-PR automation; Info.plist is the version file
+.github/scripts/                           - make-appcast, bump-build-number, bump-cask, release-note-from-pr
 Tests/
   BlackboxTests.swift                      - PCM conversion, AEC processing, gap filling, resample tests
   AudioMonitorIntegrationTests.swift       - AudioMonitor integration tests with fake dependencies
@@ -48,10 +54,11 @@ make dmg        # bundle + create DMG with Applications symlink
 make release    # dmg + notarize + staple
 make install    # bundle + copy to /Applications
 make run        # bundle + open .app
-make test       # swift test (Swift Testing framework)
+make test       # bundle + ALL tests including the hardware suite (~80s)
+make test-unit  # hermetic subset only, no bundle/permissions/devices (~14s)
 make check      # format + build + test (full validation)
-make smoke-test # bundle + run all tests including hardware smoke (requires audio permissions; serialized across worktrees by a lock)
-make smoke      # alias for smoke-test
+make smoke-test # alias for test
+make smoke      # alias for test
 make format     # swift-format --recursive Sources/ Tests/ --in-place
 make clean      # remove build artifacts
 ```
@@ -80,9 +87,15 @@ The Swift 6 compiler with strict concurrency + warnings-as-errors catches more r
 - Tests find Testing.framework via the xcode-select'd toolchain; do NOT add CLT framework search paths to Package.swift (a version-mismatched CLT breaks every @Test macro with sourceLocation/sourceBounds errors)
 
 ### Test categories
-- **Unit tests** (`make test`): PCM conversion, gap filling, resample, AEC processing, RecordingPipeline integration. Run without special permissions.
-- **AudioMonitor integration tests** (`make test`): Use `MonitorHarness` with `TestClock`, `FakeHUD`, and `TestRecorderFactory` to test call detection, auto/manual recording lifecycle, continuity events, and restart budgets - no real audio hardware needed.
-- **Hardware smoke tests** (`make smoke-test`): Launch the real `.app` bundle, drive it via file-based IPC (`BlackboxTestController`), record real audio, verify output file structure. Gated by `BLACKBOX_RUN_HARDWARE_SMOKE=1` env var. Require System Audio Recording + Microphone permissions.
+- **Unit tests** (`make test-unit`): PCM conversion, gap filling, resample, AEC processing, RecordingPipeline integration. Run without special permissions.
+- **AudioMonitor integration tests** (`make test-unit`): Use `MonitorHarness` with `TestClock`, `FakeHUD`, and `TestRecorderFactory` to test call detection, auto/manual recording lifecycle, continuity events, and restart budgets - no real audio hardware needed.
+- **Hardware smoke tests** (`make test`): Launch the real `.app` bundle, drive it via file-based IPC (`BlackboxTestController`), record real audio, verify output file structure. Require System Audio Recording + Microphone permissions; `BlackboxSmokeClient.init` fails with the sentence that fixes it if either is missing.
+
+`make test` runs everything, locally and in CI alike - there is no CI-only subset to drift out of sync. CI gets there by importing the Developer ID certificate and writing the two grants straight into the TCC databases (`.github/actions/grant-recording`); hosted runner images ship with SIP disabled and permit that, which is the only reason a headless machine can run this suite. The grant is keyed on the bundle's designated requirement, so it must be signed with the real certificate - an ad-hoc cdhash changes every build and would never match twice.
+
+`make test` takes a `lockf(1)` lock on `/tmp/blackbox-smoke.lock`: two concurrent runs fight over the default audio devices and fail each other spuriously. `make test-unit` deliberately does not.
+
+The only path no runner can cover is Bluetooth/HFP renegotiation - the runner's two virtual devices exercise the device-switch code, but not the HFP path. Check that by hand on real hardware when `AudioRecorder.swift` changes.
 
 ### Test mode infrastructure
 The app supports `--ui-test-mode` for smoke tests. `BlackboxTestMode` parses CLI flags, `BlackboxTestController` polls `command.json` and writes `state.json` for IPC. `BlackboxSmokeClient` (in TestSupport.swift) drives the app from the test process.
@@ -94,8 +107,13 @@ Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
 
 ## Pre-Release Checklist
 
-1. **Automated**: `make check` (format + build + test)
-2. **Hardware smoke test**: `make smoke-test` (builds bundle, launches app, records real audio, verifies output)
+Most of this is now enforced by CI on every PR - `make check` and the full
+hardware suite both run there. What remains is what no runner can do:
+
+1. **Automated (CI)**: `make check` plus the hardware suite, on every PR
+2. **Bluetooth/HFP**: when `AudioRecorder.swift` changes, run `make test` on real
+   hardware with AirPods connected - the runner's virtual devices exercise the
+   device-switch code but not HFP renegotiation
 3. **Manual smoke test**: `make install && open /Applications/Blackbox.app`
 4. **Verify permissions**: First recording should prompt for System Audio Recording permission
 5. **Test auto-recording**: Start any call (Zoom, Meet, etc.) - recording should start when microphone becomes active
@@ -106,21 +124,59 @@ Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
 
 ## Release Process
 
-Follow `.agents/skills/release-dmg/SKILL.md` for the full release pipeline. It is marked
-`disable-model-invocation`, so the Skill tool cannot load it - read the file and execute its
-steps directly. `.claude/skills/` holds only symlinks into `.agents/skills/`.
+Releases are automated. Land work on `main` with a Conventional Commits PR title
+and a `## Release notes` section in the PR description; release-please keeps a
+release PR open with the next version, and merging it does everything else.
 
-The command handles: version bump (Makefile + Info.plist + CHANGELOG.md), format + build + test, DMG creation, Sparkle signing, git commit + push + tag, GitHub release with changelog notes and appcast.xml.
+```
+PR merged to main
+  -> release-please opens/updates the release PR (version, Info.plist, tag)
+  -> release-changelog regenerates CHANGELOG.md + bumps CFBundleVersion on that branch
+  -> you merge the release PR
+  -> CI: signed build -> DMG -> notarize -> staple -> Gatekeeper check
+        -> Sparkle-signed appcast.xml -> GitHub release -> Homebrew cask bump
+```
 
-Version is tracked in two places that must stay in sync:
-- `Makefile` - `VERSION = X.Y.Z` (used for DMG filename)
-- `Info.plist` - `CFBundleShortVersionString` (shown in app) + `CFBundleVersion` (build number)
+`.github/workflows/release-note.yml` lints the PR title and the `## Release
+notes` section on every PR, because both become the changelog and the release
+body. It also catches a release-please parser bug: a body line starting `word(`
+whose paren does not close on the same line is read as `type(scope`, and the
+commit is SILENTLY DROPPED - the release is skipped with CI green
+(googleapis/release-please#2564).
 
-Notary uses keychain profile `blackbox` (configured via `xcrun notarytool store-credentials`).
-Sparkle reads `SUFeedURL` from Info.plist pointing to `releases/latest/download/appcast.xml`.
-A GitHub release does NOT update Homebrew: bump `Casks/blackbox-recorder.rb` in tenequm/homebrew-tap
-(version + sha256 of the published DMG). The cask keeps `auto_updates true` because Sparkle
-self-updates. Both steps are covered by the release-dmg skill file.
+git-cliff owns `CHANGELOG.md` and the release body; release-please runs with
+`skip-changelog: true` so the two never write the same file. The changelog entry
+is rendered from squash-commit bodies, and
+`.github/scripts/release-note-from-pr.sh` refetches the note from the PR when a
+squash landed without one. That script must stay executable - git-cliff reports a
+failed `replace_command` as a WARN and silently drops the commit from the entry.
+
+**Info.plist is the single source of truth for the version.** The Makefile reads
+`VERSION` from it with PlistBuddy, so the two can no longer drift. release-please
+updates `CFBundleShortVersionString` via the `x-release-please-version`
+annotation on that line. `CFBundleVersion` is a separate monotonic integer that
+release-please cannot own; `.github/scripts/bump-build-number.sh` derives it from
+the last release tag, which makes re-runs idempotent. Sparkle compares
+`CFBundleVersion` to decide whether an update exists, so a value that ever goes
+backwards silently stops updates for everyone already on the higher number.
+
+Required repository secrets: `APPLE_P12_BASE64`, `APPLE_P12_PASSWORD` (Developer
+ID, also needed by CI tests for TCC seeding), `APPLE_ASC_KEY_P8`,
+`APPLE_ASC_KEY_ID`, `APPLE_ASC_ISSUER_ID` (notarization), `SPARKLE_PRIVATE_KEY`
+(appcast signing), and `HOMEBREW_TAP_TOKEN` (cask bump; the step is skipped
+rather than failed when it is absent). The Developer ID certificate and ASC key
+live in the 1Password item `pond-apple-ci-signing`; the Sparkle key is backed up
+as `blackbox-sparkle-ed25519-private-key`. Losing the Sparkle key is
+unrecoverable - its public half is baked into every shipped copy.
+
+`make release` still works locally and falls back to the `blackbox` keychain
+profile when the ASC environment variables are absent. It gates on the
+notarization JSON `status`, because `notarytool submit --wait` exits 0 even when
+the notary returns `Invalid`.
+
+The cask keeps `auto_updates true`: Sparkle self-updates the app, so plain
+`brew upgrade` intentionally skips it, and removing the flag would let a lagging
+cask downgrade a Sparkle-updated install.
 
 ## Key Architecture Decisions
 
