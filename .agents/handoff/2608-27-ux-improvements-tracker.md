@@ -33,7 +33,7 @@ Last updated: 2026-08-27, after commit `a15bff1`.
 | J | Accessibility sweep across all screens | todo |
 | K | Settings content: consent sheet, cost, deletion wording, notifications naming, screen-recording request, key trim/debounce, model picker, storage stats refresh | todo |
 | L | Speaker-index crash, plurals, ellipses, remaining polish | todo |
-| M | Concurrent transcription queue (remove the global one-at-a-time + gate) | **plan in progress** - subagent running |
+| M | Concurrent transcription queue (remove the global one-at-a-time + gate) | **planned** - `docs/plans/2608-27-concurrent-transcription.md`, 5 commits, not started |
 | N | AEC: `Bundle.module` resolves to a path that does not exist in a shipped app. Fix or drop the feature | todo - user wants to reconsider dropping |
 
 ## Known-broken, decided later

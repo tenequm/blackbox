@@ -101,8 +101,14 @@ struct RecordingsView: View {
             }
           )
           .contextMenu {
+            if transcription.hasAPIKey, !transcription.status(for: recording.url).isActive {
+              Button(recording.hasTranscript ? "Transcribe Again" : "Transcribe") {
+                transcription.transcribe(recordingDirectory: recording.url)
+              }
+              Divider()
+            }
             Button("Reveal in Finder") { revealInFinder(Set([recording.id])) }
-            Button("Export Audio...") { exportRecordings(Set([recording.id])) }
+            Button("Export Audio…") { exportRecordings(Set([recording.id])) }
             Divider()
             Button("Delete", role: .destructive) {
               deleteRecordings(Set([recording.id]))
@@ -394,6 +400,7 @@ struct RecordingDetailView: View {
 
   // UI
   @State private var showDeleteConfirmation = false
+  @State private var showRetranscribeConfirmation = false
   @State private var isProcessingAEC = false
 
   // Metadata
@@ -499,7 +506,21 @@ struct RecordingDetailView: View {
           } label: {
             Image(systemName: "doc.text")
           }
+          .accessibilityLabel("Export Transcript")
           .help("Export Transcript")
+
+          // Without this a bad transcript was permanent: the transcript area
+          // only offers Retry on the error path, so a transcript that arrived
+          // garbled, in the wrong language, or from the wrong model could only
+          // be replaced by deleting the sidecar in Finder.
+          Button {
+            showRetranscribeConfirmation = true
+          } label: {
+            Image(systemName: "arrow.clockwise")
+          }
+          .accessibilityLabel("Transcribe Again")
+          .help("Transcribe again - replaces the current transcript")
+          .disabled(transcriptionStatus.isActive)
         }
 
         if !recording.hasProcessed {
@@ -533,6 +554,14 @@ struct RecordingDetailView: View {
       }
     }
     .padding()
+    .alert("Transcribe Again?", isPresented: $showRetranscribeConfirmation) {
+      Button("Transcribe Again") { retranscribe() }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "This replaces the current transcript and uploads the audio to Soniox again, which is billed."
+      )
+    }
     .alert("Delete Recording?", isPresented: $showDeleteConfirmation) {
       Button("Delete", role: .destructive, action: onDelete)
       Button("Cancel", role: .cancel) {}
@@ -809,22 +838,16 @@ struct RecordingDetailView: View {
 
   private var transcriptArea: some View {
     Group {
-      if let transcript, !transcript.segments.isEmpty {
-        transcriptView(transcript)
-      } else if case .error(let msg) = transcriptionStatus {
-        VStack(spacing: 12) {
-          Image(systemName: "exclamationmark.triangle")
-            .font(.title)
-            .foregroundStyle(.secondary)
-          Text(msg)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-          Button("Retry") { startTranscription() }
-            .buttonStyle(.bordered)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if transcriptionStatus.isActive {
+      // Order matters here, and it is not the obvious one.
+      //
+      // A running job wins over an existing transcript, because re-transcribing
+      // otherwise looked like nothing happened - the old text stayed on screen
+      // with no progress and no way to tell the request had registered.
+      //
+      // An existing transcript then wins over an error, because a failed
+      // re-transcribe must not cost the user the transcript they already had.
+      // The row's indicator still shows the failure.
+      if transcriptionStatus.isActive {
         VStack(spacing: 12) {
           // Determinate wherever the stage can actually report itself. Mixing
           // and uploading a long call are minutes each, and an indeterminate
@@ -845,6 +868,21 @@ struct RecordingDetailView: View {
           Button("Cancel") { cancelTranscription() }
             .buttonStyle(.bordered)
             .disabled(transcriptionStatus == .cancelling)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if let transcript, !transcript.segments.isEmpty {
+        transcriptView(transcript)
+      } else if case .error(let msg) = transcriptionStatus {
+        VStack(spacing: 12) {
+          Image(systemName: "exclamationmark.triangle")
+            .font(.title)
+            .foregroundStyle(.secondary)
+          Text(msg)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+          Button("Retry") { startTranscription() }
+            .buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -918,6 +956,15 @@ struct RecordingDetailView: View {
   }
 
   private func startTranscription() {
+    transcription.transcribe(recordingDirectory: recording.url)
+  }
+
+  /// The existing transcript is deliberately left on disk. A re-run that fails
+  /// should leave the user where they started rather than costing them the
+  /// transcript they already had; the new one overwrites it only on success.
+  /// `transcriptArea` shows progress ahead of a stale transcript, so nothing
+  /// here needs to clear the view.
+  private func retranscribe() {
     transcription.transcribe(recordingDirectory: recording.url)
   }
 
