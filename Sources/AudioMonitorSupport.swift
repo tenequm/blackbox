@@ -57,6 +57,7 @@ protocol AudioMonitorHUD: AnyObject {
   func showRecordingStarted(appName: String)
   func showRecordingSaved(appName: String)
   func showError(message: String)
+  var lastToast: HUDToast? { get }
 }
 
 extension RecordingHUD: AudioMonitorHUD {}
@@ -118,9 +119,11 @@ struct AudioMonitorDependencies {
           micEnabled: true,
           saveDirectory: BlackboxTestMode.saveDirectoryOverride
             ?? URL(fileURLWithPath: defaultSaveDirectoryPath),
-          notifyOnStart: false,
-          notifyOnSaved: false,
-          notifyOnError: false,
+          // Toasts stay on under --ui-test-mode so the smoke suite can assert
+          // the HUD actually fired; without this the panel never shows at all.
+          notifyOnStart: true,
+          notifyOnSaved: true,
+          notifyOnError: true,
           namePrefixTemplate: ""
         )
       }
