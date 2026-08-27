@@ -57,7 +57,6 @@ struct SettingsView: View {
     .formStyle(.grouped)
     .onAppear {
       launchAtLogin = SMAppService.mainApp.status == .enabled
-      migrateGracePeriod()
       refreshPermissions()
       migrateAPIKeyToKeychain()
       // After the migration, which is what puts a legacy key in the Keychain.
@@ -170,15 +169,18 @@ struct SettingsView: View {
       // VoiceOver, and "Grace period" was jargon.
       //
       // The slider it replaced allowed 5...60 by 5, so seven of its twelve
-      // values match no tag here and would render the control with nothing
-      // selected. `snappedGracePeriod` rounds a stored value onto the nearest
-      // offered one.
+      // values match no tag here and would otherwise render the control with
+      // nothing selected. They are surfaced rather than rounded away: rounding
+      // rewrote a setting the user had chosen, silently, and
+      // `AudioMonitorDependencies.live` reads the raw number, so rounding only
+      // the display would have shown "30 seconds" while the recorder used 45.
       Picker("Keep recording for", selection: $gracePeriod) {
-        Text("5 seconds").tag(5.0)
-        Text("10 seconds").tag(10.0)
-        Text("15 seconds").tag(15.0)
-        Text("30 seconds").tag(30.0)
-        Text("1 minute").tag(60.0)
+        ForEach(Self.gracePeriodChoices, id: \.self) { seconds in
+          Text(Self.gracePeriodLabel(seconds)).tag(seconds)
+        }
+        if !Self.gracePeriodChoices.contains(gracePeriod) {
+          Text(Self.gracePeriodLabel(gracePeriod)).tag(gracePeriod)
+        }
       }
       Text("Keeps recording after the microphone stops, in case the call resumes")
         .font(.caption)
@@ -643,22 +645,16 @@ struct SettingsView: View {
   }
 
   /// Offered grace-period values. A value stored by an older build that is not
-  /// one of these is snapped to the closest, so the control always shows a
-  /// selection.
+  /// one of these is added to the picker as its own entry rather than rounded
+  /// onto a neighbour, so no setting is rewritten behind the user's back.
   private static let gracePeriodChoices: [Double] = [5, 10, 15, 30, 60]
 
-  private static func snappedGracePeriod(_ value: Double) -> Double {
-    if gracePeriodChoices.contains(value) { return value }
-    return gracePeriodChoices.min { abs($0 - value) < abs($1 - value) } ?? 5
-  }
-
-  /// Snapping only the displayed value would have shown "30 seconds" while the
-  /// recorder went on using a stored 45 - `AudioMonitorDependencies.live` reads
-  /// the raw number, not this picker. So the stored value is migrated once, on
-  /// appear, and display and behaviour cannot disagree.
-  private func migrateGracePeriod() {
-    let snapped = Self.snappedGracePeriod(gracePeriod)
-    if snapped != gracePeriod { gracePeriod = snapped }
+  private static func gracePeriodLabel(_ seconds: Double) -> String {
+    if seconds == 60 { return "1 minute" }
+    if seconds > 60, seconds.truncatingRemainder(dividingBy: 60) == 0 {
+      return "\(Int(seconds / 60)) minutes"
+    }
+    return "\(Int(seconds)) seconds"
   }
 
   private func pickFolder() {
