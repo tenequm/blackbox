@@ -6,7 +6,7 @@ Findings source: `docs/plans/2608-27-audit-findings.md`.
 **This file is the reconciliation point.** Update the status column when
 something lands, and never mark an item done without a commit SHA next to it.
 
-Last updated: 2026-08-27, after commit `952091a`.
+Last updated: 2026-08-27, after commit `6f53333`.
 
 ## Rules for working this list
 
@@ -24,9 +24,9 @@ Last updated: 2026-08-27, after commit `952091a`.
 | A | Land in-flight work: cancelWriting data loss, permission truth, 30s gate ordering, status enum + real progress, cancel state | **done** `a15bff1` |
 | B | Re-transcribe button (detail toolbar + row context menu) | **done** `9ebcc0c` |
 | C | Transcript: selectable/copyable text, always-readable contrast, auto-scroll, speed control, h:mm:ss timestamps | **done** `952091a` |
-| D | Scrubbing (`isDragging` never set) + rename `@FocusState` | **partly done** `952091a` - scrubbing fixed; rename focus still todo |
-| E | Menu bar: saving state, error badge instead of hijack, timer clip past 1h, `0:60` countdown, mic-grant branch, pause auto-record, reveal in Finder, accessibility label, icon width (crash risk C1) | todo |
-| F | Toast click observer -> AppDelegate; quit-in-progress feedback | todo |
+| D | Scrubbing (`isDragging` never set) + rename `@FocusState` | **done** `952091a` + `6f53333` |
+| E | Menu bar: saving state, error badge instead of hijack, timer clip past 1h, `0:60` countdown, mic-grant branch, pause auto-record, reveal in Finder, accessibility label, icon width (crash risk C1) | **done** `6f53333` |
+| F | Toast click observer -> AppDelegate; quit-in-progress feedback | **done** `6f53333` - also HUD click-through, screen choice, VoiceOver announcement, terminate double-reply, `processRunning` timing |
 | G | Onboarding honors its permission results; re-openable; step indicator | todo |
 | H | `Settings` scene + `.commands` (Cmd+, Cmd+Delete, Cmd+F) | todo |
 | I | List: multi-select (already written, unreachable), search, date sections, export format + silent failure, delete consistency | todo |
