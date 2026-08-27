@@ -11,8 +11,24 @@ Anything needing hardware or a runtime observation says so instead of asserting.
 
 ## Status
 
-Fixed on `feat/ux-improvements` so far: D1, T2 (partly - the gate), T5, and the
-permission-truth half of C1.
+All of this was fixed on `feat/ux-improvements`, which is PR #25:
+
+**Fixed:** D1, D2, D3, D5, D6 (every data-loss item), C1, C3, T2, T5, T6, T7,
+T8, T9, and the whole user-experience and accessibility sections.
+
+**Not fixed, and deliberately out of scope for that branch** - these want their
+own follow-up, roughly in this order:
+
+- **P1** the waveform extractor: 0.5-1 GB per selection, uncancellable,
+  unserialized, uncached. The largest single item left.
+- **C4** the same extractor blocking cooperative-pool threads.
+- **S1-S4** the silent-capture-failure set: mic start failure swallowed, denied
+  mic producing a silent track, no detection of a flowing-but-silent system
+  track, and SCStream error codes falling through to a non-restarting `.other`.
+- **C2** `precondition` on a losing start/stop race.
+- **C5** unbounded spin in AEC backpressure.
+- **S6** Sparkle can relaunch mid-recording.
+- **T1**, **T3**, **T4**, **T10-T14**, **P2-P11**.
 
 ---
 
