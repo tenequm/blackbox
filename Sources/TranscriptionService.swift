@@ -43,9 +43,19 @@ nonisolated enum RecordingStore {
   /// capture. Nil when the directory holds neither.
   static func audioURL(in recordingDirectory: URL) -> URL? {
     let processed = recordingDirectory.appendingPathComponent(processedAudioName)
-    if FileManager.default.fileExists(atPath: processed.path) { return processed }
+    if isUsable(processed) { return processed }
     let raw = recordingDirectory.appendingPathComponent(audioName)
-    return FileManager.default.fileExists(atPath: raw.path) ? raw : nil
+    return isUsable(raw) ? raw : nil
+  }
+
+  /// Exists *and* has bytes. A killed echo-cancellation run used to leave a
+  /// zero-byte `audio-processed.m4a`, and because this method prefers the
+  /// processed file, that empty file silently became the playback, export and
+  /// transcription source - so a recording whose audio was perfectly intact
+  /// reported "Could not load audio: Cannot Open".
+  static func isUsable(_ url: URL) -> Bool {
+    guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return false }
+    return size > 0
   }
 
   /// Enumerates by name rather than with `contentsOfDirectory(at:)`, which

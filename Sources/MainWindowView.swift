@@ -212,7 +212,8 @@ struct RecordingsView: View {
         // Prefer processed file for playback when available
         let processedURL = url.appendingPathComponent(RecordingStore.processedAudioName)
         let processedValues = try? processedURL.resourceValues(forKeys: [.fileSizeKey])
-        let hasProcessed = processedValues != nil
+        // Zero-byte counts as absent, matching `RecordingStore.isUsable`.
+        let hasProcessed = (processedValues?.fileSize ?? 0) > 0
         let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
         let originalSize = originalValues.fileSize ?? 0
@@ -970,7 +971,13 @@ struct RecordingDetailView: View {
   private func runAEC() {
     isProcessingAEC = true
     Task {
-      await AECProcessor.process(recordingDirectory: recording.url)
+      do {
+        try await AECProcessor.process(recordingDirectory: recording.url)
+      } catch {
+        // Was fire-and-forget: the spinner simply stopped, the button stayed,
+        // and the user had no way to tell whether it had run.
+        exportError = "Echo cancellation failed: \(error.localizedDescription)"
+      }
       isProcessingAEC = false
       // Reload recordings to pick up the new processed file
       onTitleChanged()

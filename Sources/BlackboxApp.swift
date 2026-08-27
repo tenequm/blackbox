@@ -235,6 +235,11 @@ struct BlackboxApp: App {
       monitor?.startMonitoring(skipPermissionRequests: willOnboard)
       // Pick up anything a previous session left mid-flight.
       transcriptionCoordinator?.resumePendingJobs()
+      // A killed echo-cancellation run cannot clean up after itself.
+      let saveDirectory = URL(
+        fileURLWithPath: UserDefaults.standard.string(forKey: SettingsKeys.saveDirectoryPath)
+          ?? defaultSaveDirectoryPath)
+      Task.detached { AECProcessor.sweepPartialFiles(in: saveDirectory) }
 
       if willOnboard {
         showOnboarding()

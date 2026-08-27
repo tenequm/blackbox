@@ -112,7 +112,7 @@ struct AECProcessingTests {
     try FileManager.default.copyItem(
       at: audioURL, to: tmpDir.appending(path: "audio.m4a"))
 
-    await AECProcessor.process(recordingDirectory: tmpDir)
+    try await AECProcessor.process(recordingDirectory: tmpDir)
     return (tmpDir, tmpDir.appending(path: "audio-processed.m4a"))
   }
 

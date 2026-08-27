@@ -1,7 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreML
 import CoreMedia
-import DTLNAec256
 import DTLNAecCoreML
 
 /// Post-processes recorded audio to remove echo from the mic track using DTLN-aec.
@@ -21,26 +20,103 @@ enum AECProcessor {
 
   /// Process a recording directory. No-op if already processed or single-track.
   /// Fire-and-forget: errors are logged, original file is never modified.
-  static func process(recordingDirectory: URL) async {
+  nonisolated static let modelBundleName = "DTLNAecCoreML_DTLNAec256.bundle"
+
+  /// Resolves the CoreML model bundle ourselves rather than through
+  /// `DTLNAec256.bundle`, which is SwiftPM's generated `Bundle.module`.
+  ///
+  /// That accessor looks for the bundle at `Bundle.main.bundleURL` - the `.app`
+  /// root - and falls back to an absolute path inside the developer's `.build`
+  /// directory. The Makefile puts resources in `Contents/Resources`, where they
+  /// belong and where codesigning requires them, so the first location never
+  /// matched and the second only ever existed on the machine that built it.
+  /// On every other Mac, and on this one once the build directory moved, the
+  /// accessor hit its `fatalError` - on a background queue, so echo
+  /// cancellation crashed the app outright rather than failing.
+  ///
+  /// Returning nil here turns that into an ordinary thrown error.
+  nonisolated static func modelBundle() -> Bundle? {
+    var candidates: [URL] = []
+    // The `.app` layout, where codesigning requires resources to live.
+    if let resources = Bundle.main.resourceURL {
+      candidates.append(resources.appendingPathComponent(modelBundleName))
+    }
+    candidates.append(Bundle.main.bundleURL.appendingPathComponent(modelBundleName))
+    // The bare-executable layout: `swift test` and `swift run` put resource
+    // bundles beside the binary rather than inside a wrapper.
+    if let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() {
+      candidates.append(executableDirectory.appendingPathComponent(modelBundleName))
+    }
+    // The xctest layout, where `Bundle.main` is the test runner and the
+    // resources belong to the test bundle instead.
+    for bundle in Bundle.allBundles {
+      if let resources = bundle.resourceURL {
+        candidates.append(resources.appendingPathComponent(modelBundleName))
+      }
+      candidates.append(bundle.bundleURL.appendingPathComponent(modelBundleName))
+      // The directory *containing* the bundle: SwiftPM puts resource bundles
+      // beside `BlackboxPackageTests.xctest`, not inside it.
+      candidates.append(
+        bundle.bundleURL.deletingLastPathComponent().appendingPathComponent(modelBundleName))
+    }
+    for url in candidates {
+      guard FileManager.default.fileExists(atPath: url.path) else { continue }
+      if let bundle = Bundle(url: url) { return bundle }
+    }
+    Log.error(
+      Log.app, "aec",
+      "could not find \(modelBundleName) in \(candidates.map(\.path).joined(separator: ", "))")
+    return nil
+  }
+
+  static func process(recordingDirectory: URL) async throws {
     let inputURL = recordingDirectory.appendingPathComponent(RecordingStore.audioName)
     let outputURL = recordingDirectory.appendingPathComponent(
       RecordingStore.processedAudioName)
 
-    guard !FileManager.default.fileExists(atPath: outputURL.path) else { return }
+    // Usable, not merely present: an empty file from a killed run must not
+    // read as "already processed" and block a re-run forever.
+    guard !RecordingStore.isUsable(outputURL) else { return }
+    try? FileManager.default.removeItem(at: outputURL)
+
+    // Written to a scratch name and moved into place only on success. Writing
+    // straight to `audio-processed.m4a` meant a quit during a long run - which
+    // the user has no reason to think is unsafe - left a headerless file that
+    // `RecordingStore.audioURL(in:)` then *prefers*: it silently became the
+    // transcription source (and got billed), the export source and the playback
+    // source, while `hasProcessed` went true from a successful stat, hiding the
+    // button that could have regenerated it.
+    let scratchURL = recordingDirectory.appendingPathComponent(Self.partialAudioName)
+    try? FileManager.default.removeItem(at: scratchURL)
 
     do {
       try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, Error>) in
         workQueue.async {
           continuation.resume(
-            with: Result { try Self.run(inputURL: inputURL, outputURL: outputURL) })
+            with: Result { try Self.run(inputURL: inputURL, outputURL: scratchURL) })
         }
       }
-
+      try FileManager.default.moveItem(at: scratchURL, to: outputURL)
       Log.info(Log.recorder, "aec", "echo cancellation complete")
     } catch {
       Log.error(Log.recorder, "aec", "failed: \(error.localizedDescription)")
-      try? FileManager.default.removeItem(at: outputURL)
+      try? FileManager.default.removeItem(at: scratchURL)
+      throw error
+    }
+  }
+
+  /// Scratch name for an in-progress run. Swept at launch, because a killed run
+  /// cannot clean up after itself.
+  nonisolated static let partialAudioName = "audio-processed.partial.m4a"
+
+  /// Removes scratch files a killed echo-cancellation run left behind.
+  nonisolated static func sweepPartialFiles(in saveDirectory: URL) {
+    for directory in RecordingStore.directories(in: saveDirectory) {
+      let scratch = directory.appendingPathComponent(partialAudioName)
+      if FileManager.default.fileExists(atPath: scratch.path) {
+        try? FileManager.default.removeItem(at: scratch)
+      }
     }
   }
 
@@ -122,7 +198,10 @@ enum AECProcessor {
     writer.startSession(atSourceTime: .zero)
 
     let processor = DTLNAecEchoProcessor(modelSize: .medium)
-    try processor.loadModels(from: DTLNAec256.bundle)
+    guard let modelBundle = Self.modelBundle() else {
+      throw DTLNAecError.modelNotFound(Self.modelBundleName)
+    }
+    try processor.loadModels(from: modelBundle)
 
     guard
       let format = AVAudioFormat(
