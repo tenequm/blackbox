@@ -12,7 +12,12 @@ struct OnboardingView: View {
   @AccessibilityFocusState private var stepFocused: Bool
   var onComplete: (() -> Void)?
 
+  static let windowSize = CGSize(width: 480, height: 380)
   private static let stepCount = 4
+  /// Index of the final step. Every bound below was a bare `3`, so adding a
+  /// step meant changing the count and five literals - and the count is the one
+  /// that would not be forgotten.
+  private static let lastStep = stepCount - 1
 
   var body: some View {
     VStack(spacing: 0) {
@@ -21,7 +26,7 @@ struct OnboardingView: View {
         case 0: welcomeStep
         case 1: microphoneStep
         case 2: notificationsStep
-        case 3: systemAudioStep
+        case Self.lastStep: systemAudioStep
         default: EmptyView()
         }
       }
@@ -41,10 +46,10 @@ struct OnboardingView: View {
           .foregroundStyle(.secondary)
           .accessibilityAddTraits(.isHeader)
         Spacer()
-        if step > 0 && step < 3 {
+        if step > 0 && step < Self.lastStep {
           Button("Back") { step -= 1 }
         }
-        if step > 0 && step < 3 {
+        if step > 0 && step < Self.lastStep {
           Button("Skip") { step += 1 }
         }
         Button(primaryButtonTitle) { advanceStep() }
@@ -52,7 +57,7 @@ struct OnboardingView: View {
       }
       .padding(16)
     }
-    .frame(width: 480, height: 380)
+    .frame(width: Self.windowSize.width, height: Self.windowSize.height)
     .onChange(of: step) { _, _ in
       stepFocused = true
     }
@@ -60,7 +65,7 @@ struct OnboardingView: View {
   }
 
   private var primaryButtonTitle: String {
-    if step < 3 { return "Continue" }
+    if step < Self.lastStep { return "Continue" }
     if screenCaptureGranted { return "Quit and Reopen" }
     if screenCaptureDenied { return "Open System Settings…" }
     return "Grant Access"
@@ -105,7 +110,7 @@ struct OnboardingView: View {
         .foregroundStyle(.secondary)
         .frame(maxWidth: 360)
         Button("Open System Settings…") {
-          openSettings(pane: "Privacy_Microphone")
+          openSettings(pane: .microphone)
         }
         .font(.caption)
       } else {
@@ -207,11 +212,11 @@ struct OnboardingView: View {
         // costs one alert, not the product.
         step += 1
       }
-    case 3:
+    case Self.lastStep:
       if screenCaptureGranted {
         relaunch()
       } else if screenCaptureDenied {
-        openSettings(pane: "Privacy_ScreenCapture")
+        openSettings(pane: .screenCapture)
       } else if CGPreflightScreenCaptureAccess() {
         onComplete?()
       } else if CGRequestScreenCaptureAccess() {
@@ -250,15 +255,18 @@ struct OnboardingView: View {
     NSWorkspace.shared.openApplication(
       at: Bundle.main.bundleURL, configuration: configuration
     ) { _, _ in
-      Task { @MainActor in NSApplication.shared.terminate(nil) }
+      // Scheduled on the run loop, not with `Task { @MainActor }`. Terminating
+      // from inside a main-queue block starves the main queue for the whole
+      // nested run loop `.terminateLater` spins up, and both of the paths that
+      // reply - including the 8s timeout - are main-actor tasks. Neither ever
+      // runs, no reply is ever made, and the app hangs until Force Quit.
+      RunLoop.main.perform {
+        MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
+      }
     }
   }
 
-  private func openSettings(pane: String) {
-    guard
-      let url = URL(
-        string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(pane)")
-    else { return }
-    NSWorkspace.shared.open(url)
+  private func openSettings(pane: PrivacyPane) {
+    openPrivacySettings(pane: pane)
   }
 }

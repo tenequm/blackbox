@@ -7,6 +7,7 @@ struct HUDToast: Equatable, Sendable {
   static let startedTitle = "Recording Started"
   static let savedTitle = "Recording Saved"
   static let errorTitle = "Error"
+  static let finalizingTitle = "Saving Recording…"
 
   var title: String
   var subtitle: String
@@ -53,7 +54,7 @@ final class RecordingHUD {
   func showFinalizing() {
     show(
       content: HUDContentView(
-        title: "Saving Recording…",
+        title: HUDToast.finalizingTitle,
         subtitle: "Blackbox will quit when the file is written",
         icon: NSApplication.shared.applicationIconImage
       ),
@@ -164,7 +165,7 @@ final class RecordingHUD {
   }
 }
 
-// Intercepts clicks so the "Recording Saved" HUD can reveal in Finder.
+// Intercepts clicks so the "Recording Saved" HUD can open the main window.
 private final class HUDPanel: NSPanel {
   var onClick: (() -> Void)?
 

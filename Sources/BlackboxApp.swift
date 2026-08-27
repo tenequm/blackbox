@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreGraphics
+import ServiceManagement
 import Sparkle
 import SwiftUI
 
@@ -10,6 +11,10 @@ struct BlackboxApp: App {
   // rejects pairing a declaration initial value with assignment in an initializer.
   @State private var monitor: AudioMonitor
   @State private var transcriptionCoordinator: TranscriptionCoordinator
+  /// Persisted, so the window reopens on the tab it was left on - and so the
+  /// menu bar's Settings item can select the tab without reaching into the
+  /// window's own state.
+  @AppStorage(SettingsKeys.mainWindowTab) private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
@@ -39,18 +44,19 @@ struct BlackboxApp: App {
     delegate.transcriptionCoordinator = coordinator
   }
 
-  /// Every branch draws its icon at the same fixed width, and the icon does not
-  /// change with audio level.
+  /// The icon reacts to sound again, but every branch still draws at the same
+  /// fixed width - and that part is load-bearing.
   ///
-  /// Both of those are load-bearing. The label used to pick between `waveform`,
-  /// `waveform.mid` and `waveform.low` from `audioLevel`, which is published
-  /// four times a second - three glyphs of different widths meant the status
-  /// item re-laid-out at 4 Hz with an oscillating intrinsic width for the whole
-  /// recording. That is the documented shape of an intermittent
-  /// `_postWindowNeedsUpdateConstraints` crash, and under `LSUIElement` such a
-  /// crash is invisible: the icon simply disappears and the user goes on
-  /// believing the call is being captured. `symbolEffect(.variableColor)` gives
-  /// the liveness the level-driven glyph was there for, without the relayout.
+  /// The original picked between `waveform`, `waveform.mid` and `waveform.low`
+  /// from `audioLevel`, published four times a second. Three glyphs of
+  /// *different intrinsic widths* meant the status item re-laid-out at 4 Hz for
+  /// the whole recording, which is the documented shape of an intermittent
+  /// `_postWindowNeedsUpdateConstraints` crash - and under `LSUIElement` that
+  /// crash is invisible: the icon simply disappears while the user believes the
+  /// call is still being captured.
+  ///
+  /// So the level drives `scale` and opacity on ONE glyph inside a fixed frame.
+  /// Same liveness, nothing re-measures.
   @ViewBuilder private var menuBarLabel: some View {
     let iconWidth: CGFloat = 16
     if monitor.isRecording {
@@ -67,6 +73,12 @@ struct BlackboxApp: App {
           .variableColor,
           isActive: monitor.errorMessage == nil
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
+        .opacity(Self.levelOpacity(monitor.audioLevel))
+        .animation(
+          NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? nil : .easeOut(duration: 0.15),
+          value: monitor.audioLevel
         )
         .frame(width: iconWidth)
         if let grace = monitor.graceCountdown {
@@ -122,12 +134,31 @@ struct BlackboxApp: App {
     return "Blackbox - idle"
   }
 
+  /// Maps the published RMS level onto an opacity the eye reads as "sound is
+  /// happening". Never reaches zero: a silent moment in a call must still look
+  /// like a running recording, not like a stopped one.
+  ///
+  /// The curve is deliberately steep at the bottom, because speech at a normal
+  /// level sits near 0.02-0.05 RMS and a linear map would barely move.
+  nonisolated static func levelOpacity(_ level: Float) -> Double {
+    let normalized = min(1, max(0, Double(level) / 0.08))
+    return 0.55 + 0.45 * sqrt(normalized)
+  }
+
   /// Rolls over correctly at the top of the range. The old
   /// `String(format: "0:%02d", …)` hardcoded the minutes digit, so the maximum
   /// grace period of 60s rendered as "0:60".
-  private static func countdownText(_ remaining: TimeInterval) -> String {
+  static func countdownText(_ remaining: TimeInterval) -> String {
     let total = max(0, Int(ceil(remaining)))
     return String(format: "%d:%02d", total / 60, total % 60)
+  }
+
+  /// The window may not be open yet, so the tab is selected first and the
+  /// window asked for second.
+  @MainActor private func openSettingsTab() {
+    selectedTab = .settings
+    NSApplication.shared.activate()
+    NotificationCenter.default.post(name: RecordingHUD.openMainWindowNotification, object: nil)
   }
 
   var body: some Scene {
@@ -144,9 +175,11 @@ struct BlackboxApp: App {
     .menuBarExtraStyle(.menu)
 
     Window("Blackbox", id: "main") {
-      RecordingsView()
+      MainWindowView(selectedTab: $selectedTab)
         .environment(transcriptionCoordinator)
-        .frame(minWidth: 700, minHeight: 450)
+        // Settings can move the whole recordings folder, so it needs to know
+        // whether a recording is live.
+        .environment(monitor)
     }
     .defaultSize(width: 900, height: 600)
     .defaultPosition(.center)
@@ -168,6 +201,13 @@ struct BlackboxApp: App {
           updaterController.updater.checkForUpdates()
         }
       }
+      // Wired by hand: with Settings back as a tab there is no `Settings` scene
+      // to provide this for free. Replacing `.appSettings` keeps the item where
+      // a Mac user looks for it, and keeps the shortcut working.
+      CommandGroup(replacing: .appSettings) {
+        Button("Settings…") { openSettingsTab() }
+          .keyboardShortcut(",", modifiers: .command)
+      }
       CommandMenu("Recording") {
         Button("Record Now") { monitor.startManualRecording() }
           .keyboardShortcut("r")
@@ -182,16 +222,6 @@ struct BlackboxApp: App {
         .keyboardShortcut("r", modifiers: [.command, .shift])
         .disabled(!monitor.isRecording)
       }
-    }
-
-    // A real Settings scene rather than a tab inside the library window. Cmd+,
-    // is reserved by the system and is muscle memory; it did nothing here. This
-    // also lets the recordings window's sidebar own the titlebar, which a
-    // `TabView` wrapped around a `NavigationSplitView` cannot.
-    Settings {
-      SettingsView()
-        .environment(transcriptionCoordinator)
-        .frame(width: 560)
     }
 
   }
@@ -225,9 +255,7 @@ struct BlackboxApp: App {
 
       // CGPreflightScreenCaptureAccess is the source of truth on every launch.
       // If the user denies on first run or revokes between sessions, onboarding
-      // re-appears. The `hasCompletedOnboarding` UserDefaults key is now only
-      // written by `windowWillClose` as an X-button courtesy flag; it is never
-      // read here because preflight alone gives the correct answer.
+      // re-appears.
       let willOnboard = !CGPreflightScreenCaptureAccess()
 
       // Start monitoring AFTER the onboarding decision so the fallback
@@ -236,13 +264,82 @@ struct BlackboxApp: App {
       // Pick up anything a previous session left mid-flight.
       transcriptionCoordinator?.resumePendingJobs()
       // A killed echo-cancellation run cannot clean up after itself.
-      let saveDirectory = URL(
-        fileURLWithPath: UserDefaults.standard.string(forKey: SettingsKeys.saveDirectoryPath)
-          ?? defaultSaveDirectoryPath)
+      let saveDirectory =
+        BlackboxTestMode.saveDirectoryOverride
+        ?? URL(
+          fileURLWithPath: UserDefaults.standard.string(forKey: SettingsKeys.saveDirectoryPath)
+            ?? defaultSaveDirectoryPath)
       Task.detached { AECProcessor.sweepPartialFiles(in: saveDirectory) }
 
       if willOnboard {
         showOnboarding()
+      } else {
+        // `applicationShouldHandleReopen` only fires when the app was already
+        // running, so a cold launch from Spotlight or `open -a` reached nothing
+        // and the window never appeared.
+        openMainWindowIfThisLaunchWasTheUser()
+      }
+    }
+
+    /// "The user launched me" and "launchd launched me at login" are the same
+    /// launch as far as this process can tell. Measured on this app: a
+    /// foreground `open`, a background `open -g` and a login launch all arrive
+    /// with `NSApplicationLaunchIsDefaultLaunchKey` true and the same
+    /// `application.<bundle-id>.<n>.<n>` launchd label; `isActive` is false in
+    /// every case, and a windowless `LSUIElement` app is never made active, so
+    /// waiting for an activation waits forever.
+    ///
+    /// What does separate them is *when*. A login launch happens in the first
+    /// moments of a session; a user launching the app happens whenever they
+    /// felt like it. So the window is suppressed only for a launch that is both
+    /// a login item's and inside that opening window - opening one at every
+    /// login is precisely what `.restorationBehavior(.disabled)` on the scene
+    /// exists to prevent. With the switch off, nothing is suppressed at all.
+    private func openMainWindowIfThisLaunchWasTheUser() {
+      if SMAppService.mainApp.status == .enabled, let age = Self.secondsSinceLogin(),
+        age < Self.loginLaunchWindow
+      {
+        Log.info(
+          Log.app, "app",
+          "not opening the window: launched \(Int(age))s into this login session, as a login item")
+        return
+      }
+      openMainWindowAfterSceneSetup()
+    }
+
+    /// Generous, because a login item can be started well after the session
+    /// begins on a busy machine, and the cost of being wrong in this direction
+    /// is one missing window on a launch the user can simply repeat.
+    private static let loginLaunchWindow: TimeInterval = 120
+
+    /// Age of this login session, read from the console record in `utmpx`. Nil
+    /// when there is no such record, which is treated as "not a login launch"
+    /// rather than guessed at.
+    private static func secondsSinceLogin() -> TimeInterval? {
+      setutxent()
+      defer { endutxent() }
+      var loggedInAt: time_t?
+      while let entry = getutxent() {
+        let record = entry.pointee
+        guard record.ut_type == USER_PROCESS else { continue }
+        var line = record.ut_line
+        let name = withUnsafeBytes(of: &line) { raw -> String in
+          String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        guard name == "console" else { continue }
+        loggedInAt = record.ut_tv.tv_sec
+      }
+      guard let loggedInAt else { return nil }
+      return Date().timeIntervalSince1970 - TimeInterval(loggedInAt)
+    }
+
+    /// Deferred one turn because the scene and its `OpenWindowRegistrar` are
+    /// not wired until after `applicationDidFinishLaunching` returns.
+    private func openMainWindowAfterSceneSetup() {
+      DispatchQueue.main.async { [weak self] in
+        Log.info(Log.app, "app", "opening the main window for this launch")
+        self?.openMainWindow?()
+        NSApplication.shared.activate()
       }
     }
 
@@ -305,6 +402,7 @@ struct BlackboxApp: App {
     /// unexpected window - could never see it again, and it is the only place
     /// the app explains that it does not record your screen.
     func showOnboarding() {
+      Log.info(Log.app, "app", "opening the setup assistant")
       if let existing = onboardingWindow {
         existing.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate()
@@ -324,7 +422,7 @@ struct BlackboxApp: App {
       })
       let hosting = NSHostingView(rootView: onboarding)
       let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 480, height: 360),
+        contentRect: NSRect(origin: .zero, size: OnboardingView.windowSize),
         styleMask: [.titled, .closable],
         backing: .buffered, defer: false
       )
@@ -339,6 +437,25 @@ struct BlackboxApp: App {
     }
 
     private var isDismissingOnboarding = false
+
+    /// Launching an app that is already running - Spotlight, `open -a`, the
+    /// Dock if there were one - sends this instead of starting a second
+    /// process. Without it the gesture did nothing at all under `LSUIElement`,
+    /// because there is no Dock icon to bounce and no window to raise.
+    ///
+    /// Distinct from `.restorationBehavior(.disabled)` on the window scene,
+    /// which is about macOS reopening the window by itself at login. This only
+    /// fires when the user explicitly asks for the app.
+    func applicationShouldHandleReopen(
+      _ sender: NSApplication, hasVisibleWindows: Bool
+    ) -> Bool {
+      guard !BlackboxTestMode.isEnabled else { return true }
+      if !hasVisibleWindows {
+        openMainWindow?()
+      }
+      NSApplication.shared.activate()
+      return true
+    }
 
     func windowWillClose(_ notification: Notification) {
       guard !isDismissingOnboarding,
@@ -432,10 +549,14 @@ struct MenuContent: View {
   let updater: SPUUpdater
   @Environment(\.openWindow) private var openWindow
   /// Written straight to defaults; `AudioMonitor` picks it up on its next
-  /// settings pass, the same way the Settings window's toggle works.
+  /// settings pass, the same way the Settings tab's toggle works.
   @AppStorage(SettingsKeys.autoRecord) private var autoRecord = true
   @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
     defaultSaveDirectoryPath
+  /// `CGRequestScreenCaptureAccess` prompts once per process and silently
+  /// returns false thereafter, so the button has to stop offering to ask.
+  @State private var hasRequestedScreenCapture = false
+  @AppStorage(SettingsKeys.mainWindowTab) private var settingsTab: MainTab = .recordings
 
   var body: some View {
     // Primary action
@@ -466,13 +587,19 @@ struct MenuContent: View {
     if monitor.permissionNeeded {
       Text("Screen & System Audio Recording permission required")
         .foregroundStyle(.red)
-      Button("Open System Settings") {
-        NSWorkspace.shared.open(
-          URL(
-            string:
-              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
-          )!
-        )
+      // Same rule as the microphone branch below: ask where asking works, and
+      // only send the user to System Settings when it does not. A user who has
+      // never been prompted is the common case here, because the preflight poll
+      // sets this flag before any recording is attempted.
+      if CGPreflightScreenCaptureAccess() == false, !hasRequestedScreenCapture {
+        Button("Grant Screen Recording Access") {
+          hasRequestedScreenCapture = true
+          CGRequestScreenCaptureAccess()
+        }
+      } else {
+        Button("Open System Settings…") {
+          openPrivacySettings(pane: .screenCapture)
+        }
       }
     } else if monitor.micPermissionNeeded {
       // Both recording paths use the microphone, not just manual ones - a user
@@ -491,12 +618,7 @@ struct MenuContent: View {
         }
       } else {
         Button("Open System Settings…") {
-          NSWorkspace.shared.open(
-            URL(
-              string:
-                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
-            )!
-          )
+          openPrivacySettings(pane: .microphone)
         }
       }
     } else if let errorMsg = monitor.errorMessage {
@@ -504,7 +626,9 @@ struct MenuContent: View {
         .foregroundStyle(.red)
     } else if monitor.isRecording, let appName = monitor.currentAppName {
       if let grace = monitor.graceCountdown {
-        Text("\(appName) - \(monitor.formattedElapsed ?? "0:00") (ending in \(Int(grace))s)")
+        Text(
+          "\(appName) - \(monitor.formattedElapsed ?? "0:00") (ending in \(BlackboxApp.countdownText(grace)))"
+        )
       } else {
         Text("Recording \(appName) - \(monitor.formattedElapsed ?? "0:00")")
       }
@@ -533,25 +657,35 @@ struct MenuContent: View {
 
     Divider()
 
+    // The standard panel, not a window scene: the `Window(id: "about")` this
+    // used to open was removed when Settings moved to its own scene, and under
+    // LSUIElement the menu bar is the About users actually reach.
     Button("About Blackbox") {
-      openWindow(id: "about")
       NSApplication.shared.activate()
+      NSApplication.shared.orderFrontStandardAboutPanel(nil)
     }
 
-    Button("Check for Updates...") {
+    Button("Check for Updates…") {
+      NSApplication.shared.activate()
       updater.checkForUpdates()
     }
 
     Button("Setup Assistant…") {
-      (NSApplication.shared.delegate as? BlackboxApp.AppDelegate)?.showOnboarding()
+      guard let delegate = NSApplication.shared.delegate as? BlackboxApp.AppDelegate else {
+        Log.error(Log.app, "app", "setup assistant: app delegate is not BlackboxApp.AppDelegate")
+        return
+      }
+      delegate.showOnboarding()
     }
 
     Button("Report a Bug") {
       NSWorkspace.shared.open(URL(string: "https://github.com/tenequm/blackbox/issues/new")!)
     }
 
-    SettingsLink {
-      Text("Settings…")
+    Button("Settings…") {
+      settingsTab = .settings
+      NSApplication.shared.activate()
+      NotificationCenter.default.post(name: RecordingHUD.openMainWindowNotification, object: nil)
     }
     .keyboardShortcut(",", modifiers: .command)
 
@@ -566,27 +700,6 @@ struct MenuContent: View {
 }
 
 // MARK: - About
-
-private struct AboutView: View {
-  var body: some View {
-    VStack(spacing: 12) {
-      Image(nsImage: NSApplication.shared.applicationIconImage)
-        .resizable()
-        .frame(width: 64, height: 64)
-      Text("Blackbox")
-        .font(.title2.bold())
-      Text(
-        "Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")"
-      )
-      .foregroundStyle(.secondary)
-      Text("Auto-records your call audio")
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
-    .padding(24)
-    .frame(width: 260)
-  }
-}
 
 // MARK: - Uncaught Exception Handler
 
@@ -604,14 +717,3 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
 /// Maps audio RMS level to a waveform SF Symbol.
 /// Thresholds tuned for typical call audio.
 /// Buckets by dBFS, not linear RMS: conversational mic speech sits around
-/// -36 dBFS RMS, which a linear 0.05 threshold (-26 dBFS) never registers.
-func recordingWaveformIcon(level: Float) -> String {
-  let dbfs = level > 0 ? 20 * log10(level) : -Float.infinity
-  if dbfs > -30 {
-    return "waveform"
-  } else if dbfs > -45 {
-    return "waveform.mid"
-  } else {
-    return "waveform.low"
-  }
-}

@@ -55,7 +55,13 @@ final class BlackboxTestController {
     case .stopManualRecording:
       monitor.stopManualRecording()
     case .terminateApp:
-      NSApplication.shared.terminate(nil)
+      // Via the run loop: this handler runs from a main-queue block the timer
+      // callback schedules, and terminating from inside a main-queue block
+      // starves the main queue for the nested run loop `.terminateLater` spins
+      // up, so the reply that ends termination never gets to run.
+      RunLoop.main.perform {
+        MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
+      }
     }
   }
 

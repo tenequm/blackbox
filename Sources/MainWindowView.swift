@@ -2,6 +2,31 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+nonisolated enum MainTab: String, Hashable {
+  case recordings
+  case settings
+}
+
+/// Recordings and Settings as tabs in one window. Settings briefly lived in its
+/// own `Settings` scene, which is what makes Cmd+, work for free - so the
+/// shortcut is wired by hand here instead, in `BlackboxApp`'s commands, and it
+/// selects this tab rather than opening a second window.
+struct MainWindowView: View {
+  @Binding var selectedTab: MainTab
+
+  var body: some View {
+    TabView(selection: $selectedTab) {
+      RecordingsView()
+        .tabItem { Label("Recordings", systemImage: "waveform") }
+        .tag(MainTab.recordings)
+      SettingsView()
+        .tabItem { Label("Settings", systemImage: "gearshape") }
+        .tag(MainTab.settings)
+    }
+    .frame(minWidth: 700, minHeight: 450)
+  }
+}
+
 // MARK: - Recordings
 
 struct RecordingsView: View {
@@ -9,13 +34,25 @@ struct RecordingsView: View {
   @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
     defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
-  /// A set, not a single id. All three action functions already took
-  /// `Set<String>` and `exportRecordings` had a complete multi-file branch that
-  /// could never run, because the binding was one optional id.
   @State private var selection: Set<String> = []
-  @State private var exportError: String?
+  @State private var actionError: ActionError?
   @State private var reloadTask: Task<Void, Never>?
   @State private var searchText = ""
+  /// Filtering scans every transcript body, so it runs on the debounced value
+  /// rather than on every keystroke.
+  @State private var searchQuery = ""
+  @State private var searchDebounce: Task<Void, Never>?
+  @State private var pendingBulkDelete: Set<String>?
+  @State private var pendingRetranscribe: URL?
+
+  /// Carries its own title. One `String?` behind an alert hardcoded to "Export
+  /// Failed" meant a failed trash and a failed echo-cancellation run both
+  /// announced themselves as export failures.
+  struct ActionError: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+  }
 
   private var selectedRecording: RecordingFile? {
     guard selection.count == 1, let id = selection.first else { return nil }
@@ -30,7 +67,7 @@ struct RecordingsView: View {
         RecordingDetailView(
           recording: recording,
           onDelete: { deleteRecordings([recording.id]) },
-          onTitleChanged: { Task { await loadRecordings() } }
+          onTitleChanged: { scheduleReload() }
         )
         .id(recording.id)
       } else if selection.count > 1 {
@@ -48,50 +85,105 @@ struct RecordingsView: View {
       }
     }
     .searchable(text: $searchText, prompt: "Search recordings and transcripts")
-    .task { await loadRecordings() }
-    .onChange(of: transcription.revision) { _, _ in
-      Task { await loadRecordings() }
+    .onChange(of: searchText) { _, text in
+      searchDebounce?.cancel()
+      searchDebounce = Task {
+        try? await Task.sleep(for: .milliseconds(200))
+        guard !Task.isCancelled else { return }
+        searchQuery = text
+      }
     }
+    .task { await loadRecordings() }
+    // Every trigger goes through the same cancel-and-replace task. They used to
+    // spawn untracked tasks that raced each other, so a rescan started before a
+    // delete could land after it and put the deleted row back.
+    .onChange(of: transcription.revision) { _, _ in scheduleReload() }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
     ) { _ in
-      reloadTask?.cancel()
-      reloadTask = Task {
-        try? await Task.sleep(for: .milliseconds(500))
-        guard !Task.isCancelled else { return }
-        await loadRecordings()
+      scheduleReload(after: .milliseconds(500))
+    }
+    .alert(item: $actionError) { error in
+      Alert(
+        title: Text(error.title), message: Text(error.message), dismissButton: .default(Text("OK")))
+    }
+    .confirmationDialog(
+      "Delete \(pendingBulkDelete?.count ?? 0) recordings?",
+      isPresented: Binding(
+        get: { pendingBulkDelete != nil },
+        set: { if !$0 { pendingBulkDelete = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button("Move to Trash", role: .destructive) {
+        if let ids = pendingBulkDelete { deleteRecordings(ids) }
+        pendingBulkDelete = nil
       }
+      Button("Cancel", role: .cancel) { pendingBulkDelete = nil }
+    } message: {
+      Text("They move to the Trash, and any transcription still running for them is cancelled.")
     }
     .alert(
-      "Export Failed",
+      "Transcribe Again?",
       isPresented: Binding(
-        get: { exportError != nil },
-        set: { if !$0 { exportError = nil } }
+        get: { pendingRetranscribe != nil },
+        set: { if !$0 { pendingRetranscribe = nil } }
       )
     ) {
-      Button("OK") { exportError = nil }
+      Button("Transcribe Again") {
+        if let url = pendingRetranscribe { transcription.transcribe(recordingDirectory: url) }
+        pendingRetranscribe = nil
+      }
+      Button("Cancel", role: .cancel) { pendingRetranscribe = nil }
     } message: {
-      Text(exportError ?? "")
+      Text(
+        "This replaces the current transcript and uploads the audio to Soniox again, which is billed."
+      )
+    }
+  }
+
+  /// One recording goes straight to the Trash, like anywhere else on the Mac.
+  /// More than one is worth a look first: the two paths that can do it act on
+  /// the whole selection, which is not always what the click was aimed at.
+  private func confirmDelete(_ ids: Set<String>) {
+    guard !ids.isEmpty else { return }
+    if ids.count == 1 {
+      deleteRecordings(ids)
+    } else {
+      pendingBulkDelete = ids
+    }
+  }
+
+  private func scheduleReload(after delay: Duration = .zero) {
+    reloadTask?.cancel()
+    reloadTask = Task {
+      if delay > .zero { try? await Task.sleep(for: delay) }
+      guard !Task.isCancelled else { return }
+      await loadRecordings()
     }
   }
 
   // MARK: - Sidebar List
 
   private var recordingsList: some View {
-    Group {
+    // Computed once per pass. It was read four times - the empty check, the
+    // grouping, and twice inside `countSummary` - and each read scans every
+    // transcript body in the library.
+    let filtered = filteredRecordings
+    return Group {
       if recordings.isEmpty {
         ContentUnavailableView(
           "No Recordings",
           systemImage: "waveform",
           description: Text("Recordings will appear here when Blackbox captures audio.")
         )
-      } else if filteredRecordings.isEmpty {
+      } else if filtered.isEmpty {
         ContentUnavailableView.search(text: searchText)
       } else {
         List(selection: $selection) {
           // Grouped by day. A flat list of three hundred near-identical titles
           // is not something anyone can find last Thursday's call in.
-          ForEach(groupedRecordings, id: \.key) { group in
+          ForEach(Self.grouped(filtered), id: \.key) { group in
             Section(group.key) {
               ForEach(group.value) { recording in
                 RecordingRow(
@@ -106,31 +198,45 @@ struct RecordingsView: View {
             }
           }
         }
-        // The context menu acts on the whole selection when the clicked row is
-        // part of it, and on just that row otherwise - which is what every Mac
-        // list does.
-        .onDeleteCommand { deleteRecordings(selection) }
+        // Scoped to what the search is actually showing: the selection
+        // survives filtering, so Delete could otherwise take rows the user
+        // cannot see.
+        .onDeleteCommand { confirmDelete(visibleSelection(in: filtered)) }
       }
     }
     .frame(minWidth: 220)
     .navigationSplitViewColumnWidth(min: 220, ideal: 280)
     .toolbar {
       ToolbarItem(placement: .automatic) {
-        Text(countSummary)
+        Text(Self.countSummary(for: filtered, of: recordings))
           .font(.caption)
           .foregroundStyle(.secondary)
       }
     }
   }
 
+  private func visibleSelection(in filtered: [RecordingFile]) -> Set<String> {
+    let visible = Set(filtered.map(\.id))
+    return selection.intersection(visible)
+  }
+
   @ViewBuilder
   private func contextMenu(for recording: RecordingFile) -> some View {
-    let targets = selection.contains(recording.id) ? selection : [recording.id]
-    if targets.count == 1, transcription.hasAPIKey,
+    // Intersected with what the search is showing, for the same reason the
+    // Delete key is: the selection survives filtering, so "Delete 12
+    // Recordings" could otherwise include rows that are not on screen.
+    let visible = visibleSelection(in: filteredRecordings)
+    let targets = visible.contains(recording.id) ? visible : [recording.id]
+    if targets.count == 1, recording.hasAudio, transcription.hasAPIKey,
       !transcription.status(for: recording.url).isActive
     {
-      Button(recording.hasTranscript ? "Transcribe Again" : "Transcribe") {
-        transcription.transcribe(recordingDirectory: recording.url)
+      if recording.hasTranscript {
+        // Replaces a transcript that already exists and pays for it again, so
+        // it asks - the same rule as the detail view's button, which used to
+        // confirm while this one did not.
+        Button("Transcribe Again…") { pendingRetranscribe = recording.url }
+      } else {
+        Button("Transcribe") { transcription.transcribe(recordingDirectory: recording.url) }
       }
       Divider()
     }
@@ -141,14 +247,14 @@ struct RecordingsView: View {
     Divider()
     Button(targets.count > 1 ? "Delete \(targets.count) Recordings" : "Delete", role: .destructive)
     {
-      deleteRecordings(targets)
+      confirmDelete(targets)
     }
   }
 
   /// Title match, plus transcript body so the archive is searchable by what was
   /// said rather than only by what it was called.
   private var filteredRecordings: [RecordingFile] {
-    let query = searchText.trimmingCharacters(in: .whitespaces)
+    let query = searchQuery.trimmingCharacters(in: .whitespaces)
     guard !query.isEmpty else { return recordings }
     return recordings.filter {
       $0.title.localizedCaseInsensitiveContains(query)
@@ -156,44 +262,48 @@ struct RecordingsView: View {
     }
   }
 
-  private var groupedRecordings: [(key: String, value: [RecordingFile])] {
+  private static func grouped(_ recordings: [RecordingFile])
+    -> [(key: String, value: [RecordingFile])]
+  {
     let calendar = Calendar.current
+    // Hoisted: `sectionTitle` built two of these per recording.
+    let now = Date()
     var order: [String] = []
     var groups: [String: [RecordingFile]] = [:]
-    for recording in filteredRecordings {
-      let key = Self.sectionTitle(for: recording.date, calendar: calendar)
+    for recording in recordings {
+      let key = sectionTitle(for: recording.date, calendar: calendar, now: now)
       if groups[key] == nil { order.append(key) }
       groups[key, default: []].append(recording)
     }
     return order.map { ($0, groups[$0] ?? []) }
   }
 
-  private static func sectionTitle(for date: Date, calendar: Calendar) -> String {
+  private static func sectionTitle(for date: Date, calendar: Calendar, now: Date) -> String {
     if calendar.isDateInToday(date) { return "Today" }
     if calendar.isDateInYesterday(date) { return "Yesterday" }
-    if let weekAgo = calendar.date(byAdding: .day, value: -7, to: Date()), date > weekAgo {
+    if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now), date > weekAgo {
       return date.formatted(.dateTime.weekday(.wide))
     }
-    if calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
+    if calendar.isDate(date, equalTo: now, toGranularity: .year) {
       return date.formatted(.dateTime.month(.wide))
     }
     return date.formatted(.dateTime.month(.wide).year())
   }
 
-  private var countSummary: String {
-    let shown = filteredRecordings.count
+  /// Says "3 of 326" while a search is narrowing the list. Reporting only the
+  /// filtered count made the size of the library itself disappear the moment
+  /// anything was typed.
+  private static func countSummary(for shown: [RecordingFile], of all: [RecordingFile]) -> String {
     let total = ByteCountFormatter.string(
-      fromByteCount: Int64(filteredRecordings.reduce(0) { $0 + $1.size }), countStyle: .file)
-    let noun = shown == 1 ? "recording" : "recordings"
-    return "\(shown) \(noun), \(total)"
+      fromByteCount: Int64(shown.reduce(0) { $0 + $1.size }), countStyle: .file)
+    let noun = shown.count == 1 ? "recording" : "recordings"
+    if shown.count == all.count {
+      return "\(shown.count) \(noun), \(total)"
+    }
+    return "\(shown.count) of \(all.count) \(noun), \(total)"
   }
 
   // MARK: - Data
-
-  private var totalSizeFormatted: String {
-    let total = recordings.reduce(0) { $0 + $1.size }
-    return ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file)
-  }
 
   // Directory enumeration + resourceValues is synchronous I/O that blocks MainActor.
   // With hundreds of recordings this freezes the UI on every window activation.
@@ -209,29 +319,35 @@ struct RecordingsView: View {
         let originalURL = url.appendingPathComponent(RecordingStore.audioName)
         guard let originalValues = try? originalURL.resourceValues(forKeys: [.fileSizeKey])
         else { continue }
-        // Prefer processed file for playback when available
+        // A zero-byte original is shown, not skipped. It means a call happened
+        // and the capture produced nothing, which is information the user needs
+        // - hiding it reads as "the recording never started", and leaves a
+        // directory with no way to delete it from inside the app. The row marks
+        // itself as failed and refuses to play or transcribe.
+        let hasAudio = (originalValues.fileSize ?? 0) > 0
         let processedURL = url.appendingPathComponent(RecordingStore.processedAudioName)
         let processedValues = try? processedURL.resourceValues(forKeys: [.fileSizeKey])
-        // Zero-byte counts as absent, matching `RecordingStore.isUsable`.
         let hasProcessed = (processedValues?.fileSize ?? 0) > 0
-        let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
         let originalSize = originalValues.fileSize ?? 0
         let processedSize = processedValues?.fileSize ?? 0
-        let sidecar = TranscriptDocument.sidecarURL(for: url)
         let transcript = TranscriptDocument.load(for: url)
         results.append(
           RecordingFile(
             url: url,
-            audioURL: audioURL,
             title: metadata?.title ?? url.deletingPathExtension().lastPathComponent,
             date: metadata?.createdAt
               ?? (try? url.resourceValues(
                 forKeys: [.contentModificationDateKey]
               ).contentModificationDate) ?? .distantPast,
             size: originalSize + processedSize,
+            hasAudio: hasAudio,
             hasProcessed: hasProcessed,
-            hasTranscript: FileManager.default.fileExists(atPath: sidecar.path),
+            // `load` already opened the sidecar one line up, so the extra
+            // `fileExists` was a second syscall per recording per scan - and a
+            // sidecar that exists but will not decode is better reported as no
+            // transcript than as one the detail view cannot show.
+            hasTranscript: transcript != nil,
             transcriptText: transcript.map { $0.segments.map(\.text).joined(separator: " ") }
           ))
       }
@@ -250,8 +366,19 @@ struct RecordingsView: View {
   }
 
   private func exportRecordings(_ ids: Set<String>) {
-    let selected = recordings.filter { ids.contains($0.id) }
-    guard !selected.isEmpty else { return }
+    guard !ids.isEmpty else { return }
+    // A recording with a zero-byte original has nothing to copy: `exportM4A`
+    // throws on `loadTracks` and the user gets "Failed to export 1 of 1" from a
+    // save panel they should never have been shown.
+    let selected = recordings.filter { ids.contains($0.id) && $0.hasAudio }
+    guard !selected.isEmpty else {
+      actionError = ActionError(
+        title: "Nothing to Export",
+        message: ids.count == 1
+          ? "That recording captured no audio."
+          : "None of the selected recordings captured any audio.")
+      return
+    }
 
     if selected.count == 1, let recording = selected.first {
       let baseName = recording.title
@@ -268,7 +395,8 @@ struct RecordingsView: View {
           try await TranscriptionService.exportM4A(
             from: recording.url.appendingPathComponent(RecordingStore.audioName), to: dest)
         } catch {
-          exportError = error.localizedDescription
+          actionError = ActionError(
+            title: "Export Failed", message: error.localizedDescription)
         }
       }
     } else {
@@ -277,13 +405,22 @@ struct RecordingsView: View {
       panel.canChooseDirectories = true
       panel.canCreateDirectories = true
       panel.prompt = "Export"
-      panel.message =
-        "Choose a folder to export \(selected.count) \(selected.count == 1 ? "recording" : "recordings") as M4A"
+      panel.message = "Choose a folder to export \(selected.count) recordings as M4A"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
       Task {
         var failed = 0
+        var overwritten = 0
         for recording in selected {
-          let target = dest.appendingPathComponent("\(recording.title).m4a")
+          // The title is user-editable, is not a filename, and is not unique -
+          // three Zoom calls in one day share one. Joining it raw let a title
+          // containing "../" walk out of the chosen folder, and `exportM4A`
+          // unconditionally removes its destination, so exports silently
+          // replaced each other. The recording's own directory name carries the
+          // timestamp that makes it unique.
+          let target = dest.appendingPathComponent(
+            Self.exportFileName(for: recording.title, uniqueSuffix: recording.url.lastPathComponent)
+          )
+          if FileManager.default.fileExists(atPath: target.path) { overwritten += 1 }
           do {
             try await TranscriptionService.exportM4A(
               from: recording.url.appendingPathComponent(RecordingStore.audioName), to: target)
@@ -291,29 +428,58 @@ struct RecordingsView: View {
             failed += 1
           }
         }
+        // Both are reported. A batch that overwrote *and* failed used to say
+        // only that it failed, which is the half the user can see for
+        // themselves.
+        let overwriteNote =
+          overwritten > 0
+          ? " \(overwritten) replaced a file of the same name in that folder." : ""
         if failed > 0 {
-          exportError =
-            "Failed to export \(failed) of \(selected.count) \(selected.count == 1 ? "recording" : "recordings")"
+          actionError = ActionError(
+            title: "Export Failed",
+            message: "Failed to export \(failed) of \(selected.count) recordings.\(overwriteNote)")
+        } else if overwritten > 0 {
+          actionError = ActionError(
+            title: "Export Finished",
+            message:
+              "\(overwritten) of \(selected.count) recordings replaced a file of the same name in that folder."
+          )
         }
       }
     }
   }
 
+  /// A single path component, always, and unique across a batch. Sanitising
+  /// keeps it inside the chosen folder; the suffix - the recording's directory
+  /// name, which carries its timestamp - keeps two same-titled calls apart.
+  static func exportFileName(for title: String, uniqueSuffix: String? = nil) -> String {
+    let cleaned =
+      title
+      .components(separatedBy: CharacterSet(charactersIn: "/:"))
+      .joined(separator: "-")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+      // Again, because the dot-trim can expose whitespace: ". ." trimmed once
+      // is " ", which is not empty and names a file " .m4a".
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let base = cleaned.isEmpty ? "Recording" : cleaned
+    guard let uniqueSuffix, !uniqueSuffix.isEmpty else { return "\(base).m4a" }
+    return "\(base) \(uniqueSuffix).m4a"
+  }
+
   private func deleteRecordings(_ ids: Set<String>) {
     var failed: [String] = []
     for recording in recordings where ids.contains(recording.id) {
-      // Drop any queued transcription so it does not spend an upload on a
-      // recording that is going away. Cancelling an already-running job is
-      // asynchronous, so the job itself also re-checks that the directory still
-      // exists before writing its transcript.
-      transcription.cancel(recordingDirectory: recording.url)
+      // Read before the move, used after it. Trashing first is what stops an
+      // irreversible Soniox DELETE from firing for a recording that then fails
+      // to trash - but the sidecar naming those remote artifacts goes to the
+      // Trash with the directory, so the ids have to be captured here or the
+      // cleanup has nothing to delete and the audio stays on Soniox forever.
+      let job = TranscriptionJob.load(for: recording.url)
       do {
         try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
+        transcription.forgetDeletedRecording(recordingDirectory: recording.url, job: job)
       } catch {
-        // Was `try?`. A failed trash left the recording on disk, back in the
-        // list at the next scan - but with its transcription job already
-        // cancelled and its remote artifacts deleted, and nothing said so. The
-        // user re-transcribes and pays again.
         failed.append(recording.title)
         Log.error(
           Log.app, "delete",
@@ -322,12 +488,13 @@ struct RecordingsView: View {
     }
     selection.subtract(ids)
     if !failed.isEmpty {
-      exportError =
-        failed.count == 1
-        ? "Could not move \"\(failed[0])\" to the Trash."
-        : "Could not move \(failed.count) recordings to the Trash."
+      actionError = ActionError(
+        title: "Delete Failed",
+        message: failed.count == 1
+          ? "Could not move \"\(failed[0])\" to the Trash."
+          : "Could not move \(failed.count) recordings to the Trash.")
     }
-    Task { await loadRecordings() }
+    scheduleReload()
   }
 
   private func renameRecording(_ recording: RecordingFile, to newTitle: String) {
@@ -340,8 +507,17 @@ struct RecordingsView: View {
         speakers: [:]
       )
     metadata.title = newTitle
-    try? metadata.save(in: recording.url)
-    Task { await loadRecordings() }
+    do {
+      try metadata.save(in: recording.url)
+    } catch {
+      // Was `try?`. The list reloads from disk straight afterwards, so a failed
+      // write showed the old title again with no explanation - and this is the
+      // path that rebuilds the record from a failed load, so a silent failure
+      // here is how a title is lost for good.
+      actionError = ActionError(
+        title: "Rename Failed", message: error.localizedDescription)
+    }
+    scheduleReload()
   }
 }
 
@@ -452,6 +628,13 @@ private struct RecordingRow: View {
             .help(recording.title)
             .onTapGesture(count: 2) { beginRename() }
         }
+        if !recording.hasAudio {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .help("This recording captured no audio")
+            .accessibilityLabel("Recording failed - no audio was captured")
+        }
         if recording.hasProcessed {
           Image(systemName: "waveform.badge.magnifyingglass")
             .font(.caption2)
@@ -511,7 +694,7 @@ struct RecordingDetailView: View {
   /// "Jump to current" button or by seeking.
   @State private var isFollowSuspended = false
   @State private var didCopyTranscript = false
-  @State private var exportError: String?
+  @State private var actionError: RecordingsView.ActionError?
   @AppStorage(SettingsKeys.playbackRate) private var playbackRate: Double = 1
 
   // Metadata
@@ -527,7 +710,25 @@ struct RecordingDetailView: View {
     VStack(spacing: 0) {
       metadataHeader
       Divider()
-      if let playerError {
+      if !recording.hasAudio {
+        // Shown rather than hidden from the list: the user needs to know a call
+        // produced nothing, and needs to be able to delete it.
+        VStack(spacing: 8) {
+          Image(systemName: "exclamationmark.triangle")
+            .font(.title)
+            .foregroundStyle(.orange)
+          Text("This recording captured no audio")
+            .font(.headline)
+          Text(
+            "The capture produced an empty file. There is nothing to play, transcribe or export - you can delete it with the button above."
+          )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 360)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if let playerError {
         VStack(spacing: 8) {
           Image(systemName: "exclamationmark.triangle")
             .font(.title)
@@ -535,6 +736,20 @@ struct RecordingDetailView: View {
           Text("Could not load audio: \(playerError)")
             .font(.caption)
             .foregroundStyle(.secondary)
+          // The source picker normally lives inside `playbackControls`, which
+          // this branch replaces - so when the echo-cancelled copy was the file
+          // that would not open, the one control that switches back to the
+          // intact original disappeared with it.
+          if recording.hasProcessed {
+            Picker("Audio", selection: $useProcessed) {
+              Text("Original").tag(false)
+              Text("Echo removed").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .onChange(of: useProcessed) { _, _ in switchAudioSource() }
+          }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -545,9 +760,17 @@ struct RecordingDetailView: View {
     }
     .onAppear {
       loadMetadata()
-      setupPlayer()
+      // No player for a capture that produced nothing: `AVPlayer` on an empty
+      // file only produces an error to show underneath a message that already
+      // says the same thing.
+      if recording.hasAudio { setupPlayer() }
       loadTranscript()
     }
+    // The cached metadata is the source for every write below, and `.id` is the
+    // directory path, which a rename does not change - so renaming in the
+    // sidebar left this view holding the old title, and the next speaker rename
+    // wrote it back over the new one.
+    .onChange(of: recording.title) { _, _ in loadMetadata() }
     .onChange(of: transcription.finishCount(for: recording.url)) { _, _ in
       // Decoding a transcript is main-thread JSON work proportional to call
       // length, so only the recording that actually finished reloads - not
@@ -600,7 +823,7 @@ struct RecordingDetailView: View {
           Text(recording.date.formatted(.dateTime.year().month().day().hour().minute()))
           Text(recording.sizeFormatted)
           if duration > 0 {
-            Text(formatTime(duration))
+            Text(formatHMS(duration))
           }
         }
         .font(.caption)
@@ -639,7 +862,10 @@ struct RecordingDetailView: View {
           .disabled(transcriptionStatus.isActive)
         }
 
-        if !recording.hasProcessed {
+        // A recording that captured nothing has no mic track to clean, so the
+        // button could only ever fail - under a headline that already says
+        // there is nothing to do with this recording.
+        if !recording.hasProcessed, recording.hasAudio {
           Button {
             runAEC()
           } label: {
@@ -676,19 +902,13 @@ struct RecordingDetailView: View {
       }
     }
     .padding()
-    .alert(
-      "Export Failed",
-      isPresented: Binding(
-        get: { exportError != nil },
-        set: { if !$0 { exportError = nil } }
-      )
-    ) {
-      Button("OK") { exportError = nil }
-    } message: {
-      Text(exportError ?? "")
+    .alert(item: $actionError) { error in
+      Alert(
+        title: Text(error.title), message: Text(error.message),
+        dismissButton: .default(Text("OK")))
     }
     .alert("Transcribe Again?", isPresented: $showRetranscribeConfirmation) {
-      Button("Transcribe Again") { retranscribe() }
+      Button("Transcribe Again") { startTranscription() }
       Button("Cancel", role: .cancel) {}
     } message: {
       Text(
@@ -723,7 +943,7 @@ struct RecordingDetailView: View {
       .frame(height: 48)
 
       HStack {
-        Text(formatTime(currentTime))
+        Text(formatHMS(currentTime))
           .font(.caption.monospacedDigit())
           .foregroundStyle(.secondary)
         Spacer()
@@ -753,7 +973,7 @@ struct RecordingDetailView: View {
           applyTrackSelection(newValue)
         }
         Spacer()
-        Text("-\(formatTime(max(0, duration - currentTime)))")
+        Text("-\(formatHMS(max(0, duration - currentTime)))")
           .font(.caption.monospacedDigit())
           .foregroundStyle(.secondary)
       }
@@ -871,13 +1091,19 @@ struct RecordingDetailView: View {
       }
     }
 
-    // Periodic time observer (10x/sec)
+    // The interval is in the *item's* timeline, so at 2x this fires ~20x/sec.
+    // Every tick invalidates the whole detail view, so the value is deliberately
+    // not written when it has not changed at this resolution.
     let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
     timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
-      Task { @MainActor in
-        if !isDragging {
-          currentTime = time.seconds
-        }
+      // Already on the main queue; the `Task` hop only cost an extra turn.
+      //
+      // No change-detection threshold here. One was added to cut re-renders and
+      // it quantised the playhead into visible steps - the transport is the one
+      // thing in this view that has to look continuous.
+      MainActor.assumeIsolated {
+        guard !isDragging, time.seconds.isFinite else { return }
+        currentTime = time.seconds
       }
     }
 
@@ -972,14 +1198,30 @@ struct RecordingDetailView: View {
     isProcessingAEC = true
     Task {
       do {
-        try await AECProcessor.process(recordingDirectory: recording.url)
+        // Every non-outcome is reported. The most reachable one is a recording
+        // made with the microphone off, where the button is offered on a file
+        // that has no mic track to clean and used to do nothing at all.
+        switch try await AECProcessor.process(recordingDirectory: recording.url) {
+        case .processed, .alreadyRunning:
+          break
+        case .alreadyProcessed:
+          actionError = RecordingsView.ActionError(
+            title: "Already Processed",
+            message: "This recording already has an echo-cancelled copy.")
+        case .nothingToProcess:
+          actionError = RecordingsView.ActionError(
+            title: "Nothing to Process",
+            message:
+              "This recording has no separate microphone track, so there is no echo to remove.")
+        }
       } catch {
         // Was fire-and-forget: the spinner simply stopped, the button stayed,
         // and the user had no way to tell whether it had run.
-        exportError = "Echo cancellation failed: \(error.localizedDescription)"
+        actionError = RecordingsView.ActionError(
+          title: "Echo Cancellation Failed", message: error.localizedDescription)
       }
       isProcessingAEC = false
-      // Reload recordings to pick up the new processed file
+      // Through the list's own reload, like every other trigger.
       onTitleChanged()
     }
   }
@@ -996,7 +1238,11 @@ struct RecordingDetailView: View {
     titleFieldFocused = true
   }
 
-  private func saveTitle(_ newTitle: String) {
+  /// The one place that rebuilds a record from a failed load and writes it
+  /// back. `appName` genuinely has no better source here - it is not on
+  /// `RecordingFile` - so a reconstruction loses it, which is why the write
+  /// failing silently was worth surfacing.
+  private func writeMetadata(_ mutate: (inout RecordingMetadata) -> Void) {
     var meta =
       metadata
       ?? RecordingMetadata(
@@ -1005,9 +1251,21 @@ struct RecordingDetailView: View {
         appName: recording.title,
         speakers: [:]
       )
-    meta.title = newTitle
-    try? meta.save(in: recording.url)
-    metadata = meta
+    mutate(&meta)
+    do {
+      try meta.save(in: recording.url)
+      metadata = meta
+    } catch {
+      // Was `try?` in all three rename paths, and two of them then assigned the
+      // in-memory copy anyway - so the UI showed a rename that never reached
+      // disk and reverted at the next scan.
+      actionError = RecordingsView.ActionError(
+        title: "Could Not Save", message: error.localizedDescription)
+    }
+  }
+
+  private func saveTitle(_ newTitle: String) {
+    writeMetadata { $0.title = newTitle }
     onTitleChanged()
   }
 
@@ -1015,21 +1273,12 @@ struct RecordingDetailView: View {
     if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
       return name
     }
-    return speakerID == -1 ? "You" : "Speaker \(speakerID + 1)"
+    // `+ 1` on `Int.max` traps, and this value comes off disk.
+    return speakerID == -1 ? "You" : "Speaker \(speakerID &+ 1)"
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
-    var meta =
-      metadata
-      ?? RecordingMetadata(
-        title: recording.title,
-        createdAt: recording.date,
-        appName: recording.title,
-        speakers: [:]
-      )
-    meta.speakers[String(speakerID)] = name
-    try? meta.save(in: recording.url)
-    metadata = meta
+    writeMetadata { $0.speakers[String(speakerID)] = name }
   }
 
   // MARK: - Transcript
@@ -1113,14 +1362,17 @@ struct RecordingDetailView: View {
   }
 
   private func transcriptView(_ doc: TranscriptDocument) -> some View {
-    ScrollViewReader { proxy in
+    // Hoisted so it is computed once per pass rather than once per rendered
+    // row, which is what the property's own comment already claimed.
+    let active = activeSegmentIndex
+    return ScrollViewReader { proxy in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 12) {
           ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
             TranscriptSegmentView(
               segment: segment,
               speakerName: speakerName(for: segment.speaker),
-              isActive: index == activeSegmentIndex,
+              isActive: index == active,
               onSeek: { jumpTo(time: segment.time) },
               onRenameSpeaker: { newName in
                 saveSpeakerName(newName, for: segment.speaker)
@@ -1141,7 +1393,7 @@ struct RecordingDetailView: View {
         if phase == .interacting { isFollowSuspended = true }
       }
       .overlay(alignment: .bottomTrailing) {
-        if isFollowSuspended, activeSegmentIndex != nil {
+        if isFollowSuspended, active != nil {
           Button {
             isFollowSuspended = false
             scrollToActiveSegment(in: doc, proxy: proxy)
@@ -1160,9 +1412,8 @@ struct RecordingDetailView: View {
     }
   }
 
-  /// Which segment the playhead is inside, or nil when it is past the end.
-  /// Computed once per tick rather than per row: asking each row "am I active?"
-  /// made highlighting quadratic in transcript length.
+  /// Which segment the playhead is inside, or nil before the first one.
+  /// Callers hoist it out of the row loop, so it runs once per pass.
   ///
   /// Deliberately not gated on `isPlaying`. Pausing used to clear the highlight
   /// entirely, which is precisely when the user wants to see where they are.
@@ -1207,16 +1458,13 @@ struct RecordingDetailView: View {
     transcript = TranscriptDocument.load(for: recording.url)
   }
 
-  private func startTranscription() {
-    transcription.transcribe(recordingDirectory: recording.url)
-  }
-
-  /// The existing transcript is deliberately left on disk. A re-run that fails
-  /// should leave the user where they started rather than costing them the
-  /// transcript they already had; the new one overwrites it only on success.
+  /// Covers the first transcription, Retry, and Transcribe Again - they were
+  /// three call sites of two byte-identical functions. The existing transcript
+  /// is deliberately left on disk: a re-run that fails should leave the user
+  /// where they started, and the new one overwrites it only on success.
   /// `transcriptArea` shows progress ahead of a stale transcript, so nothing
   /// here needs to clear the view.
-  private func retranscribe() {
+  private func startTranscription() {
     transcription.transcribe(recordingDirectory: recording.url)
   }
 
@@ -1231,7 +1479,7 @@ struct RecordingDetailView: View {
   private func copyTranscript() {
     guard let transcript, !transcript.segments.isEmpty else { return }
     let body = transcript.segments.map { segment in
-      "[\(formatTime(segment.time))] \(speakerName(for: segment.speaker)): \(segment.text)"
+      "[\(formatHMS(segment.time))] \(speakerName(for: segment.speaker)): \(segment.text)"
     }.joined(separator: "\n")
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(body, forType: .string)
@@ -1249,14 +1497,22 @@ struct RecordingDetailView: View {
     let panel = NSSavePanel()
     panel.nameFieldStringValue = "\(recording.title).txt"
     panel.allowedContentTypes = [.plainText, .json]
+    // Both formats are offered in the panel itself. Plain text is the default
+    // because that is what a transcript is usually pasted into, but JSON was
+    // reachable only by typing the extension, which is not a choice anyone
+    // finds.
+    panel.accessoryView = NSHostingView(
+      rootView: Text("Choose .txt for readable text, or .json for structured data.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(8)
+    )
     guard panel.runModal() == .OK, let dest = panel.url else { return }
 
     let segments = transcript.segments.map { segment in
-      let m = Int(segment.time) / 60
-      let s = Int(segment.time) % 60
-      return ExportedSegment(
+      ExportedSegment(
         speaker: speakerName(for: segment.speaker),
-        time: String(format: "%d:%02d", m, s),
+        time: formatHMS(segment.time),
         text: segment.text
       )
     }
@@ -1278,7 +1534,8 @@ struct RecordingDetailView: View {
     } catch {
       // Was logged and swallowed: the user picked a location, pressed Save, and
       // got no file and no error.
-      exportError = error.localizedDescription
+      actionError = RecordingsView.ActionError(
+        title: "Export Failed", message: error.localizedDescription)
       Log.error(
         Log.app, "export",
         "failed to export transcript: \(error.localizedDescription)")
@@ -1287,15 +1544,6 @@ struct RecordingDetailView: View {
 
   // MARK: - Formatting
 
-  private func formatTime(_ time: TimeInterval) -> String {
-    let total = max(0, Int(time))
-    let h = total / 3600
-    let m = (total % 3600) / 60
-    let s = total % 60
-    return h > 0
-      ? String(format: "%d:%02d:%02d", h, m, s)
-      : String(format: "%d:%02d", m, s)
-  }
 }
 
 // MARK: - Transcript Segment View
@@ -1364,14 +1612,14 @@ private struct TranscriptSegmentView: View {
         }
 
         Button(action: onSeek) {
-          Text(formatTimestamp(segment.time))
+          Text(formatHMS(segment.time))
             .font(.caption2.monospacedDigit())
             // Was `.tertiary`, which is under 3:1 at this size - and this is a
             // functional control, not decoration.
             .foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Play from \(formatTimestamp(segment.time))")
+        .accessibilityLabel("Play from \(formatHMS(segment.time))")
         .help("Play from here")
       }
       .frame(width: gutterWidth, alignment: .trailing)
@@ -1389,6 +1637,13 @@ private struct TranscriptSegmentView: View {
     }
     .padding(.vertical, 4)
     .padding(.horizontal, 8)
+    // Clicking anywhere on the row seeks, as it did before the transcript
+    // became selectable. Making the whole row a `Button` is what selection
+    // replaced, and a plain `onTapGesture` loses to the text's own click
+    // handling - `simultaneousGesture` runs alongside it, so a click still
+    // seeks and a drag still selects.
+    .contentShape(Rectangle())
+    .simultaneousGesture(TapGesture().onEnded { onSeek() })
     .background(
       isActive ? speakerColor.opacity(contrast == .increased ? 0.22 : 0.10) : Color.clear,
       in: RoundedRectangle(cornerRadius: 6)
@@ -1413,17 +1668,6 @@ private struct TranscriptSegmentView: View {
     }
   }
 
-  private func formatTimestamp(_ time: Double) -> String {
-    let total = max(0, Int(time))
-    let h = total / 3600
-    let m = (total % 3600) / 60
-    let s = total % 60
-    // Rolls to h:mm:ss past an hour. It used to emit "78:12" for a 78-minute
-    // call while the transport above it read "1:18:12".
-    return h > 0
-      ? String(format: "%d:%02d:%02d", h, m, s)
-      : String(format: "%d:%02d", m, s)
-  }
 }
 
 // MARK: - Track Selection
@@ -1441,15 +1685,47 @@ enum TrackSelection: String, Identifiable {
   }
 }
 
+// MARK: - Time Formatting
+
+/// One formatter for every timestamp the app shows. There were four, and each
+/// was fixed for the past-an-hour case separately: the transport and the
+/// transcript rows got the hour component, the transcript *export* and the
+/// scrubber's VoiceOver value did not - so a 78-minute call read "1:18:12" on
+/// screen and "78:12" in the exported file.
+nonisolated func formatHMS(_ seconds: TimeInterval) -> String {
+  let total = seconds.isFinite ? max(0, Int(min(seconds, 24 * 60 * 60))) : 0
+  let h = total / 3600
+  let m = (total % 3600) / 60
+  let s = total % 60
+  return h > 0
+    ? String(format: "%d:%02d:%02d", h, m, s)
+    : String(format: "%d:%02d", m, s)
+}
+
+/// Spoken form of the same value, for `accessibilityValue`.
+nonisolated func spokenDuration(_ seconds: TimeInterval) -> String {
+  let total = seconds.isFinite ? max(0, Int(min(seconds, 24 * 60 * 60))) : 0
+  let h = total / 3600
+  let m = (total % 3600) / 60
+  let s = total % 60
+  var parts: [String] = []
+  if h > 0 { parts.append("\(h) hour\(h == 1 ? "" : "s")") }
+  if m > 0 { parts.append("\(m) minute\(m == 1 ? "" : "s")") }
+  parts.append("\(s) second\(s == 1 ? "" : "s")")
+  return parts.joined(separator: " ")
+}
+
 // MARK: - Recording File
 
 struct RecordingFile: Identifiable {
   var id: String { url.path }
   let url: URL  // recording directory
-  let audioURL: URL  // audio.m4a inside the directory
   var title: String  // from metadata.title
   let date: Date  // from metadata.createdAt
   let size: Int
+  /// False when `audio.m4a` is present but empty - a capture that produced
+  /// nothing. The row still appears so it can be seen and deleted.
+  let hasAudio: Bool
   let hasProcessed: Bool
   let hasTranscript: Bool
   /// Loaded during the off-main scan so search can match on what was said, not
@@ -1531,7 +1807,7 @@ private struct WaveformView: View {
       // with the arrow keys and announces where it is.
       .accessibilityElement()
       .accessibilityLabel("Playback Position")
-      .accessibilityValue(Self.timeDescription(progress * duration))
+      .accessibilityValue(spokenDuration(progress * duration))
       .accessibilityAdjustableAction { direction in
         let step = 0.02
         let next = direction == .increment ? progress + step : progress - step
@@ -1540,12 +1816,6 @@ private struct WaveformView: View {
     }
   }
 
-  private static func timeDescription(_ seconds: TimeInterval) -> String {
-    let total = max(0, Int(seconds))
-    let minutes = total / 60
-    let secs = total % 60
-    return "\(minutes) minutes \(secs) seconds"
-  }
 }
 
 // MARK: - Waveform Extractor
