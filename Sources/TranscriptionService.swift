@@ -125,13 +125,77 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
   }
 }
 
+/// Which half of `upload` is running. The two are reported separately because
+/// they fail and stall for different reasons, and because on a long call the
+/// local re-encode is the longer of the two.
+nonisolated enum TranscriptionUploadPhase: Sendable {
+  case mixing(Double)
+  case uploading(Double)
+}
+
+/// Reports bytes-sent for a single upload. `URLSession.shared` has no delegate
+/// of its own, so this is attached per task rather than per session.
+/// `@unchecked Sendable` because the callback is the only state and it is
+/// immutable; libdispatch delivers the delegate calls on the session queue.
+nonisolated final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate,
+  @unchecked Sendable
+{
+  private let onFraction: @Sendable (Double) -> Void
+
+  init(onFraction: @escaping @Sendable (Double) -> Void) {
+    self.onFraction = onFraction
+  }
+
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask,
+    didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
+    totalBytesExpectedToSend: Int64
+  ) {
+    guard totalBytesExpectedToSend > 0 else { return }
+    onFraction(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+  }
+}
+
+/// Every stage the user can be waiting through gets its own case. They used to
+/// collapse into three, so a job held behind a recording, a job third in line,
+/// and a job an hour into offline retries all read "Queued for transcription"
+/// - which tells the user nothing about whether the wait is theirs to fix.
 nonisolated enum TranscriptionStatus: Equatable, Sendable {
   case idle
-  case uploading
+  /// Held because a recording is in progress; starts on its own once that ends.
+  case waitingForRecording
+  /// Behind another job, or submitted to Soniox and waiting for it to begin.
   case queued
+  /// Re-encoding the two tracks into one file. Local, slow on a long call, and
+  /// entirely invisible before it had its own case.
+  case mixing(fraction: Double)
+  case uploading(fraction: Double)
   case transcribing
+  /// Network is unreachable; retrying without spending an attempt.
+  case offline
+  /// A recoverable failure is being retried, with which attempt this is.
+  case retrying(attempt: Int, of: Int)
+  /// The user asked to stop and the job has not finished unwinding yet.
+  case cancelling
   case completed
   case error(String)
+
+  /// True while the job is doing or waiting on work - anything that should show
+  /// progress rather than an action button.
+  var isActive: Bool {
+    switch self {
+    case .idle, .completed, .error: false
+    default: true
+    }
+  }
+
+  /// Determinate progress for the stages that can report it, nil for the rest.
+  var fraction: Double? {
+    switch self {
+    case .mixing(let f), .uploading(let f): f
+    default: nil
+    }
+  }
 }
 
 nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
@@ -181,7 +245,10 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
 protocol TranscriptionServicing: Sendable {
   /// Mixes multi-track audio into a single file when needed, uploads it, and
   /// returns the remote file id.
-  @concurrent func upload(fileURL: URL) async throws -> String
+  @concurrent func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String
   @concurrent func createTranscription(fileId: String, reference: String) async throws -> String
   @concurrent func awaitCompletion(transcriptionId: String) async throws
   @concurrent func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
@@ -275,19 +342,28 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// For dual-track recordings (system audio + mic), tracks are mixed into a
   /// single file first so Soniox can diarize speakers from the combined audio,
   /// producing proper speaker separation and timestamps.
+  ///
+  /// Every Blackbox recording is dual-track, so the mix always runs - and on a
+  /// long call it is the slowest thing here, a full re-encode before a byte
+  /// leaves the machine. `onProgress` exists because that used to be minutes of
+  /// a spinner captioned "Uploading audio...", which is both the wrong stage
+  /// and no way to tell work from a stall.
   @concurrent
-  func upload(fileURL: URL) async throws -> String {
+  func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-    guard tracks.count >= 2 else { return try await uploadFile(fileURL) }
+    guard tracks.count >= 2 else { return try await uploadFile(fileURL, onProgress: onProgress) }
 
     Log.info(
       Log.transcription, "transcription",
       "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
-    let mixedURL = try await Self.mix(asset: asset, tracks: tracks)
+    let mixedURL = try await Self.mix(asset: asset, tracks: tracks, onProgress: onProgress)
     defer { try? FileManager.default.removeItem(at: mixedURL) }
-    return try await uploadFile(mixedURL)
+    return try await uploadFile(mixedURL, onProgress: onProgress)
   }
 
   // MARK: - Audio Mixing & Export
@@ -295,7 +371,11 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// Takes an already-loaded asset so callers that had to inspect the track
   /// count first do not parse the container a second time.
   @concurrent
-  static func mix(asset: AVAsset, tracks: [AVAssetTrack]) async throws -> URL {
+  static func mix(
+    asset: AVAsset,
+    tracks: [AVAssetTrack],
+    onProgress: (@Sendable (TranscriptionUploadPhase) -> Void)? = nil
+  ) async throws -> URL {
     let composition = AVMutableComposition()
     let duration = try await asset.load(.duration)
 
@@ -327,7 +407,25 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     }
 
     do {
-      try await exporter.export(to: tempURL, as: .m4a)
+      if let onProgress {
+        onProgress(.mixing(0))
+        // `nonisolated(unsafe)` because `AVAssetExportSession` is not Sendable
+        // and both the export and its progress sequence need the same
+        // instance. Reading progress while an export runs is what the API is
+        // for - `states(updateInterval:)` exists to be consumed concurrently
+        // with `export(to:as:)`, and the sequence ends when the export does.
+        nonisolated(unsafe) let session = exporter
+        async let export: Void = session.export(to: tempURL, as: .m4a)
+        for await state in session.states(updateInterval: 0.5) {
+          if case .exporting(let progress) = state {
+            onProgress(.mixing(progress.fractionCompleted))
+          }
+        }
+        try await export
+        onProgress(.mixing(1))
+      } else {
+        try await exporter.export(to: tempURL, as: .m4a)
+      }
     } catch {
       throw TranscriptionError.transcriptionFailed(
         "track mixing failed: \(error.localizedDescription)")
@@ -371,7 +469,10 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   // MARK: - Upload
 
   @concurrent
-  private func uploadFile(_ fileURL: URL) async throws -> String {
+  private func uploadFile(
+    _ fileURL: URL,
+    onProgress: (@Sendable (TranscriptionUploadPhase) -> Void)? = nil
+  ) async throws -> String {
     let boundary = UUID().uuidString
 
     // Build multipart body as a temp file to avoid loading entire audio into memory
@@ -384,7 +485,12 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     request.setValue(
       "multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-    let (data, response) = try await URLSession.shared.upload(for: request, fromFile: tempURL)
+    onProgress?(.uploading(0))
+    let (data, response) = try await URLSession.shared.upload(
+      for: request, fromFile: tempURL,
+      delegate: onProgress.map { handler in
+        UploadProgressDelegate { handler(.uploading($0)) }
+      })
     try checkHTTPResponse(response, data: data, context: "upload")
 
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]

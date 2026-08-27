@@ -35,10 +35,18 @@ actor FakeTranscriptionService: TranscriptionServicing {
   func setHoldsCompletion(_ holds: Bool) { holdsCompletion = holds }
   func setAfterUpload(_ handler: (@Sendable () async -> Void)?) { afterUpload = handler }
 
-  func upload(fileURL: URL) async throws -> String {
+  func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String {
     uploadCount += 1
     if let uploadError { throw uploadError }
+    // Reported so a test can observe the coordinator's stage transitions
+    // rather than only its terminal states.
+    onProgress(.mixing(1))
+    onProgress(.uploading(0.5))
     await afterUpload?()
+    onProgress(.uploading(1))
     return "file-\(uploadCount)"
   }
 
@@ -313,7 +321,9 @@ struct TranscriptionCoordinatorTests {
     coordinator.transcribe(recordingDirectory: directory)
     await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
     #expect(await harness.service.uploadCount == 0)
-    #expect(coordinator.status(for: directory) == .queued)
+    // Distinct from `.queued`: the user can act on "waiting for the recording
+    // to finish", and cannot act on "third in line".
+    #expect(coordinator.status(for: directory) == .waitingForRecording)
 
     harness.recordingActive = false
     await harness.wait { coordinator.status(for: directory) == .completed }
@@ -619,7 +629,7 @@ struct TranscriptionCoordinatorTests {
     let coordinator = harness.makeCoordinator()
 
     coordinator.recordingFinished(recordingDirectory: directory)
-    #expect(coordinator.status(for: directory) == .queued)
+    #expect(coordinator.status(for: directory) == .waitingForRecording)
 
     // The user changes their mind while the job waits behind the recorder.
     harness.autoEnabled = false

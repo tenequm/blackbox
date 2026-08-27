@@ -338,7 +338,7 @@ struct SonioxContractTests {
     let audio = try Data(contentsOf: audioURL)
 
     let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL)
-    let fileId = try await service.upload(fileURL: audioURL)
+    let fileId = try await service.upload(fileURL: audioURL) { _ in }
     #expect(fileId == "file-1")
 
     let request = try #require(server.requests(path: "/v1/files").first)

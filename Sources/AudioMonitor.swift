@@ -81,9 +81,11 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    // Screen Recording permission is requested at onboarding; if it was revoked
-    // or never granted, recording fails with .permissionDenied and the failure
-    // handler sets permissionNeeded = true.
+    // Screen Recording permission is requested at onboarding. `loadSettings`
+    // above has already seeded `permissionNeeded` from a preflight, and the
+    // 5-second poll below keeps it honest if the user revokes mid-session; the
+    // recorder's `.permissionDenied` failure path sets it too, as a backstop
+    // for the window between a revoke and the next poll.
 
     if !skipPermissionRequests {
       Task { @MainActor [weak self] in
@@ -336,12 +338,17 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      // `updateAutoState` first: it is what clears `isRecording`, and
+      // `reportRecordingSaved` runs a consumer that reads it. Announcing the
+      // save while the just-finished recording still reads as live made the
+      // transcription coordinator hold every automatic job behind its
+      // recording gate for the gate's full duration, every time.
+      updateAutoState()
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
         reportRecordingSaved(url)
       }
-      updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
       lastKnownMicRunning = false
       evaluateCallState()
@@ -650,12 +657,14 @@ final class AudioMonitor {
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      // Ordered as in `stopManualRecording`, and for the same reason: the save
+      // must not be announced while `isRecording` still reads true.
+      updateAutoState()
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
         reportRecordingSaved(url)
       }
-      updateAutoState()
     }
   }
 
@@ -756,6 +765,17 @@ final class AudioMonitor {
       micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
     if micPermissionNeeded != nextMicPermissionNeeded {
       micPermissionNeeded = nextMicPermissionNeeded
+    }
+
+    // Asked here rather than only after a capture fails. Recording is the whole
+    // product, so an app that cannot record has to say so before the user
+    // relies on it, not after they have lost a call to it.
+    let nextPermissionNeeded = !dependencies.screenCaptureAccessGranted()
+    if permissionNeeded != nextPermissionNeeded {
+      Log.info(
+        Log.monitor, "monitor",
+        "screen recording permission \(nextPermissionNeeded ? "missing" : "granted")")
+      permissionNeeded = nextPermissionNeeded
     }
   }
 

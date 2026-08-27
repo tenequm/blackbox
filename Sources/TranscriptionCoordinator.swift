@@ -168,7 +168,12 @@ final class TranscriptionCoordinator {
   /// Offline waits do not spend an attempt, so they get their own bound.
   private static let maxOfflineWaits = 60
   private static let offlineRetry = Duration.seconds(60)
-  private static let recordingGate = Duration.seconds(30)
+  /// How often the gate re-asks whether a recording is still running - not how
+  /// long it waits. It used to be a single 30s sleep, which meant a job queued
+  /// the instant a call ended waited the whole 30s for a condition that was
+  /// already false by then. Short enough to feel immediate, long enough that
+  /// the poll costs nothing.
+  private static let recordingGatePoll = Duration.seconds(2)
   /// Automatic jobs upload without asking, so a file too short to be a call is
   /// dropped rather than billed. In practice this catches an early manual stop
   /// and a recorder that died at startup; a false-positive *detection* always
@@ -184,6 +189,17 @@ final class TranscriptionCoordinator {
 
   func status(for recordingDirectory: URL) -> TranscriptionStatus {
     statuses[recordingDirectory.path] ?? .idle
+  }
+
+  /// Folds an upload-phase report into the status. Called from a detached hop,
+  /// so it drops anything for a job that has since moved on rather than
+  /// resurrecting a stale stage over a newer one.
+  private func recordUploadProgress(_ phase: TranscriptionUploadPhase, for key: String) {
+    guard let current = statuses[key], current.isActive else { return }
+    switch phase {
+    case .mixing(let fraction): statuses[key] = .mixing(fraction: fraction)
+    case .uploading(let fraction): statuses[key] = .uploading(fraction: fraction)
+    }
   }
 
   var hasAPIKey: Bool { apiKey() != nil }
@@ -267,6 +283,11 @@ final class TranscriptionCoordinator {
   func cancel(recordingDirectory: URL) {
     queue.removeAll { $0.path == recordingDirectory.path }
     if activeDirectory?.path == recordingDirectory.path {
+      // Marked synchronously. Cancellation is only observed at the next
+      // suspension point, and an upload can sit inside one for minutes, so
+      // without this the button stayed live and the spinner unchanged - which
+      // reads as a dead control and gets clicked again.
+      statuses[recordingDirectory.path] = .cancelling
       runTask?.cancel()
       return
     }
@@ -370,10 +391,11 @@ final class TranscriptionCoordinator {
     guard activeDirectory == nil, let next = queue.first else { return }
 
     if isRecordingActive() {
+      statuses[next.path] = .waitingForRecording
       guard gateTask == nil else { return }
       let sleep = dependencies.sleep
       gateTask = Task { [weak self] in
-        await sleep(Self.recordingGate)
+        await sleep(Self.recordingGatePoll)
         guard let self else { return }
         self.gateTask = nil
         self.pump()
@@ -463,8 +485,12 @@ final class TranscriptionCoordinator {
         }
 
         if job.fileId == nil {
-          statuses[key] = .uploading
-          job.fileId = try await service.upload(fileURL: audioURL)
+          statuses[key] = .mixing(fraction: 0)
+          job.fileId = try await service.upload(fileURL: audioURL) { [weak self] phase in
+            Task { @MainActor [weak self] in
+              self?.recordUploadProgress(phase, for: key)
+            }
+          }
           job.save(for: recordingDirectory)
         }
         // Checked again here rather than only at the top of the pass: `upload`
@@ -535,12 +561,13 @@ final class TranscriptionCoordinator {
 
         case .wait(let duration):
           offlineWaits += 1
-          statuses[key] = .queued
+          statuses[key] = .offline
           await dependencies.sleep(duration)
 
         case .retry(let duration):
           job.attempts += 1
           job.save(for: recordingDirectory)
+          statuses[key] = .retrying(attempt: job.attempts, of: Self.maxAttempts)
           Log.error(
             Log.transcription, "transcription",
             "transient failure for \(name) (attempt \(job.attempts)/\(Self.maxAttempts)): \(error.localizedDescription)"

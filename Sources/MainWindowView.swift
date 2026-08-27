@@ -266,21 +266,57 @@ private struct RecordingRow: View {
   @State private var isEditing = false
   @State private var editedTitle = ""
 
+  /// Each stage gets its own glyph rather than one shared spinner: in this row
+  /// the indicator is the only signal a recording is being transcribed at all,
+  /// and "waiting on a recording" and "stalled offline" are things the user can
+  /// act on, while "transcribing" is not.
   @ViewBuilder private var transcriptionIndicator: some View {
-    switch transcription.status(for: recording.url) {
+    let status = transcription.status(for: recording.url)
+    switch status {
     case .idle, .completed:
       EmptyView()
     case .error:
       Image(systemName: "exclamationmark.triangle")
         .font(.caption2)
         .foregroundStyle(.orange)
+        .accessibilityLabel("Transcription failed")
         .help("Transcription failed - open the recording to retry")
-    case .uploading, .queued, .transcribing:
+    case .offline:
+      Image(systemName: "wifi.slash")
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Waiting for a network connection")
+        .help("Offline - Blackbox will keep trying")
+    case .waitingForRecording:
+      Image(systemName: "clock")
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Waiting for recording to finish")
+        .help("Starts when the current recording finishes")
+    default:
       ProgressView()
         .controlSize(.small)
-        .scaleEffect(0.6)
-        .frame(width: 12, height: 12)
-        .help("Transcribing...")
+        .frame(width: 14, height: 14)
+        .accessibilityLabel(Self.statusText(status))
+        .help(Self.statusText(status))
+    }
+  }
+
+  /// Shared with the detail view so a row and the pane it opens can never
+  /// describe the same job differently.
+  static func statusText(_ status: TranscriptionStatus) -> String {
+    switch status {
+    case .idle: "Not transcribed"
+    case .waitingForRecording: "Starts when the current recording finishes"
+    case .queued: "Waiting in line"
+    case .mixing: "Preparing audio"
+    case .uploading: "Uploading"
+    case .transcribing: "Transcribing"
+    case .offline: "No connection - Blackbox will keep trying"
+    case .retrying(let attempt, let total): "Retrying (attempt \(attempt) of \(total))"
+    case .cancelling: "Cancelling"
+    case .completed: "Transcribed"
+    case .error(let message): message
     }
   }
 
@@ -788,14 +824,27 @@ struct RecordingDetailView: View {
             .buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if transcriptionStatus != .idle {
+      } else if transcriptionStatus.isActive {
         VStack(spacing: 12) {
-          ProgressView()
+          // Determinate wherever the stage can actually report itself. Mixing
+          // and uploading a long call are minutes each, and an indeterminate
+          // spinner through that is indistinguishable from a stall.
+          if let fraction = transcriptionStatus.fraction {
+            ProgressView(value: fraction)
+              .progressViewStyle(.linear)
+              .frame(maxWidth: 220)
+              .accessibilityLabel(RecordingRow.statusText(transcriptionStatus))
+              .accessibilityValue("\(Int(fraction * 100)) percent")
+          } else {
+            ProgressView()
+              .accessibilityLabel(RecordingRow.statusText(transcriptionStatus))
+          }
           Text(transcriptionStatusText)
             .font(.caption)
             .foregroundStyle(.secondary)
           Button("Cancel") { cancelTranscription() }
             .buttonStyle(.bordered)
+            .disabled(transcriptionStatus == .cancelling)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -817,10 +866,9 @@ struct RecordingDetailView: View {
 
   private var transcriptionStatusText: String {
     switch transcriptionStatus {
-    case .uploading: "Uploading audio..."
-    case .queued: "Queued for transcription..."
-    case .transcribing: "Transcribing..."
-    default: ""
+    case .mixing: "Preparing audio for transcription"
+    case .uploading(let fraction): "Uploading - \(Int(fraction * 100))%"
+    default: RecordingRow.statusText(transcriptionStatus)
     }
   }
 
