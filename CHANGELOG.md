@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transcription no longer runs any of its work on the main thread - uploading, mixing, polling and decoding the transcript all move off it - so the app stays responsive while a long recording is being prepared. Transcription also waits while a call is being recorded, so it never competes with the recorder for the machine.
 - Nothing is left behind on Soniox. A transcription that fails or is cancelled now deletes the audio it had already uploaded, where before a failure could leave a recording sitting on the server indefinitely. Turning auto-transcribe off also stops recordings that were queued while it was on and had not been uploaded yet.
 - Polling a transcription now backs off instead of asking every two seconds for up to half an hour, and scratch files left by a quit mid-transcription are cleaned up on the next launch.
+- Settings can verify a Soniox API key on the spot, so a wrong key is caught when you paste it rather than by a recording that quietly fails to transcribe hours later. The Soniox model is now a setting too, defaulting to stt-async-v5, so a model retirement does not need an app update.
+- Transcription failures are reported accurately. A transcript that was ready a moment later used to be thrown away as a permanent failure; an exhausted Soniox balance is now named as such instead of appearing as a generic error; and every failure logs the request id that Soniox support asks for. Transcripts also record which service and model produced them.
 
 ## [0.9.3] - 2026-08-20
 

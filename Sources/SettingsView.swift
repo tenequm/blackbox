@@ -20,6 +20,8 @@ struct SettingsView: View {
   @Environment(TranscriptionCoordinator.self) private var transcription
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
   @AppStorage("autoTranscribe") private var autoTranscribe = false
+  @AppStorage("sonioxModel") private var sonioxModel = TranscriptionService.defaultModel
+  @State private var keyCheck: APIKeyCheck = .untested
 
   @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -45,6 +47,7 @@ struct SettingsView: View {
     .onChange(of: sonioxAPIKey) { _, newValue in
       KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
       transcription.apiKeyChanged()
+      keyCheck = .untested
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -293,8 +296,20 @@ struct SettingsView: View {
   private var transcriptionSection: some View {
     Section("Transcription") {
       SecureField("Soniox API Key", text: $sonioxAPIKey)
+      HStack(spacing: 8) {
+        Button("Verify Key") { verifyAPIKey() }
+          .disabled(sonioxAPIKey.isEmpty || keyCheck == .checking)
+        keyCheckLabel
+      }
       Text(
         "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      TextField("Model", text: $sonioxModel)
+      Text(
+        "Soniox model used for transcription. Leave as \(TranscriptionService.defaultModel) unless Soniox retires it."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -391,6 +406,43 @@ struct SettingsView: View {
     panel.canCreateDirectories = true
     if panel.runModal() == .OK, let url = panel.url {
       saveDirectoryPath = url.path(percentEncoded: false)
+    }
+  }
+
+  // MARK: - API Key Verification
+
+  enum APIKeyCheck: Equatable {
+    case untested
+    case checking
+    case valid
+    case invalid(String)
+  }
+
+  @ViewBuilder private var keyCheckLabel: some View {
+    switch keyCheck {
+    case .untested:
+      EmptyView()
+    case .checking:
+      ProgressView().controlSize(.small)
+    case .valid:
+      Label("Key works", systemImage: "checkmark.circle.fill")
+        .font(.caption)
+        .foregroundStyle(.green)
+    case .invalid(let message):
+      Label(message, systemImage: "exclamationmark.triangle.fill")
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .lineLimit(2)
+    }
+  }
+
+  private func verifyAPIKey() {
+    let key = sonioxAPIKey
+    keyCheck = .checking
+    Task {
+      let result = await TranscriptionService.verifyAPIKey(key)
+      guard key == sonioxAPIKey else { return }
+      keyCheck = result.isValid ? .valid : .invalid(result.message ?? "Key rejected")
     }
   }
 

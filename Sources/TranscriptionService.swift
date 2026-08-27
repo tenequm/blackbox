@@ -69,6 +69,11 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   var segments: [TranscriptSegment]
   var language: String?
   var createdAt: Date
+  /// Which service and model produced this. Optional so transcripts written
+  /// before provenance existed still decode, and so a later provider picker has
+  /// something to label them with.
+  var provider: String?
+  var model: String?
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
     recordingURL.appendingPathComponent("transcript.json")
@@ -127,6 +132,11 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
   case uploadFailed(String)
   case transcriptionFailed(String)
   case serverError(Int, String)
+  /// 409 `transcription_invalid_state` - the transcript is not retrievable yet.
+  /// Retryable: polling and fetching are separate calls, so a job that finishes
+  /// between them answers 409 for a moment.
+  case notReady(String)
+  case balanceExhausted(String)
   case pollTimeout
 
   var errorDescription: String? {
@@ -134,6 +144,8 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
     case .uploadFailed(let msg): "Upload failed: \(msg)"
     case .transcriptionFailed(let msg): "Transcription failed: \(msg)"
     case .serverError(let code, let msg): "Soniox error \(code): \(msg)"
+    case .notReady(let msg): "Transcript not ready: \(msg)"
+    case .balanceExhausted(let msg): "Soniox balance or budget exhausted: \(msg)"
     case .pollTimeout: "Transcription timed out"
     }
   }
@@ -154,21 +166,63 @@ protocol TranscriptionServicing: Sendable {
   /// Mixes multi-track audio into a single file when needed, uploads it, and
   /// returns the remote file id.
   @concurrent func upload(fileURL: URL) async throws -> String
-  @concurrent func createTranscription(fileId: String) async throws -> String
+  @concurrent func createTranscription(fileId: String, reference: String) async throws -> String
   @concurrent func awaitCompletion(transcriptionId: String) async throws
   @concurrent func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
   @concurrent func deleteRemote(transcriptionIds: [String], fileIds: [String]) async
 }
 
 nonisolated final class TranscriptionService: TranscriptionServicing {
+  static let defaultModel = "stt-async-v5"
+  static let defaultBaseURL = "https://api.soniox.com"
+  static let providerName = "soniox"
+
   private let apiKey: String
-  private static let baseURL = "https://api.soniox.com"
+  private let model: String
+  private let baseURL: String
   private static let mixPrefix = "blackbox-mixed-"
   private static let uploadSuffix = ".multipart"
   private static let pollCeiling = Duration.seconds(30 * 60)
 
-  init(apiKey: String) {
+  /// Falls back to the default when the stored model is blank - the Settings
+  /// field is free text, and an empty `model` is rejected by every request.
+  static func resolvedModel(_ stored: String?) -> String {
+    let trimmed = stored?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? defaultModel : trimmed
+  }
+
+  /// `baseURL` is injectable so the contract tests can point the client at a
+  /// loopback stub that speaks the documented Soniox wire format.
+  init(apiKey: String, model: String = defaultModel, baseURL: String = defaultBaseURL) {
     self.apiKey = apiKey
+    self.model = model
+    self.baseURL = baseURL
+  }
+
+  /// Checks a key without spending anything: the file list is the cheapest
+  /// authenticated endpoint. Lets Settings tell the user the key is wrong now
+  /// rather than through a recording that silently fails to transcribe later.
+  @concurrent
+  static func verifyAPIKey(_ apiKey: String, baseURL: String = defaultBaseURL) async -> (
+    isValid: Bool, message: String?
+  ) {
+    guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return (false, "No API key entered.")
+    }
+    guard let url = URL(string: "\(baseURL)/v1/files") else { return (false, "Invalid URL.") }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 10
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse else { return (false, "No HTTP response.") }
+      if (200..<300).contains(http.statusCode) { return (true, nil) }
+      let envelope = Self.errorEnvelope(from: data)
+      return (false, envelope.message ?? "HTTP \(http.statusCode)")
+    } catch {
+      return (false, error.localizedDescription)
+    }
   }
 
   /// For dual-track recordings (system audio + mic), tracks are mixed into a
@@ -367,12 +421,15 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   // MARK: - Create Transcription
 
   @concurrent
-  func createTranscription(fileId: String) async throws -> String {
+  func createTranscription(fileId: String, reference: String) async throws -> String {
     let config: [String: Any] = [
-      "model": "stt-async-v5",
+      "model": model,
       "file_id": fileId,
       "enable_language_identification": true,
       "enable_speaker_diarization": true,
+      // Ties the remote job back to a recording directory, so an artifact this
+      // client loses track of is still identifiable in the Soniox console.
+      "client_reference_id": String(reference.prefix(256)),
     ]
 
     var request = try makeRequest(.post, "/v1/transcriptions")
@@ -463,7 +520,10 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       throw TranscriptionError.transcriptionFailed("empty or invalid transcript response")
     }
 
-    return groupTokensIntoDocument(tokens)
+    var document = groupTokensIntoDocument(tokens)
+    document.provider = Self.providerName
+    document.model = model
+    return document
   }
 
   private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
@@ -533,14 +593,14 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   @concurrent
   func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
     for tId in transcriptionIds {
-      guard let url = URL(string: "\(Self.baseURL)/v1/transcriptions/\(tId)") else { continue }
+      guard let url = URL(string: "\(baseURL)/v1/transcriptions/\(tId)") else { continue }
       var req = URLRequest(url: url)
       req.httpMethod = "DELETE"
       req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
       _ = try? await URLSession.shared.data(for: req)
     }
     for fId in fileIds {
-      guard let url = URL(string: "\(Self.baseURL)/v1/files/\(fId)") else { continue }
+      guard let url = URL(string: "\(baseURL)/v1/files/\(fId)") else { continue }
       var req = URLRequest(url: url)
       req.httpMethod = "DELETE"
       req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -556,7 +616,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   }
 
   private func makeRequest(_ method: HTTPMethod, _ path: String) throws -> URLRequest {
-    guard let url = URL(string: "\(Self.baseURL)\(path)") else {
+    guard let url = URL(string: "\(baseURL)\(path)") else {
       throw TranscriptionError.transcriptionFailed("invalid URL: \(path)")
     }
     var request = URLRequest(url: url)
@@ -565,27 +625,43 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     return request
   }
 
+  /// Soniox errors carry `{status_code, error_type, message, request_id}`.
+  /// `request_id` is what their support asks for, so it goes in the log even
+  /// though the user never sees it.
+  nonisolated private static func errorEnvelope(from data: Data) -> (
+    message: String?, errorType: String?, requestId: String?
+  ) {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return (nil, nil, nil)
+    }
+    return (
+      json["message"] as? String, json["error_type"] as? String, json["request_id"] as? String
+    )
+  }
+
   private func checkHTTPResponse(
     _ response: URLResponse, data: Data, context: String
   ) throws {
     guard let http = response as? HTTPURLResponse else { return }
     guard (200..<300).contains(http.statusCode) else {
-      let body = String(data: data, encoding: .utf8) ?? "no body"
+      let envelope = Self.errorEnvelope(from: data)
+      let apiMessage = envelope.message ?? "HTTP \(http.statusCode)"
       Log.error(
         Log.transcription, "transcription",
-        "\(context) failed (\(http.statusCode)): \(body)")
-      let apiMsg: String
-      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-        let msg = json["error"] as? String ?? json["message"] as? String
-      {
-        apiMsg = msg
-      } else {
-        apiMsg = "HTTP \(http.statusCode)"
+        "\(context) failed (\(http.statusCode) \(envelope.errorType ?? "unknown")): \(apiMessage) [request_id=\(envelope.requestId ?? "none")]"
+      )
+      let detail = "\(context): \(apiMessage)"
+
+      switch http.statusCode {
+      case 409:
+        throw TranscriptionError.notReady(detail)
+      case 402:
+        throw TranscriptionError.balanceExhausted(apiMessage)
+      case 429, 500...599:
+        throw TranscriptionError.serverError(http.statusCode, detail)
+      default:
+        throw TranscriptionError.transcriptionFailed(detail)
       }
-      if http.statusCode >= 500 || http.statusCode == 429 {
-        throw TranscriptionError.serverError(http.statusCode, "\(context): \(apiMsg)")
-      }
-      throw TranscriptionError.transcriptionFailed("\(context): \(apiMsg)")
     }
   }
 }

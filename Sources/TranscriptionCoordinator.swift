@@ -52,7 +52,12 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 @Observable
 final class TranscriptionCoordinator {
   struct Dependencies {
-    var makeService: (String) -> any TranscriptionServicing = { TranscriptionService(apiKey: $0) }
+    var makeService: (String) -> any TranscriptionServicing = { key in
+      TranscriptionService(
+        apiKey: key,
+        model: TranscriptionService.resolvedModel(
+          UserDefaults.standard.string(forKey: "sonioxModel")))
+    }
     var apiKey: () -> String? = {
       let key = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
       return key.isEmpty ? nil : key
@@ -274,7 +279,8 @@ final class TranscriptionCoordinator {
         }
         if job.transcriptionId == nil, let fileId = job.fileId {
           statuses[key] = .queued
-          job.transcriptionId = try await service.createTranscription(fileId: fileId)
+          job.transcriptionId = try await service.createTranscription(
+            fileId: fileId, reference: name)
           job.save(for: recordingDirectory)
         }
         guard let transcriptionId = job.transcriptionId else { break }
@@ -418,8 +424,10 @@ final class TranscriptionCoordinator {
     }
     if let error = error as? TranscriptionError {
       switch error {
-      case .serverError, .pollTimeout: return true
-      case .uploadFailed, .transcriptionFailed: return false
+      // `.notReady` is a 409 from fetching a transcript the server has not
+      // finished publishing - the next pass re-polls and picks it up.
+      case .serverError, .pollTimeout, .notReady: return true
+      case .uploadFailed, .transcriptionFailed, .balanceExhausted: return false
       }
     }
     return false

@@ -31,6 +31,7 @@ Tests/
   RecordingPipelineIntegrationTests.swift  - RecordingPipeline file output, gap fill, tail padding tests
   AudioRecorderRaceTests.swift             - Start/stop race tests (live SCK gated by BLACKBOX_RUN_LIVE_SCK)
   TranscriptionCoordinatorTests.swift      - Trigger decision, queueing, retry/failure, cancel, launch resume (fake Soniox client)
+  SonioxContractTests.swift                - Real client against a loopback HTTP stub speaking Soniox's documented wire format
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
   Fixtures/Recordings/                     - Reference recordings for AEC regression tests
@@ -49,7 +50,7 @@ make install    # bundle + copy to /Applications
 make run        # bundle + open .app
 make test       # swift test (Swift Testing framework)
 make check      # format + build + test (full validation)
-make smoke-test # bundle + run all tests including hardware smoke (requires audio permissions)
+make smoke-test # bundle + run all tests including hardware smoke (requires audio permissions; serialized across worktrees by a lock)
 make smoke      # alias for smoke-test
 make format     # swift-format --recursive Sources/ Tests/ --in-place
 make clean      # remove build artifacts

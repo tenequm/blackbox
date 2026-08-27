@@ -14,6 +14,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
   private(set) var fetchCount = 0
   private(set) var deletedTranscriptionIds: [String] = []
   private(set) var deletedFileIds: [String] = []
+  private(set) var references: [String] = []
 
   private var uploadError: Error?
   /// Consumed one per `awaitCompletion` call, so a test can fail then succeed.
@@ -35,8 +36,9 @@ actor FakeTranscriptionService: TranscriptionServicing {
     return "file-\(uploadCount)"
   }
 
-  func createTranscription(fileId: String) async throws -> String {
+  func createTranscription(fileId: String, reference: String) async throws -> String {
     createCount += 1
+    references.append(reference)
     return "transcription-\(createCount)"
   }
 
@@ -142,6 +144,42 @@ struct TranscriptionCoordinatorTests {
     // The job sidecar exists only while work is outstanding.
     #expect(TranscriptionJob.load(for: directory) == nil)
     #expect(await harness.service.deletedFileIds == ["file-1"])
+    // The remote job is tagged with the recording it belongs to.
+    #expect(await harness.service.references == ["call-1"])
+  }
+
+  @Test("a 409 while fetching the transcript is retried, not treated as failure")
+  func retriesNotReady() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setCompletionErrors([
+      TranscriptionError.notReady("fetch transcript: still processing")
+    ])
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.uploadCount == 1)
+    #expect(TranscriptDocument.load(for: directory) != nil)
+  }
+
+  @Test("an exhausted balance fails terminally instead of retrying")
+  func balanceExhaustedIsTerminal() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setUploadError(
+      TranscriptionError.balanceExhausted("prepaid balance is zero"))
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait {
+      if case .error = coordinator.status(for: directory) { return true }
+      return false
+    }
+
+    // Retrying a dead balance just spends time; one attempt only.
+    #expect(await harness.service.uploadCount == 1)
   }
 
   @Test("does not auto-transcribe when the setting is off")
