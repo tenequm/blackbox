@@ -1,0 +1,54 @@
+name: Signed bundle
+description: Import the Developer ID certificate and build a signed .app bundle.
+
+# A Developer ID signature is not cosmetic here. TCC keys a grant to a code
+# requirement, and the ad-hoc signature `make bundle` falls back to produces a
+# fresh cdhash every build, so a seeded grant would never match twice. Signing
+# with the certificate yields a stable requirement (identifier + team OU) that
+# survives rebuilds, which is what makes grant-recording work at all.
+
+inputs:
+  p12-base64:
+    description: Base64-encoded Developer ID Application .p12
+    required: true
+  p12-password:
+    description: Password for the .p12
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Import the Developer ID certificate
+      shell: bash
+      env:
+        APPLE_P12_BASE64: ${{ inputs.p12-base64 }}
+        APPLE_P12_PASSWORD: ${{ inputs.p12-password }}
+      run: |
+        set -euo pipefail
+        if [ -z "${APPLE_P12_BASE64:-}" ]; then
+          echo "APPLE_P12_BASE64 is empty - the bundle would be ad-hoc signed and TCC seeding could not work." >&2
+          exit 1
+        fi
+        KC=build.keychain
+        KCP="$(uuidgen)"
+        security create-keychain -p "$KCP" "$KC"
+        security set-keychain-settings -lut 21600 "$KC"
+        security unlock-keychain -p "$KCP" "$KC"
+        # Keep login.keychain-db in the search list; dropping it breaks other
+        # tooling that expects it, and `make bundle` only needs ours to be found.
+        security list-keychains -d user -s "$KC" login.keychain-db
+        printf '%s' "$APPLE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/id.p12"
+        security import "$RUNNER_TEMP/id.p12" -k "$KC" -P "$APPLE_P12_PASSWORD" \
+          -T /usr/bin/codesign -T /usr/bin/security
+        # Without this, codesign blocks on a GUI keychain prompt no one can answer.
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCP" "$KC" >/dev/null
+        rm -f "$RUNNER_TEMP/id.p12"
+        security find-identity -v -p codesigning
+
+    - name: Build the signed bundle
+      shell: bash
+      run: |
+        set -euo pipefail
+        make bundle
+        codesign -dvvv build/Blackbox.app 2>&1 | grep -q 'Authority=Developer ID Application' \
+          || { echo "bundle is not Developer ID signed" >&2; exit 1; }

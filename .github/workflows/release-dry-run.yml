@@ -1,0 +1,107 @@
+# Proves the release path without publishing anything.
+#
+# Everything here is the real thing - a real Developer ID signature, a real
+# submission to Apple's notary, a real Sparkle signature, a real download and
+# hash of a published asset. The only steps omitted are the two that are visible
+# to users: `gh release upload` and the push to the tap.
+#
+# Run it manually before trusting a change to the release path. It exists
+# because a broken release fails at the worst possible moment, and a malformed
+# appcast does not merely fail the release - it can break Sparkle for every
+# copy already installed.
+name: Release dry run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dry-run:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/signed-bundle
+        with:
+          p12-base64: ${{ secrets.APPLE_P12_BASE64 }}
+          p12-password: ${{ secrets.APPLE_P12_PASSWORD }}
+
+      - name: Build, notarize and staple the DMG
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          brew install create-dmg
+          export APPLE_ASC_KEY_PATH="$RUNNER_TEMP/asc.p8"
+          printf '%s' "$APPLE_ASC_KEY_P8" | base64 --decode > "$APPLE_ASC_KEY_PATH"
+          make release
+          rm -f "$APPLE_ASC_KEY_PATH"
+
+      - name: Verify Gatekeeper accepts the app
+        run: |
+          set -euo pipefail
+          VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)"
+          hdiutil attach -nobrowse -quiet "build/Blackbox-$VERSION.dmg"
+          spctl -a -t exec -vv /Volumes/Blackbox/Blackbox.app 2>&1 | tee /tmp/spctl.txt
+          grep -q "Notarized Developer ID" /tmp/spctl.txt
+          hdiutil detach -quiet /Volumes/Blackbox
+
+      - name: Sign the Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: v0.0.0-dry-run
+        run: .github/scripts/make-appcast.sh
+
+      # The signature is verified inside make-appcast.sh; this checks the shape
+      # Sparkle actually parses, which a bad heredoc would break silently.
+      - name: Validate the appcast
+        run: |
+          set -euo pipefail
+          cat appcast.xml
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          ns = {"sparkle": "http://www.andymatuschak.org/xml-namespaces/sparkle"}
+          item = ET.parse("appcast.xml").getroot().find("./channel/item")
+          assert item is not None, "no <item> in the appcast"
+          enc = item.find("enclosure")
+          assert enc is not None, "no <enclosure> in the appcast"
+          for attr in ("url", "length", "{http://www.andymatuschak.org/xml-namespaces/sparkle}edSignature"):
+              assert enc.get(attr), f"enclosure is missing {attr}"
+          assert int(enc.get("length")) > 100000, "enclosure length looks wrong"
+          assert int(item.findtext("sparkle:version", namespaces=ns)) > 0, "sparkle:version must be a positive integer"
+          print("appcast OK:", item.findtext("title"), enc.get("length"), "bytes")
+          PY
+
+      # Exercises clone, download, hash and sed against the LAST published
+      # release, which must produce no diff - the cask is already at that
+      # version. Proves every step short of the push.
+      - name: Dry-run the cask bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.9.3
+        run: |
+          set -euo pipefail
+          git stash push --include-untracked --quiet || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.9.3" Info.plist
+          .github/scripts/bump-cask.sh
+          git checkout Info.plist
+
+      # release-please reads its config over the API from the target branch, not
+      # from the checkout, so this has to name the branch under test - on main
+      # the default is correct and the flag is unnecessary.
+      - name: Verify release-please can parse the config
+        env:
+          TARGET_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          npx --yes release-please@latest release-pr \
+            --repo-url=tenequm/blackbox \
+            --target-branch="$TARGET_BRANCH" \
+            --config-file=.github/release-please-config.json \
+            --manifest-file=.github/.release-please-manifest.json \
+            --token="${{ github.token }}" \
+            --dry-run
