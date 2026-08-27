@@ -144,9 +144,13 @@ final class AudioMonitor {
     await autoTask?.value
     await manualTask?.value
 
-    // And for any stop already in flight when quit arrived. Bounded by the same
-    // stream-stop timeout the recorder already applies, so this cannot blow the
-    // termination budget on its own.
+    // And for any stop already in flight when quit arrived. Not bounded: only
+    // the SCStream stop inside it is (3s), and `finishWriting` after that runs
+    // as long as it runs - which is the point, since cancelling it deletes the
+    // file. The real backstop is `applicationShouldTerminate`'s own 8s reply
+    // timer; if finalization outlasts it the process exits mid-write, and the
+    // file is recoverable through `movieFragmentInterval` once the first
+    // fragment has flushed.
     for task in savingTasks.values { await task.value }
 
     isRecording = false
