@@ -711,9 +711,3 @@ nonisolated private func uncaughtExceptionHandler(_ exception: NSException) {
     Log.app, "crash",
     "Uncaught exception: \(exception.name.rawValue) - \(exception.reason ?? "Unknown")")
 }
-
-// MARK: - Helpers
-
-/// Maps audio RMS level to a waveform SF Symbol.
-/// Thresholds tuned for typical call audio.
-/// Buckets by dBFS, not linear RMS: conversational mic speech sits around
