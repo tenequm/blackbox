@@ -95,26 +95,24 @@ final class FakeHUD: AudioMonitorHUD {
   private(set) var savedApps: [String] = []
   private(set) var errors: [String] = []
   private(set) var lastToast: HUDToast?
-  private(set) var isToastVisible = false
 
   func showRecordingStarted(appName: String) {
     startedApps.append(appName)
-    record(title: "Recording Started", subtitle: appName)
+    record(title: HUDToast.startedTitle, subtitle: appName)
   }
 
   func showRecordingSaved(appName: String) {
     savedApps.append(appName)
-    record(title: "Recording Saved", subtitle: appName)
+    record(title: HUDToast.savedTitle, subtitle: appName)
   }
 
   func showError(message: String) {
     errors.append(message)
-    record(title: "Error", subtitle: message)
+    record(title: HUDToast.errorTitle, subtitle: message)
   }
 
   private func record(title: String, subtitle: String) {
     lastToast = HUDToast(title: title, subtitle: subtitle)
-    isToastVisible = true
   }
 }
 
@@ -427,7 +425,7 @@ final class BlackboxSmokeClient {
   }
 
   private func terminateRunningApps() {
-    // Kill any Blackbox instance — including an installed /Applications copy —
+    // Kill any Blackbox instance - including an installed /Applications copy -
     // so two tap/aggregate owners don't contend for the same system audio.
     for app in NSRunningApplication.runningApplications(
       withBundleIdentifier: "com.tenequm.Blackbox")

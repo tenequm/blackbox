@@ -796,7 +796,6 @@ final class AudioMonitor {
       permissionNeeded: permissionNeeded,
       micPermissionNeeded: micPermissionNeeded,
       lastSavedRecordingPath: lastSavedRecordingURL?.path,
-      hudVisible: dependencies.hud.isToastVisible,
       hudTitle: dependencies.hud.lastToast?.title,
       hudSubtitle: dependencies.hud.lastToast?.subtitle
     )

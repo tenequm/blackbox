@@ -58,7 +58,6 @@ protocol AudioMonitorHUD: AnyObject {
   func showRecordingSaved(appName: String)
   func showError(message: String)
   var lastToast: HUDToast? { get }
-  var isToastVisible: Bool { get }
 }
 
 extension RecordingHUD: AudioMonitorHUD {}
