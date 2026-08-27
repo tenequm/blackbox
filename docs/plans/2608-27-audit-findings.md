@@ -11,11 +11,21 @@ Anything needing hardware or a runtime observation says so instead of asserting.
 
 ## Status
 
-Fixed on `feat/ux-improvements` (PR #25), then re-reviewed and corrected in a
-second pass. **The first version of this section overstated what had landed** -
-T9 was listed as fixed when nothing about it had changed, and T2's row described
-a "2s re-ask" gate that was never shipped. Both are corrected below and in their
-own rows.
+Fixed on `feat/ux-improvements` (PR #25), then re-reviewed and corrected in two
+further passes. **The first version of this section overstated what had
+landed** - T9 was listed as fixed when nothing about it had changed, and T2's
+row described a "2s re-ask" gate that was never shipped. Both are corrected
+below and in their own rows.
+
+**A third pass compared the two endpoints rather than the commits**, because
+several fixes turned out to be repairs of damage the branch had done to itself
+and were being described as improvements. Settings became a `Settings` scene
+mid-branch and is a tab again, exactly as it is on `main`; the menu bar level
+indicator and click-to-seek on a transcript line were removed and restored the
+same way. None of those three changes anything for a user, and the structural
+finding above still describes `main` accurately. What is genuinely new against
+`main` is that Cmd+, works from the window rather than only while the menu bar
+menu is open.
 
 **Fixed:** D1, D2, D3, D5, D6, C1, C3, T2 (the ordering only - the gate was
 deleted outright, not shortened), T5, T6, T7, T8, T9, plus the accessibility
