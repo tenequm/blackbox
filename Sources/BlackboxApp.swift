@@ -23,8 +23,8 @@ struct BlackboxApp: App {
     // Not wired under `--ui-test-mode`. The hardware suite that `make test`
     // runs records real audio on a developer's machine, and this hook reads the
     // real auto-transcribe setting and the real Keychain key - so leaving it
-    // wired sends those test recordings to a third party. They are 4s and ~12s,
-    // both over the duration floor.
+    // wired sends those test recordings to a third party. The suite records
+    // three of them, roughly 4s, 6s and 12s, all over the duration floor.
     if !BlackboxTestMode.isEnabled {
       dependencies.onRecordingSaved = { [weak coordinator] url in
         coordinator?.recordingFinished(audioFileURL: url)
