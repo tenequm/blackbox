@@ -511,7 +511,7 @@ struct SonioxContractTests {
     let server = try StubHTTPServer { _ in .json(200, [:]) }
     let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL)
 
-    await service.deleteRemote(transcriptionIds: ["t-1"], fileIds: ["f-1"])
+    #expect(await service.deleteRemote(transcriptionIds: ["t-1"], fileIds: ["f-1"]))
 
     let paths = server.requests.map(\.path)
     #expect(paths.contains("/v1/transcriptions/t-1"))

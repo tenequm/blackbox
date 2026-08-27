@@ -141,7 +141,7 @@ final class TranscriptionCoordinator {
 
   private struct UploadWaiter {
     let id: UUID
-    let continuation: CheckedContinuation<Bool, Never>
+    let continuation: CheckedContinuation<UploadSlot, Never>
   }
 
   @ObservationIgnored private var uploadSlotsInUse = 0
@@ -155,15 +155,29 @@ final class TranscriptionCoordinator {
   /// which releases the actor and lets the next caller straight in - so an
   /// actor would bound nothing at all. The coordinator already runs wholly on
   /// the main actor, which is what makes two variables sufficient here.
-  private func acquireUploadSlot() async -> Bool {
-    guard !Task.isCancelled else { return false }
+  private enum UploadSlot {
+    case acquired
+    case cancelled
+    /// Quit began while this job was waiting. Distinct from `cancelled`,
+    /// because a cancelled job discards its record and a suspended one has to
+    /// keep it - that sidecar is what the next launch resumes from.
+    case suspended
+  }
+
+  private func acquireUploadSlot() async -> UploadSlot {
+    guard !Task.isCancelled else { return .cancelled }
+    // Checked here as well as in the hand-off: a job can arrive at the gate
+    // *after* quit begins - out of `durationSeconds`, or waking from eight
+    // minutes of backoff - and would otherwise take the fast path below and
+    // start a POST the process kill is about to cut.
+    guard !isSuspended else { return .suspended }
     if uploadSlotsInUse < dependencies.uploadConcurrency {
       uploadSlotsInUse += 1
-      return true
+      return .acquired
     }
     let id = UUID()
     return await withTaskCancellationHandler {
-      await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+      await withCheckedContinuation { (continuation: CheckedContinuation<UploadSlot, Never>) in
         uploadWaiters.append(UploadWaiter(id: id, continuation: continuation))
       }
     } onCancel: {
@@ -176,7 +190,7 @@ final class TranscriptionCoordinator {
   /// makes a double resume impossible.
   private func abandonUploadWaiter(_ id: UUID) {
     guard let index = uploadWaiters.firstIndex(where: { $0.id == id }) else { return }
-    uploadWaiters.remove(at: index).continuation.resume(returning: false)
+    uploadWaiters.remove(at: index).continuation.resume(returning: .cancelled)
   }
 
   /// Hands the slot straight to the head waiter rather than decrementing, so
@@ -187,7 +201,18 @@ final class TranscriptionCoordinator {
       uploadSlotsInUse -= 1
       return
     }
-    uploadWaiters.removeFirst().continuation.resume(returning: true)
+    // Nothing new starts once quit has begun. `suspendNewJobs` only guarded
+    // `enqueue`, so a job already parked here was handed a slot during the 8s
+    // termination window and began a POST the process kill then cut - the exact
+    // outcome that flag exists to prevent.
+    guard !isSuspended else {
+      uploadSlotsInUse -= 1
+      let waiting = uploadWaiters
+      uploadWaiters.removeAll()
+      for waiter in waiting { waiter.continuation.resume(returning: .suspended) }
+      return
+    }
+    uploadWaiters.removeFirst().continuation.resume(returning: .acquired)
   }
 
   /// What to do about a failure that interrupted a job.
@@ -274,7 +299,12 @@ final class TranscriptionCoordinator {
   /// so it drops anything for a job that has since moved on rather than
   /// resurrecting a stale stage over a newer one.
   private func recordUploadProgress(_ phase: TranscriptionUploadPhase, for key: String) {
-    guard let current = statuses[key], current.isActive else { return }
+    // `.cancelling` is `isActive`, so without excluding it the next progress
+    // tick - `mix` reports every 0.5s, and a long mix runs for minutes -
+    // overwrote the status `cancel()` had just set, re-enabling the Cancel
+    // button and restoring a moving bar. That is precisely the dead-control
+    // behaviour the synchronous write in `cancel()` exists to prevent.
+    guard let current = statuses[key], current.isActive, current != .cancelling else { return }
     switch phase {
     case .mixing(let fraction): statuses[key] = .mixing(fraction: fraction)
     case .uploading(let fraction): statuses[key] = .uploading(fraction: fraction)
@@ -292,8 +322,17 @@ final class TranscriptionCoordinator {
 
   /// Settings writes the key straight to the Keychain, so the cache needs an
   /// explicit poke when it changes.
+  ///
+  /// Resume runs again on the way out, because it is gated on a key and had
+  /// only one caller - launch. A user who starts the app with no key, then
+  /// pastes one, otherwise leaves every interrupted job and every
+  /// `awaitingRemoteDelete` marker untouched for the rest of the session. Those
+  /// markers are the mechanism that gets already-uploaded call audio back off
+  /// Soniox, so "until the next launch" is the wrong deadline for them.
   func apiKeyChanged() {
     cachedAPIKey = nil
+    guard apiKey() != nil else { return }
+    resumePendingJobs(sweepScratchFiles: false)
   }
 
   // MARK: - Triggers
@@ -319,9 +358,13 @@ final class TranscriptionCoordinator {
     // of acting on it is the user's money and a stranger's audio on Soniox.
     let saveDirectory = dependencies.saveDirectory()
     guard recordingDirectory.deletingLastPathComponent().path == saveDirectory.path else {
-      Log.error(
+      // Ordinarily this means the save folder changed while the recording was
+      // running: the recorder captured its directory at construction, so the
+      // finished recording is in the old folder and this refuses it. It is not
+      // a caller error, which is what the old wording said.
+      Log.info(
         Log.transcription, "transcription",
-        "refusing to transcribe \(recordingDirectory.path): not a recording directory inside \(saveDirectory.path)"
+        "not auto-transcribing \(recordingDirectory.lastPathComponent): it is not in the current save folder (\(saveDirectory.path))"
       )
       return
     }
@@ -336,7 +379,18 @@ final class TranscriptionCoordinator {
   /// terminal on the first hiccup.
   func transcribe(recordingDirectory: URL) {
     guard apiKey() != nil else { return }
-    if var job = TranscriptionJob.load(for: recordingDirectory) {
+    // The reset below dispatches remote DELETEs and clears the sidecar's ids,
+    // and `enqueue`'s in-flight guard is downstream of it - so a request for a
+    // directory whose job is still running used to destroy that job's remote
+    // artifacts and erase its ids, then start nothing. Only four view-level
+    // `.disabled` conditions kept that unreachable.
+    //
+    // Scoped to this block rather than the whole method: `enqueue` still has to
+    // run, because it is what downgrades the automatic flag on a job the user
+    // has now asked for by hand, and that has to work while one is in flight.
+    if jobs[recordingDirectory.path] == nil,
+      var job = TranscriptionJob.load(for: recordingDirectory)
+    {
       if job.awaitingRemoteDelete {
         // A cleanup left over from a session that had no key. There is one now
         // (guarded above), so it goes out immediately and the new job starts
@@ -348,6 +402,12 @@ final class TranscriptionCoordinator {
         // them now, so the new run starts fresh instead of re-polling a
         // transcription this same click is about to delete.
         if job.fileId != nil || job.transcriptionId != nil, discardRemote(job: job) {
+          // Cleared on dispatch rather than on confirmation, unlike every other
+          // path here: the user is starting a new run, and a record still
+          // naming the old transcription would have that run polling ids this
+          // very click is deleting. A delete that then fails is logged and its
+          // artifacts orphaned - the one place that trade is made, and only on
+          // an explicit user action.
           job.fileId = nil
           job.transcriptionId = nil
         }
@@ -357,6 +417,18 @@ final class TranscriptionCoordinator {
       job.save(for: recordingDirectory)
     }
     enqueue(recordingDirectory, isAutomatic: false)
+  }
+
+  /// Discards a recording's job using a record captured *before* the directory
+  /// was moved. `cancel` reads the sidecar by path, so calling it after the
+  /// trash gets an empty job, and an empty job has no ids to delete - which
+  /// left the uploaded audio on Soniox with nothing naming it.
+  func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
+    jobs[recordingDirectory.path]?.cancel()
+    jobs[recordingDirectory.path] = nil
+    statuses[recordingDirectory.path] = nil
+    guard let job else { return }
+    _ = discardRemote(job: job)
   }
 
   func cancel(recordingDirectory: URL) {
@@ -381,12 +453,16 @@ final class TranscriptionCoordinator {
   /// and has its uploaded audio deleted rather than being left on Soniox; and
   /// nothing else. An automatic job that already holds a `transcriptionId` has
   /// been charged, so finishing it beats throwing away what was paid for.
-  func resumePendingJobs() {
+  /// `sweepScratchFiles` is only safe at launch. The sweep deletes by the
+  /// `blackbox-mixed-` / `blackbox-upload-` prefixes, which are exactly the
+  /// names a running job is writing, so sweeping mid-session unlinks the mix or
+  /// the multipart body out from under an in-flight upload.
+  func resumePendingJobs(sweepScratchFiles: Bool = true) {
     guard apiKey() != nil else { return }
     let directory = dependencies.saveDirectory()
     let sweep = dependencies.sweepTemporaryFiles
     Task { [weak self] in
-      await sweep()
+      if sweepScratchFiles { await sweep() }
       let pending = await Self.directoriesWithPendingJobs(in: directory)
       guard let self else { return }
       for recordingDirectory in pending {
@@ -408,20 +484,15 @@ final class TranscriptionCoordinator {
           Log.info(
             Log.transcription, "transcription",
             "retrying Soniox cleanup left over from an earlier session for \(name)")
-          if self.discardRemote(job: job) {
-            TranscriptionJob.remove(for: recordingDirectory)
-          }
+          self.discardRemote(job: job) { Self.retireMarker(job, in: recordingDirectory) }
           continue
         }
         if let lastError = job.lastError {
           // A terminal failure keeps its ids when the cleanup could not be
           // dispatched at the time. Retry the delete, but keep the record
           // either way: the detail view still has to offer the retry.
-          if job.fileId != nil || job.transcriptionId != nil, self.discardRemote(job: job) {
-            var cleared = job
-            cleared.fileId = nil
-            cleared.transcriptionId = nil
-            cleared.save(for: recordingDirectory)
+          if job.fileId != nil || job.transcriptionId != nil {
+            self.discardRemote(job: job) { Self.clearRemoteIds(job, in: recordingDirectory) }
           }
           self.statuses[recordingDirectory.path] = .error(lastError)
           continue
@@ -496,9 +567,9 @@ final class TranscriptionCoordinator {
     }
 
     // Consent is re-checked here, not just where the job was created: a job can
-    // sit behind the recording gate or another job for a long time, and the
-    // user can turn auto-transcribe off in the meantime. Once Soniox has been
-    // billed (`transcriptionId`) the money is spent and finishing is better.
+    // sit on the upload gate, in backoff, or in an hour of offline retries, and
+    // the user can turn auto-transcribe off during any of them. Once Soniox has
+    // been billed (`transcriptionId`) the money is spent and finishing is better.
     if isConsentWithdrawn(for: job) {
       Log.info(
         Log.transcription, "transcription",
@@ -544,11 +615,22 @@ final class TranscriptionCoordinator {
 
         if job.fileId == nil {
           statuses[key] = .queued
-          guard await acquireUploadSlot() else {
+          switch await acquireUploadSlot() {
+          case .acquired:
+            break
+          case .cancelled:
             Log.info(
               Log.transcription, "transcription",
               "cancelled \(name) while waiting to upload")
             drop(job: job, in: recordingDirectory)
+            return
+          case .suspended:
+            // Sidecar deliberately left in place: this is the quit path, and
+            // the next launch resumes from it. Dropping here would delete the
+            // record `suspendNewJobs` exists to preserve.
+            Log.info(
+              Log.transcription, "transcription",
+              "deferring \(name) to the next launch: quit began while it waited to upload")
             return
           }
           defer { releaseUploadSlot() }
@@ -670,14 +752,14 @@ final class TranscriptionCoordinator {
       "gave up on \(name) for now; it will be retried on next launch")
   }
 
-  /// The automatic-consent rule, in one place because it is applied at four
-  /// points: at resume so a withdrawn job never joins the queue, on entry to
-  /// `run`, on every pass of the job loop, and again immediately before the
-  /// call that bills. The waits between those points are long - an upload of a
-  /// long call, eight minutes of backoff, an hour of offline retries - and the
-  /// user can reach Settings during any of them. False once Soniox has been
-  /// billed: the money is spent, and finishing beats throwing away a transcript
-  /// that has already been paid for.
+  /// The automatic-transcription rule, in one place because it is applied at
+  /// five points: at resume so a switched-off job never starts, on entry to
+  /// `run`, on every pass of the job loop, again immediately after acquiring an
+  /// upload slot, and again immediately before the call that bills. The waits
+  /// between those points are long - an upload of a long call, eight minutes of
+  /// backoff, an hour of offline retries - and the user can reach Settings
+  /// during any of them. False once Soniox has been billed: the money is spent,
+  /// and finishing beats throwing away a transcript already paid for.
   private func isConsentWithdrawn(for job: TranscriptionJob) -> Bool {
     job.isAutomatic && job.transcriptionId == nil && !dependencies.isAutoEnabled()
   }
@@ -706,35 +788,55 @@ final class TranscriptionCoordinator {
     statuses.removeValue(forKey: recordingDirectory.path)
   }
 
-  /// Retires a job's local record. The record only goes away once something is
-  /// on its way to delete what the job left on Soniox; otherwise it is kept as a
-  /// delete-only marker, because those ids are the last trace of what is there.
-  /// Every path that finishes with a job - success, abandonment, cancellation -
-  /// goes through here.
+  /// Retires a job's local record, but not before Soniox has confirmed the
+  /// delete. Until then the record stands as a delete-only marker, because
+  /// those ids are the last trace of what is sitting there. Every path that
+  /// finishes with a job - success, abandonment, cancellation - goes through
+  /// here, so a crash between the two leaves a marker the next launch retries.
   private func releaseRemoteRecord(_ job: TranscriptionJob, in recordingDirectory: URL) {
-    if discardRemote(job: job) {
-      TranscriptionJob.remove(for: recordingDirectory)
-      return
-    }
     var pending = job
     pending.awaitingRemoteDelete = true
     pending.lastError = nil
     pending.save(for: recordingDirectory)
+    discardRemote(job: job) { Self.retireMarker(job, in: recordingDirectory) }
+  }
+
+  /// Removes a delete-only marker, but only if it is still the same one. The
+  /// user can start a fresh job for this recording while the delete is in
+  /// flight, and that job's sidecar must not be taken out from under it.
+  private static func retireMarker(_ job: TranscriptionJob, in recordingDirectory: URL) {
+    guard let current = TranscriptionJob.load(for: recordingDirectory),
+      current.awaitingRemoteDelete,
+      current.fileId == job.fileId,
+      current.transcriptionId == job.transcriptionId
+    else { return }
+    TranscriptionJob.remove(for: recordingDirectory)
+  }
+
+  /// Clears the ids from a record that outlives its job - a terminal failure
+  /// keeps its sidecar so the detail view can offer a retry. Same identity
+  /// check as `retireMarker`, for the same reason.
+  private static func clearRemoteIds(_ job: TranscriptionJob, in recordingDirectory: URL) {
+    guard var current = TranscriptionJob.load(for: recordingDirectory),
+      current.fileId == job.fileId,
+      current.transcriptionId == job.transcriptionId
+    else { return }
+    current.fileId = nil
+    current.transcriptionId = nil
+    current.save(for: recordingDirectory)
   }
 
   /// Terminal outcome: surface it and keep the sidecar so the detail view can
   /// offer a retry, but drop what the job already put on Soniox. A failed job
   /// the user never retries would otherwise leave the call audio there for good.
   private func fail(_ job: inout TranscriptionJob, in recordingDirectory: URL, message: String) {
-    // The ids are cleared only when something is actually on its way to delete
-    // them, so a retry starts clean; otherwise they are the last record of what
-    // is on Soniox and are kept for the cleanup pass at next launch.
-    if discardRemote(job: job) {
-      job.fileId = nil
-      job.transcriptionId = nil
-    }
+    // The ids survive in the record until the delete is confirmed; they are the
+    // only trace of what is on Soniox, and a failed cleanup has to be retryable
+    // at the next launch.
+    let attempted = job
     job.lastError = message
     job.save(for: recordingDirectory)
+    discardRemote(job: attempted) { Self.clearRemoteIds(attempted, in: recordingDirectory) }
     finish(key: recordingDirectory.path, status: .error(message))
   }
 
@@ -745,10 +847,22 @@ final class TranscriptionCoordinator {
   /// when there is no API key - the user cleared or rotated it while a job held
   /// remote artifacts. Callers must not destroy the job's ids in that case: the
   /// sidecar is the only thing left that names what is sitting on Soniox.
-  private func discardRemote(job: TranscriptionJob) -> Bool {
+  ///
+  /// `onDeleted` runs only once Soniox has confirmed every artifact is gone.
+  /// Retiring the record on *dispatch* was the older shape and it lost the ids
+  /// whenever the request then failed - a 401 from a half-typed key, or an
+  /// offline machine - which are exactly the conditions a user is in while
+  /// typing a key into Settings, the moment these markers get retried.
+  @discardableResult
+  private func discardRemote(
+    job: TranscriptionJob, onDeleted: @escaping @MainActor () -> Void = {}
+  ) -> Bool {
     let transcriptionIds = [job.transcriptionId].compactMap { $0 }
     let fileIds = [job.fileId].compactMap { $0 }
-    guard !transcriptionIds.isEmpty || !fileIds.isEmpty else { return true }
+    guard !transcriptionIds.isEmpty || !fileIds.isEmpty else {
+      onDeleted()
+      return true
+    }
     guard let apiKey = apiKey() else {
       Log.error(
         Log.transcription, "transcription",
@@ -757,8 +871,11 @@ final class TranscriptionCoordinator {
       return false
     }
     let service = dependencies.makeService(apiKey)
-    Task {
-      await service.deleteRemote(transcriptionIds: transcriptionIds, fileIds: fileIds)
+    Task { @MainActor in
+      let deleted = await service.deleteRemote(
+        transcriptionIds: transcriptionIds, fileIds: fileIds)
+      guard deleted else { return }
+      onDeleted()
     }
     return true
   }

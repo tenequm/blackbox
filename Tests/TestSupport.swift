@@ -114,7 +114,7 @@ final class FakeHUD: AudioMonitorHUD {
 
   func showFinalizing() {
     finalizingCount += 1
-    record(title: "Saving Recording…", subtitle: "")
+    record(title: HUDToast.finalizingTitle, subtitle: "")
   }
 
   func showError(message: String) {
