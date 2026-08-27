@@ -385,12 +385,6 @@ private struct RecordingRow: View {
         .foregroundStyle(.secondary)
         .accessibilityLabel("Waiting for a network connection")
         .help("Offline - Blackbox will keep trying")
-    case .waitingForRecording:
-      Image(systemName: "clock")
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-        .accessibilityLabel("Waiting for recording to finish")
-        .help("Starts when the current recording finishes")
     default:
       ProgressView()
         .controlSize(.small)
@@ -422,7 +416,6 @@ private struct RecordingRow: View {
   static func statusText(_ status: TranscriptionStatus) -> String {
     switch status {
     case .idle: "Not transcribed"
-    case .waitingForRecording: "Starts when the current recording finishes"
     case .queued: "Waiting in line"
     case .mixing: "Preparing audio"
     case .uploading: "Uploading"
@@ -554,11 +547,10 @@ struct RecordingDetailView: View {
       setupPlayer()
       loadTranscript()
     }
-    .onChange(of: transcription.revision) { _, _ in
+    .onChange(of: transcription.finishCount(for: recording.url)) { _, _ in
       // Decoding a transcript is main-thread JSON work proportional to call
       // length, so only the recording that actually finished reloads - not
       // every open detail view every time any job anywhere completes.
-      guard transcription.lastFinishedPath == recording.url.path else { return }
       loadTranscript()
     }
     .onDisappear {

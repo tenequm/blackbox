@@ -162,9 +162,8 @@ nonisolated final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate
 /// - which tells the user nothing about whether the wait is theirs to fix.
 nonisolated enum TranscriptionStatus: Equatable, Sendable {
   case idle
-  /// Held because a recording is in progress; starts on its own once that ends.
-  case waitingForRecording
-  /// Behind another job, or submitted to Soniox and waiting for it to begin.
+  /// Enqueued and not yet started, waiting for an upload slot, or submitted to
+  /// Soniox and waiting for it to begin.
   case queued
   /// Re-encoding the two tracks into one file. Local, slow on a long call, and
   /// entirely invisible before it had its own case.

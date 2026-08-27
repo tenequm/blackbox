@@ -30,7 +30,6 @@ struct BlackboxApp: App {
       }
     }
     let monitor = AudioMonitor(dependencies: dependencies)
-    coordinator.isRecordingActive = { [weak monitor] in monitor?.isRecording ?? false }
 
     self.monitor = monitor
     self.transcriptionCoordinator = coordinator
@@ -356,6 +355,11 @@ struct BlackboxApp: App {
       guard !isTerminating else { return .terminateLater }
       isTerminating = true
       testController?.stop()
+      // Precise replacement for the recording gate that used to defer jobs at
+      // quit as a side effect. One synchronous bool on the main actor, so it
+      // cannot extend the 8s budget - and unlike the gate, it fires on quit and
+      // only on quit.
+      transcriptionCoordinator?.suspendNewJobs()
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
         if !BlackboxTestMode.isEnabled {

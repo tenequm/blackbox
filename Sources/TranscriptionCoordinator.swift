@@ -89,10 +89,11 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 /// window, so a job started from the detail view survives that window closing
 /// and an auto-triggered job has somewhere to live at all.
 ///
-/// One job runs at a time. Everything is best-effort: a failure here never
-/// touches the recording, and nothing on this path is allowed to extend
-/// `applicationShouldTerminate`'s budget - an interrupted job resumes on the
-/// next launch from its sidecar.
+/// Each recording gets its own job and they run concurrently; only the local
+/// mix is bounded, by `Dependencies.uploadConcurrency`. Everything is
+/// best-effort: a failure here never touches the recording, and nothing on this
+/// path is allowed to extend `applicationShouldTerminate`'s budget - an
+/// interrupted job resumes on the next launch from its sidecar.
 @Observable
 final class TranscriptionCoordinator {
   struct Dependencies {
@@ -128,6 +129,65 @@ final class TranscriptionCoordinator {
     var sweepTemporaryFiles: @Sendable () async -> Void = {
       await TranscriptionService.sweepTemporaryFiles()
     }
+    /// How many jobs may be inside `upload` at once. `upload` is where the mix
+    /// lives, and a mix writes a full-size copy of the recording to the temp
+    /// directory, so this is a disk bound as much as a CPU one. Two keeps peak
+    /// scratch at four recording-sized files while still overlapping one job's
+    /// network transmit with another's encode.
+    var uploadConcurrency: Int = 2
+  }
+
+  // MARK: - Upload Gate
+
+  private struct UploadWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
+  }
+
+  @ObservationIgnored private var uploadSlotsInUse = 0
+  @ObservationIgnored private var uploadWaiters: [UploadWaiter] = []
+
+  /// True when the caller owns a slot and must release it. False means the wait
+  /// was cancelled and the caller must not proceed to upload.
+  ///
+  /// Deliberately not an actor. Actor isolation is mutual exclusion across
+  /// *synchronous* regions, and `mix` awaits `AVAssetExportSession.export`,
+  /// which releases the actor and lets the next caller straight in - so an
+  /// actor would bound nothing at all. The coordinator already runs wholly on
+  /// the main actor, which is what makes two variables sufficient here.
+  private func acquireUploadSlot() async -> Bool {
+    guard !Task.isCancelled else { return false }
+    if uploadSlotsInUse < dependencies.uploadConcurrency {
+      uploadSlotsInUse += 1
+      return true
+    }
+    let id = UUID()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        uploadWaiters.append(UploadWaiter(id: id, continuation: continuation))
+      }
+    } onCancel: {
+      Task { @MainActor [weak self] in self?.abandonUploadWaiter(id) }
+    }
+  }
+
+  /// A waiter that has already been handed a slot is no longer in the array, so
+  /// a cancel landing after the hand-off finds nothing and returns. That is what
+  /// makes a double resume impossible.
+  private func abandonUploadWaiter(_ id: UUID) {
+    guard let index = uploadWaiters.firstIndex(where: { $0.id == id }) else { return }
+    uploadWaiters.remove(at: index).continuation.resume(returning: false)
+  }
+
+  /// Hands the slot straight to the head waiter rather than decrementing, so
+  /// the count never dips and a job arriving between the release and the
+  /// wake-up cannot jump the queue.
+  private func releaseUploadSlot() {
+    if uploadWaiters.isEmpty {
+      uploadSlotsInUse -= 1
+      return
+    }
+    uploadWaiters.removeFirst().continuation.resume(returning: true)
   }
 
   /// What to do about a failure that interrupted a job.
@@ -142,21 +202,46 @@ final class TranscriptionCoordinator {
   /// Bumped whenever a job reaches a terminal state, so views can reload the
   /// sidecar files on disk without polling.
   private(set) var revision = 0
-  /// Which recording the latest `revision` belongs to. Without it a detail view
-  /// re-decodes its own transcript every time any *other* recording finishes.
-  private(set) var lastFinishedPath: String?
+  /// How many times each recording's job has reached a terminal state.
+  ///
+  /// This replaced a single `lastFinishedPath`, which could only name one
+  /// recording. With concurrent jobs, A finishing and then B finishing before
+  /// SwiftUI drains the change leaves the variable reading B, `revision` bumped
+  /// twice, and A's open detail view never reloading its transcript - silently,
+  /// forever. A per-path counter cannot coalesce that way, because `onChange`
+  /// compares the value it is watching.
+  private var finishCounts: [String: Int] = [:]
+
+  func finishCount(for recordingDirectory: URL) -> Int {
+    finishCounts[recordingDirectory.path] ?? 0
+  }
 
   private var statuses: [String: TranscriptionStatus] = [:]
-  private var queue: [URL] = []
-  private var activeDirectory: URL?
-  private var runTask: Task<Void, Never>?
-  private var gateTask: Task<Void, Never>?
 
-  /// Transcription mixes and re-encodes the whole recording, so it is held back
-  /// while the recorder owns the machine. Late-bound: the monitor and the
-  /// coordinator are built together in `BlackboxApp` and neither can capture
-  /// the other at init.
-  @ObservationIgnored var isRecordingActive: () -> Bool = { false }
+  /// One task per recording directory, keyed by the same path `statuses` uses -
+  /// so "is this job in flight" and "what is this job's status" cannot
+  /// disagree.
+  ///
+  /// This replaced a global queue plus a single `activeDirectory`. Jobs are
+  /// almost entirely *waiting*: a mix, an upload, then a poll loop against
+  /// Soniox that can run for a minute or more and contends with nothing. Making
+  /// them share one slot meant a recording finished at 17:52 did not start
+  /// transcribing until 18:17, because a call that began one second later ran
+  /// for 23 minutes. Only the local mix deserves a bound, and it has its own.
+  ///
+  /// `@ObservationIgnored` because nothing observes it, and a dictionary of
+  /// tasks would otherwise fire a SwiftUI invalidation per job start.
+  @ObservationIgnored private var jobs: [String: Task<Void, Never>] = [:]
+
+  /// Set when the app is terminating. New work still writes its sidecar and
+  /// shows as queued, so `resumePendingJobs()` picks it up next launch - but
+  /// nothing starts an upload the process kill is about to interrupt
+  /// mid-flight, which would strand the audio on Soniox with no local record of
+  /// it. Running jobs are deliberately not cancelled: cancelling would drop them
+  /// and delete remote artifacts for work that would otherwise resume.
+  @ObservationIgnored private var isSuspended = false
+
+  func suspendNewJobs() { isSuspended = true }
 
   @ObservationIgnored private let dependencies: Dependencies
   /// Outer nil means "not read yet". Cached because `hasAPIKey` is read from a
@@ -168,12 +253,6 @@ final class TranscriptionCoordinator {
   /// Offline waits do not spend an attempt, so they get their own bound.
   private static let maxOfflineWaits = 60
   private static let offlineRetry = Duration.seconds(60)
-  /// How often the gate re-asks whether a recording is still running - not how
-  /// long it waits. It used to be a single 30s sleep, which meant a job queued
-  /// the instant a call ended waited the whole 30s for a condition that was
-  /// already false by then. Short enough to feel immediate, long enough that
-  /// the poll costs nothing.
-  private static let recordingGatePoll = Duration.seconds(2)
   /// Automatic jobs upload without asking, so a file too short to be a call is
   /// dropped rather than billed. In practice this catches an early manual stop
   /// and a recorder that died at startup; a false-positive *detection* always
@@ -281,14 +360,13 @@ final class TranscriptionCoordinator {
   }
 
   func cancel(recordingDirectory: URL) {
-    queue.removeAll { $0.path == recordingDirectory.path }
-    if activeDirectory?.path == recordingDirectory.path {
+    if let task = jobs[recordingDirectory.path] {
       // Marked synchronously. Cancellation is only observed at the next
       // suspension point, and an upload can sit inside one for minutes, so
       // without this the button stayed live and the spinner unchanged - which
       // reads as a dead control and gets clicked again.
       statuses[recordingDirectory.path] = .cancelling
-      runTask?.cancel()
+      task.cancel()
       return
     }
     drop(
@@ -314,9 +392,7 @@ final class TranscriptionCoordinator {
       for recordingDirectory in pending {
         // Read fresh, and skip anything already in flight: the user can have
         // hit Retry on one of these while the sweep above was running.
-        guard self.activeDirectory?.path != recordingDirectory.path,
-          !self.queue.contains(where: { $0.path == recordingDirectory.path })
-        else { continue }
+        guard self.jobs[recordingDirectory.path] == nil else { continue }
         guard let job = TranscriptionJob.load(for: recordingDirectory) else {
           // `save` logs its write failures; this is the read side of that pair.
           // A record that will not decode is skipped on every launch, and its
@@ -378,40 +454,15 @@ final class TranscriptionCoordinator {
       existing.isAutomatic = false
       existing.save(for: recordingDirectory)
     }
-    guard activeDirectory?.path != key, !queue.contains(where: { $0.path == key }) else { return }
+    guard jobs[key] == nil else { return }
     if TranscriptionJob.load(for: recordingDirectory) == nil {
       TranscriptionJob(isAutomatic: isAutomatic).save(for: recordingDirectory)
     }
     statuses[key] = .queued
-    queue.append(recordingDirectory)
-    pump()
-  }
-
-  private func pump() {
-    guard activeDirectory == nil, let next = queue.first else { return }
-
-    if isRecordingActive() {
-      statuses[next.path] = .waitingForRecording
-      guard gateTask == nil else { return }
-      let sleep = dependencies.sleep
-      gateTask = Task { [weak self] in
-        await sleep(Self.recordingGatePoll)
-        guard let self else { return }
-        self.gateTask = nil
-        self.pump()
-      }
-      return
-    }
-
-    queue.removeFirst()
-    activeDirectory = next
-    runTask = Task { [weak self] in
-      await self?.run(next)
-      guard let self else { return }
-      self.activeDirectory = nil
-      self.runTask = nil
-      self.pump()
-    }
+    // The sidecar is written either way, so a recording reported during quit is
+    // picked up by the next launch rather than lost.
+    guard !isSuspended else { return }
+    jobs[key] = Task { [weak self] in await self?.run(recordingDirectory) }
   }
 
   // MARK: - Job Runner
@@ -419,6 +470,13 @@ final class TranscriptionCoordinator {
   private func run(_ recordingDirectory: URL) async {
     let key = recordingDirectory.path
     let name = recordingDirectory.lastPathComponent
+    // Inside `run`, not the task body: `run` is MainActor-isolated with no
+    // suspension between its terminal `finish`/`drop`/`fail` and its return, so
+    // this fires in the same main-actor turn as the terminal status write.
+    // Clearing from the task body would put a suspension between "status is
+    // terminal" and "slot is free", and retry-after-error would intermittently
+    // hit the still-occupied guard.
+    defer { jobs[key] = nil }
 
     guard let apiKey = apiKey() else {
       finish(key: key, status: .error("No Soniox API key configured"))
@@ -485,6 +543,26 @@ final class TranscriptionCoordinator {
         }
 
         if job.fileId == nil {
+          statuses[key] = .queued
+          guard await acquireUploadSlot() else {
+            Log.info(
+              Log.transcription, "transcription",
+              "cancelled \(name) while waiting to upload")
+            drop(job: job, in: recordingDirectory)
+            return
+          }
+          defer { releaseUploadSlot() }
+          // The fifth consent point. A job can now wait behind up to N other
+          // uploads, each of them minutes long, and without a check here that
+          // wait would be the one window in the whole pipeline with no consent
+          // re-check in it.
+          if isConsentWithdrawn(for: job) {
+            Log.info(
+              Log.transcription, "transcription",
+              "dropping auto-transcription for \(name) before uploading: the setting is now off")
+            drop(job: job, in: recordingDirectory)
+            return
+          }
           statuses[key] = .mixing(fraction: 0)
           job.fileId = try await service.upload(fileURL: audioURL) { [weak self] phase in
             Task { @MainActor [weak self] in
@@ -616,7 +694,7 @@ final class TranscriptionCoordinator {
 
   private func finish(key: String, status: TranscriptionStatus) {
     statuses[key] = status
-    lastFinishedPath = key
+    finishCounts[key, default: 0] += 1
     revision += 1
   }
 
