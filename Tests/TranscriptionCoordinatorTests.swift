@@ -35,10 +35,47 @@ actor FakeTranscriptionService: TranscriptionServicing {
   func setHoldsCompletion(_ holds: Bool) { holdsCompletion = holds }
   func setAfterUpload(_ handler: (@Sendable () async -> Void)?) { afterUpload = handler }
 
-  func upload(fileURL: URL) async throws -> String {
+  private var holdsUpload = false
+  private(set) var uploadsInFlight = 0
+  private(set) var maxConcurrentUploads = 0
+
+  func setHoldsUpload(_ holds: Bool) { holdsUpload = holds }
+
+  /// Keeps the job parked even after it is cancelled, so a test can observe
+  /// what happens to a cancelled-but-still-running job. Real uploads behave
+  /// this way: cancellation is only noticed at a suspension point, and
+  /// `URLSession` does not abandon a transmit mid-flight.
+  private var holdIgnoresCancellation = false
+  func setHoldIgnoresCancellation(_ ignores: Bool) { holdIgnoresCancellation = ignores }
+
+  /// Kept so a test can fire a progress report at a moment of its choosing.
+  /// The scripted reports below all land before the hold, and the hold loop
+  /// throws on cancellation, so there is otherwise no way to model a report
+  /// arriving *after* the user pressed Cancel - which is the case that matters.
+  private var progressHandler: (@Sendable (TranscriptionUploadPhase) -> Void)?
+  func emitProgress(_ phase: TranscriptionUploadPhase) { progressHandler?(phase) }
+
+  func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String {
+    progressHandler = onProgress
     uploadCount += 1
     if let uploadError { throw uploadError }
+    uploadsInFlight += 1
+    maxConcurrentUploads = max(maxConcurrentUploads, uploadsInFlight)
+    defer { uploadsInFlight -= 1 }
+    // Reported so a test can observe the coordinator's stage transitions
+    // rather than only its terminal states.
+    onProgress(.mixing(1))
+    onProgress(.uploading(0.5))
+    // Held so a test can pin jobs inside the stage the upload gate bounds.
+    while holdsUpload {
+      try? await Task.sleep(for: .milliseconds(2))
+      if !holdIgnoresCancellation { try Task.checkCancellation() }
+    }
     await afterUpload?()
+    onProgress(.uploading(1))
     return "file-\(uploadCount)"
   }
 
@@ -62,10 +99,17 @@ actor FakeTranscriptionService: TranscriptionServicing {
     return document
   }
 
-  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
+  /// Settable so a test can hold the coordinator in the state a failed cleanup
+  /// leaves it in: the record kept, the ids still naming what is on Soniox.
+  var deleteSucceeds = true
+
+  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async -> Bool {
     deletedTranscriptionIds.append(contentsOf: transcriptionIds)
     deletedFileIds.append(contentsOf: fileIds)
+    return deleteSucceeds
   }
+
+  func setDeleteSucceeds(_ value: Bool) { deleteSucceeds = value }
 }
 
 @MainActor
@@ -75,7 +119,6 @@ final class TranscriptionHarness {
 
   var apiKey: String? = "test-key"
   var autoEnabled = true
-  var recordingActive = false
   /// Long enough to clear the automatic-transcription duration floor. Tests that
   /// care about the floor set it explicitly.
   var duration: Double? = 600
@@ -86,6 +129,9 @@ final class TranscriptionHarness {
   /// Runs where the real temp-file sweep runs, inside `resumePendingJobs` and
   /// before its scan. Lets a test act on a recording in that window.
   var sweepHandler: (@Sendable () async -> Void)?
+  /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
+  /// before building the coordinator.
+  var uploadConcurrency = 2
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -116,9 +162,9 @@ final class TranscriptionHarness {
         saveDirectory: { [root] in root },
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
         durationSeconds: { [weak self] _ in await self?.duration },
-        sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() }
+        sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
+        uploadConcurrency: uploadConcurrency
       ))
-    coordinator.isRecordingActive = { [weak self] in self?.recordingActive ?? false }
     return coordinator
   }
 
@@ -281,8 +327,11 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.uploadCount == 1)
   }
 
-  @Test("a second recording waits while the first is in flight")
-  func jobsRunOneAtATime() async throws {
+  /// The direct regression test for the reported bug: a recording finished at
+  /// 17:52 did not start transcribing until 18:17, because it sat behind
+  /// another job's poll loop.
+  @Test("a second recording transcribes while the first is still polling")
+  func jobsRunConcurrently() async throws {
     let harness = try TranscriptionHarness()
     await harness.service.setHoldsCompletion(true)
     let first = try harness.makeRecording("call-1")
@@ -290,37 +339,141 @@ struct TranscriptionCoordinatorTests {
     let coordinator = harness.makeCoordinator()
 
     coordinator.transcribe(recordingDirectory: first)
+    // Wait until the first job is inside `awaitCompletion` before releasing the
+    // hold - it is a single flag on the fake, read at call time, so the first
+    // job stays parked while later ones sail past.
+    await harness.wait { coordinator.status(for: first) == .transcribing }
+    await harness.service.setHoldsCompletion(false)
     coordinator.transcribe(recordingDirectory: second)
-    await harness.wait { await harness.service.completionCount == 1 }
 
-    #expect(await harness.service.uploadCount == 1)
-    #expect(coordinator.status(for: second) == .queued)
+    // The second job runs to completion while the first is still parked in
+    // `awaitCompletion`, which is where a job spends most of its life.
+    await harness.wait { coordinator.status(for: second) == .completed }
+    #expect(coordinator.status(for: second) == .completed)
+    #expect(await harness.service.uploadCount == 2)
+    #expect(coordinator.status(for: first) == .transcribing)
 
     coordinator.cancel(recordingDirectory: first)
-    await harness.wait { await harness.service.uploadCount == 2 }
-    #expect(await harness.service.uploadCount == 2)
   }
 
-  @Test("transcription is held back while a recording is in progress")
-  func defersWhileRecording() async throws {
+  @Test("cancelling one job leaves the others running")
+  func cancellingOneJobLeavesOthers() async throws {
     let harness = try TranscriptionHarness()
-    harness.recordingActive = true
-    // A real wait keeps the gate from spinning hot while the flag stays set.
-    harness.sleepHandler = { _ in try? await Task.sleep(for: .milliseconds(5)) }
+    await harness.service.setHoldsCompletion(true)
+    let first = try harness.makeRecording("call-1")
+    let second = try harness.makeRecording("call-2")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: first)
+    await harness.wait { coordinator.status(for: first) == .transcribing }
+    await harness.service.setHoldsCompletion(false)
+    coordinator.transcribe(recordingDirectory: second)
+
+    coordinator.cancel(recordingDirectory: first)
+    await harness.wait { coordinator.status(for: second) == .completed }
+
+    #expect(coordinator.status(for: second) == .completed)
+    #expect(coordinator.status(for: first) == .idle)
+    #expect(TranscriptDocument.load(for: second) != nil)
+  }
+
+  @Test("resume starts every pending job, not just the first")
+  func resumeStartsEveryJob() async throws {
+    let harness = try TranscriptionHarness()
+    for name in ["call-1", "call-2", "call-3"] {
+      let directory = try harness.makeRecording(name)
+      TranscriptionJob(fileId: "f", transcriptionId: "t", isAutomatic: false)
+        .save(for: directory)
+    }
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.resumePendingJobs()
+    await harness.wait { await harness.service.completionCount == 3 }
+
+    #expect(await harness.service.completionCount == 3)
+  }
+
+  @Test("at most the configured number of uploads run at once")
+  func uploadConcurrencyIsBounded() async throws {
+    let harness = try TranscriptionHarness()
+    harness.uploadConcurrency = 2
+    await harness.service.setHoldsUpload(true)
+    let directories = try (1...5).map { try harness.makeRecording("call-\($0)") }
+    let coordinator = harness.makeCoordinator()
+
+    for directory in directories { coordinator.transcribe(recordingDirectory: directory) }
+    await harness.wait { await harness.service.uploadsInFlight == 2 }
+    #expect(await harness.service.uploadsInFlight == 2)
+
+    await harness.service.setHoldsUpload(false)
+    await harness.wait { coordinator.status(for: directories[4]) == .completed }
+
+    #expect(await harness.service.maxConcurrentUploads <= 2)
+    #expect(await harness.service.uploadCount == 5)
+  }
+
+  @Test("a job waiting for an upload slot is dropped when consent is withdrawn")
+  func consentWithdrawnWhileWaitingForSlot() async throws {
+    let harness = try TranscriptionHarness()
+    harness.uploadConcurrency = 1
+    await harness.service.setHoldsUpload(true)
+    let first = try harness.makeRecording("call-1")
+    let second = try harness.makeRecording("call-2")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: first)
+    await harness.wait { await harness.service.uploadsInFlight == 1 }
+    coordinator.recordingFinished(recordingDirectory: second)
+
+    // The second job is parked on the gate, which is a wait the user can act
+    // during - so it has to be a consent re-check point like every other wait.
+    harness.autoEnabled = false
+    await harness.service.setHoldsUpload(false)
+    await harness.wait { TranscriptionJob.load(for: second) == nil }
+
+    #expect(coordinator.status(for: second) == .idle)
+    #expect(await harness.service.uploadCount == 1)
+  }
+
+  @Test("two jobs finishing back to back each report their own completion")
+  func finishCountsArePerRecording() async throws {
+    let harness = try TranscriptionHarness()
+    let first = try harness.makeRecording("call-1")
+    let second = try harness.makeRecording("call-2")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: first)
+    coordinator.transcribe(recordingDirectory: second)
+    await harness.wait {
+      coordinator.status(for: first) == .completed && coordinator.status(for: second) == .completed
+    }
+
+    // A single `lastFinishedPath` could only name one of these, so an open
+    // detail view on the other never reloaded its transcript.
+    #expect(coordinator.finishCount(for: first) == 1)
+    #expect(coordinator.finishCount(for: second) == 1)
+  }
+
+  @Test("a recording reported at quit writes its sidecar without starting")
+  func quitDefersInsteadOfUploading() async throws {
+    let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.transcribe(recordingDirectory: directory)
+    coordinator.suspendNewJobs()
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
+
     #expect(await harness.service.uploadCount == 0)
-    #expect(coordinator.status(for: directory) == .queued)
+    #expect(TranscriptionJob.load(for: directory) != nil)
 
-    harness.recordingActive = false
-    await harness.wait { coordinator.status(for: directory) == .completed }
-    #expect(await harness.service.uploadCount == 1)
+    // The next launch picks it up, which is the whole point of deferring rather
+    // than starting an upload the process kill is about to interrupt.
+    let next = harness.makeCoordinator()
+    next.resumePendingJobs()
+    await harness.wait { next.status(for: directory) == .completed }
+    #expect(next.status(for: directory) == .completed)
   }
-
-  // MARK: Failure handling
 
   @Test("a transient failure is retried without re-uploading")
   func retriesTransientFailure() async throws {
@@ -395,6 +548,9 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(TranscriptDocument.load(for: directory) != nil)
+    // The record is retired on the delete's confirmation, one hop after the
+    // status lands.
+    await harness.wait { TranscriptionJob.load(for: directory) == nil }
     #expect(TranscriptionJob.load(for: directory) == nil)
   }
 
@@ -613,17 +769,16 @@ struct TranscriptionCoordinatorTests {
   @Test("a queued auto job does not upload if the setting is turned off first")
   func dropsQueuedAutoJobWhenSettingTurnedOffBeforeItRuns() async throws {
     let harness = try TranscriptionHarness()
-    harness.recordingActive = true
-    harness.sleepHandler = { _ in try? await Task.sleep(for: .milliseconds(5)) }
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
     coordinator.recordingFinished(recordingDirectory: directory)
+    // No await between the enqueue and the flip, so the job's task cannot have
+    // run yet - this is the window between queueing and first execution.
     #expect(coordinator.status(for: directory) == .queued)
 
-    // The user changes their mind while the job waits behind the recorder.
+    // The user changes their mind before the job gets going.
     harness.autoEnabled = false
-    harness.recordingActive = false
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
 
     #expect(await harness.service.uploadCount == 0)
@@ -633,22 +788,21 @@ struct TranscriptionCoordinatorTests {
   @Test("a manual request outranks the automatic flag an interrupted job left behind")
   func manualEnqueueDowngradesAutomaticFlag() async throws {
     let harness = try TranscriptionHarness()
-    harness.recordingActive = true
-    harness.sleepHandler = { _ in try? await Task.sleep(for: .milliseconds(5)) }
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    // An automatic job gets queued and stalls behind the recorder...
+    // An automatic job is enqueued...
     coordinator.recordingFinished(recordingDirectory: directory)
     #expect(TranscriptionJob.load(for: directory)?.isAutomatic == true)
 
-    // ...then the user asks for that same recording explicitly, while it is
-    // still sitting in the queue, and turns the setting off.
+    // ...then, in the same main-actor turn and so before that job's task has
+    // run, the user asks for the same recording explicitly and turns the
+    // setting off. The downgrade must survive, or the job would be dropped as
+    // a withdrawn automatic one.
     coordinator.transcribe(recordingDirectory: directory)
     #expect(TranscriptionJob.load(for: directory)?.isAutomatic == false)
 
     harness.autoEnabled = false
-    harness.recordingActive = false
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(await harness.service.uploadCount == 1)
@@ -695,6 +849,62 @@ struct TranscriptionCoordinatorTests {
   }
 
   // MARK: Sidecar format
+
+  /// The job sidecar was hardened against this and these two were not, which is
+  /// worse: the three rename paths rebuild metadata from
+  /// `load(...) ?? RecordingMetadata(fresh)` and write it back, so one
+  /// unreadable decode plus one rename permanently loses the title, the date and
+  /// every speaker name.
+  @Test("a metadata file written before a field existed still decodes")
+  func metadataDecodesWithMissingKeys() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"title":"Standup","appName":"Zoom"}"#
+    try Data(json.utf8).write(to: directory.appendingPathComponent(RecordingMetadata.fileName))
+
+    let loaded = try #require(RecordingMetadata.load(in: directory))
+    #expect(loaded.title == "Standup")
+    #expect(loaded.appName == "Zoom")
+    #expect(loaded.speakers.isEmpty)
+  }
+
+  @Test("a transcript written before a field existed still decodes")
+  func transcriptDecodesWithMissingKeys() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"segments":[{"speaker":1,"time":0,"text":"hello"}]}"#
+    try Data(json.utf8).write(to: TranscriptDocument.sidecarURL(for: directory))
+
+    let loaded = try #require(TranscriptDocument.load(for: directory))
+    #expect(loaded.segments.count == 1)
+    #expect(loaded.segments.first?.text == "hello")
+  }
+
+  /// The cost of losing a transcript is a paid-for result vanishing and the user
+  /// pressing Transcribe again, so one malformed segment must not take the other
+  /// four hundred with it. `decodeIfPresent` only covers a *missing* key - a key
+  /// present with the wrong type still throws, and that throw propagates out of
+  /// the segment array and loses the whole document.
+  @Test("one malformed segment does not lose the rest of the transcript")
+  func transcriptSurvivesMalformedSegment() throws {
+    let harness = try TranscriptionHarness()
+    let shapes: [(String, String)] = [
+      ("speaker as a string", #"{"speaker":"1","time":0,"text":"a"}"#),
+      ("time as a string", #"{"speaker":1,"time":"0","text":"a"}"#),
+      ("text as a number", #"{"speaker":1,"time":0,"text":7}"#),
+      ("null values", #"{"speaker":null,"time":null,"text":null}"#),
+      ("missing every key", #"{}"#),
+    ]
+    for (name, bad) in shapes {
+      let directory = try harness.makeRecording("call-\(UUID().uuidString)")
+      let json = #"{"segments":[\#(bad),{"speaker":2,"time":9,"text":"survivor"}]}"#
+      try Data(json.utf8).write(to: TranscriptDocument.sidecarURL(for: directory))
+
+      let loaded = try #require(TranscriptDocument.load(for: directory), "lost the file: \(name)")
+      #expect(loaded.segments.count == 2, "lost a segment: \(name)")
+      #expect(loaded.segments.last?.text == "survivor", "lost the good segment: \(name)")
+    }
+  }
 
   @Test("a job sidecar written before a field existed still decodes")
   func decodesSidecarMissingNewerFields() throws {
@@ -851,6 +1061,7 @@ struct TranscriptionCoordinatorTests {
     // The user's retry ran to completion: resume neither cancelled it nor wrote
     // the old failed record back over it.
     #expect(TranscriptDocument.load(for: directory) != nil)
+    await harness.wait { TranscriptionJob.load(for: directory) == nil }
     #expect(TranscriptionJob.load(for: directory) == nil)
     // It started clean rather than re-polling a transcription that had already
     // failed, and the leftovers from the previous session were deleted.
@@ -921,5 +1132,163 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(await harness.service.uploadCount == 1)
+  }
+
+  /// `transcribe` reset the sidecar and dispatched remote DELETEs before
+  /// `enqueue`'s in-flight guard could reject the request, so asking again for a
+  /// running job destroyed that job's remote artifacts and erased its ids.
+  @Test("asking again for a running job does not delete its remote artifacts")
+  func repeatRequestLeavesRunningJobAlone() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setHoldsCompletion(true)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .transcribing }
+
+    coordinator.transcribe(recordingDirectory: directory)
+
+    #expect(await harness.service.deletedFileIds.isEmpty)
+    #expect(await harness.service.deletedTranscriptionIds.isEmpty)
+    let job = try #require(TranscriptionJob.load(for: directory))
+    #expect(job.transcriptionId == "transcription-1")
+
+    coordinator.cancel(recordingDirectory: directory)
+  }
+
+  /// `.cancelling` is `isActive`, so a progress report arriving after the user
+  /// pressed Cancel overwrote it and re-enabled the button.
+  @Test("a progress report does not undo a cancellation")
+  func progressDoesNotOverwriteCancelling() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setHoldsUpload(true)
+    await harness.service.setHoldIgnoresCancellation(true)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .uploading(fraction: 0.5) }
+
+    coordinator.cancel(recordingDirectory: directory)
+    #expect(coordinator.status(for: directory) == .cancelling)
+
+    // A mix reports every 0.5s and runs for minutes on a long call, so a report
+    // landing after the click is the normal case, not a rare one.
+    await harness.service.emitProgress(.uploading(0.9))
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(coordinator.status(for: directory) == .cancelling)
+
+    await harness.service.setHoldIgnoresCancellation(false)
+    await harness.service.setHoldsUpload(false)
+  }
+
+  // Quit can land after enqueue but before the job reaches the upload gate.
+  @Test("suspend before the gate keeps the sidecar and uploads nothing")
+  func suspendedBeforeGateKeepsSidecar() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    coordinator.suspendNewJobs()
+
+    await harness.wait(upTo: 0.5) { await harness.service.uploadCount > 0 }
+    #expect(await harness.service.uploadCount == 0)
+    #expect(TranscriptionJob.load(for: directory) != nil, "sidecar was destroyed")
+    #expect(coordinator.status(for: directory) == .queued)
+  }
+
+  // A job parked on the upload gate when quit arrives keeps its sidecar, so
+  // the next launch resumes it instead of re-uploading.
+  @Test("a waiter drained at quit keeps its sidecar")
+  func drainedWaiterKeepsSidecar() async throws {
+    let harness = try TranscriptionHarness()
+    harness.uploadConcurrency = 1
+    await harness.service.setHoldsUpload(true)
+    let first = try harness.makeRecording("call-1")
+    let second = try harness.makeRecording("call-2")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: first)
+    await harness.wait { await harness.service.uploadsInFlight == 1 }
+    coordinator.transcribe(recordingDirectory: second)
+    // Long enough that `second`'s task has certainly reached the gate. It is
+    // parked there rather than inside `upload`, which `uploadCount == 1` proves
+    // - so the only way it can be resumed is the drain in `releaseUploadSlot`.
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await harness.service.uploadCount == 1, "second was not parked on the gate")
+
+    coordinator.suspendNewJobs()
+    await harness.service.setHoldsUpload(false)
+    await harness.wait { coordinator.status(for: first) == .completed }
+    // Give the drained waiter a chance to do the wrong thing.
+    try await Task.sleep(for: .milliseconds(200))
+
+    #expect(await harness.service.uploadCount == 1, "the drained waiter uploaded anyway")
+    #expect(TranscriptionJob.load(for: second) != nil, "drained waiter lost its sidecar")
+  }
+
+  // Cancelling is the one case that does drop the sidecar.
+  @Test("a cancelled waiter drops its sidecar")
+  func cancelledWaiterDrops() async throws {
+    let harness = try TranscriptionHarness()
+    harness.uploadConcurrency = 1
+    await harness.service.setHoldsUpload(true)
+    let first = try harness.makeRecording("call-1")
+    let second = try harness.makeRecording("call-2")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: first)
+    await harness.wait { await harness.service.uploadsInFlight == 1 }
+    coordinator.transcribe(recordingDirectory: second)
+    await harness.wait { coordinator.status(for: second) == .queued }
+
+    coordinator.cancel(recordingDirectory: second)
+    await harness.wait { TranscriptionJob.load(for: second) == nil }
+    #expect(TranscriptionJob.load(for: second) == nil)
+
+    await harness.service.setHoldsUpload(false)
+    await harness.wait { coordinator.status(for: first) == .completed }
+  }
+
+  // The job is read before the trash moves the directory, so the remote
+  // DELETE still goes out for a recording the user deleted.
+  @Test("forgetDeletedRecording deletes remote artifacts from the passed job")
+  func forgetDeletedDispatchesDelete() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    let job = TranscriptionJob(fileId: "file-9", transcriptionId: "transcription-9")
+    job.save(for: directory)
+    let captured = TranscriptionJob.load(for: directory)
+    try FileManager.default.removeItem(at: directory)
+
+    coordinator.forgetDeletedRecording(recordingDirectory: directory, job: captured)
+    await harness.wait { await harness.service.deletedFileIds == ["file-9"] }
+    #expect(await harness.service.deletedFileIds == ["file-9"])
+    #expect(await harness.service.deletedTranscriptionIds == ["transcription-9"])
+  }
+
+  // A refused DELETE must not take the record with it: that record is the only
+  // thing naming audio that is still sitting on Soniox.
+  @Test("a cleanup the server refuses keeps its marker for the next launch")
+  func refusedCleanupKeepsItsMarker() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setDeleteSucceeds(false)
+    let directory = try harness.makeRecording("call-1")
+    TranscriptionJob(
+      fileId: "file-1", transcriptionId: "transcription-1", awaitingRemoteDelete: true
+    ).save(for: directory)
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.resumePendingJobs()
+    await harness.wait { await harness.service.deletedFileIds == ["file-1"] }
+    // Long enough for a retirement to have landed if one were coming.
+    try await Task.sleep(for: .milliseconds(200))
+
+    #expect(TranscriptionJob.load(for: directory)?.awaitingRemoteDelete == true)
+    #expect(TranscriptionJob.load(for: directory)?.fileId == "file-1")
   }
 }

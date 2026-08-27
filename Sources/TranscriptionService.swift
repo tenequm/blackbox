@@ -14,6 +14,39 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
 
   static let fileName = "metadata.json"
 
+  init(
+    title: String, createdAt: Date, appName: String, speakers: [String: String],
+    perAppBundleID: String? = nil, perAppName: String? = nil, trackCount: Int? = nil
+  ) {
+    self.title = title
+    self.createdAt = createdAt
+    self.appName = appName
+    self.speakers = speakers
+    self.perAppBundleID = perAppBundleID
+    self.perAppName = perAppName
+    self.trackCount = trackCount
+  }
+
+  /// Hand-written for the same reason `TranscriptionJob`'s is: the synthesized
+  /// decoder throws on a missing key rather than falling back to the property's
+  /// default, and `load` swallows that with `try?`. Adding one non-optional
+  /// field would therefore make every metadata file a previous build wrote
+  /// undecodable at once - and the three rename paths rebuild a fresh record
+  /// from `load(...) ?? RecordingMetadata(...)` and write it back, so a single
+  /// unreadable decode plus one rename permanently loses the title, the date and
+  /// every speaker name. Every key is optional here so the format stays
+  /// additive.
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    appName = try container.decodeIfPresent(String.self, forKey: .appName) ?? ""
+    speakers = try container.decodeIfPresent([String: String].self, forKey: .speakers) ?? [:]
+    perAppBundleID = try container.decodeIfPresent(String.self, forKey: .perAppBundleID)
+    perAppName = try container.decodeIfPresent(String.self, forKey: .perAppName)
+    trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
+  }
+
   static func load(in directory: URL) -> RecordingMetadata? {
     let url = directory.appendingPathComponent(fileName)
     guard let data = try? Data(contentsOf: url) else { return nil }
@@ -39,13 +72,40 @@ nonisolated enum RecordingStore {
   static let audioName = "audio.m4a"
   static let processedAudioName = "audio-processed.m4a"
 
+  /// Echo cancellation writes here and moves the result into place only on
+  /// success. The name lives with its two siblings rather than on
+  /// `AECProcessor`, because the size scanners have to know about all three -
+  /// an in-flight run is a recording-sized third file, and neither the
+  /// recordings list nor the storage total could see it from over there.
+  private static let partialProcessedPrefix = "audio-processed-partial-"
+
+  /// Unique per run: two runs for one recording sharing a scratch path meant
+  /// the second one's cleanup unlinked the first one's output mid-write.
+  static func partialProcessedName() -> String {
+    "\(partialProcessedPrefix)\(UUID().uuidString).m4a"
+  }
+
+  static func isPartialProcessedName(_ name: String) -> Bool {
+    name.hasPrefix(partialProcessedPrefix)
+  }
+
   /// The echo-cancelled output when the user has run AEC, otherwise the raw
   /// capture. Nil when the directory holds neither.
   static func audioURL(in recordingDirectory: URL) -> URL? {
     let processed = recordingDirectory.appendingPathComponent(processedAudioName)
-    if FileManager.default.fileExists(atPath: processed.path) { return processed }
+    if isUsable(processed) { return processed }
     let raw = recordingDirectory.appendingPathComponent(audioName)
-    return FileManager.default.fileExists(atPath: raw.path) ? raw : nil
+    return isUsable(raw) ? raw : nil
+  }
+
+  /// Exists *and* has bytes. A killed echo-cancellation run used to leave a
+  /// zero-byte `audio-processed.m4a`, and because this method prefers the
+  /// processed file, that empty file silently became the playback, export and
+  /// transcription source - so a recording whose audio was perfectly intact
+  /// reported "Could not load audio: Cannot Open".
+  static func isUsable(_ url: URL) -> Bool {
+    guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return false }
+    return size > 0
   }
 
   /// Enumerates by name rather than with `contentsOfDirectory(at:)`, which
@@ -81,6 +141,30 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   var provider: String?
   var model: String?
 
+  init(
+    segments: [TranscriptSegment], language: String? = nil, createdAt: Date,
+    provider: String? = nil, model: String? = nil
+  ) {
+    self.segments = segments
+    self.language = language
+    self.createdAt = createdAt
+    self.provider = provider
+    self.model = model
+  }
+
+  /// Hand-written for the same reason as `RecordingMetadata`'s. Here the cost of
+  /// an undecodable file is a paid-for transcript vanishing from the detail
+  /// view, the user pressing Transcribe, and the intact file being overwritten
+  /// by a re-billed one.
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
+    language = try container.decodeIfPresent(String.self, forKey: .language)
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    provider = try container.decodeIfPresent(String.self, forKey: .provider)
+    model = try container.decodeIfPresent(String.self, forKey: .model)
+  }
+
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
     recordingURL.appendingPathComponent("transcript.json")
   }
@@ -111,27 +195,119 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
 
   init(speaker: Int, time: Double, text: String) {
     self.id = UUID()
-    self.speaker = speaker
-    self.time = time
+    self.speaker = Self.clampSpeaker(speaker)
+    self.time = Self.clampTime(time)
     self.text = text
   }
 
+  /// Defaults rather than throws, for the same reason `TranscriptDocument`'s
+  /// initialiser is hand-written: a throw here propagates out of the document's
+  /// `decodeIfPresent([TranscriptSegment].self)` and takes the whole transcript
+  /// with it, so one malformed segment loses a transcript the user has paid for
+  /// and the retry re-bills.
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     self.id = (try? container.decode(UUID.self, forKey: .id)) ?? UUID()
-    self.speaker = try container.decode(Int.self, forKey: .speaker)
-    self.time = try container.decode(Double.self, forKey: .time)
-    self.text = try container.decode(String.self, forKey: .text)
+    // `try?`, not `decodeIfPresent`: the latter still throws when the key is
+    // present with the wrong type - a speaker sent as a string, a time sent as
+    // null - and a throw here propagates out of the document's segment array
+    // and loses the entire transcript, which is the exact outcome this
+    // initialiser exists to prevent. Measured: 4 of 6 malformed shapes still
+    // took the whole file before this.
+    self.speaker = Self.clampSpeaker((try? container.decode(Int.self, forKey: .speaker)) ?? 0)
+    self.time = Self.clampTime((try? container.decode(Double.self, forKey: .time)) ?? 0)
+    self.text = (try? container.decode(String.self, forKey: .text)) ?? ""
+  }
+
+  /// Clamped at the parse boundary rather than in each formatter. `abs(Int.min)`
+  /// and `speakerID + 1` both trap, and the transcript is written to disk before
+  /// it is ever displayed, so an out-of-range value from a corrupt sidecar or a
+  /// misbehaving response crashes the app on every attempt to open that
+  /// recording, permanently.
+  /// `Int.min` maps to 0, not to -1: -1 is the reserved id for the local
+  /// speaker, so folding garbage onto it labels it "You".
+  static func clampSpeaker(_ value: Int) -> Int {
+    value == Int.min ? 0 : min(value, Int.max - 1)
+  }
+
+  /// `Int(time)` traps on a value outside `Int`'s range, and the display
+  /// helpers convert before they clamp.
+  static func clampTime(_ value: Double) -> Double {
+    guard value.isFinite else { return 0 }
+    return min(max(0, value), 24 * 60 * 60)
   }
 }
 
+/// Which half of `upload` is running. The two are reported separately because
+/// they fail and stall for different reasons, and because on a long call the
+/// local re-encode is the longer of the two.
+nonisolated enum TranscriptionUploadPhase: Sendable {
+  case mixing(Double)
+  case uploading(Double)
+}
+
+/// Reports bytes-sent for a single upload. `URLSession.shared` has no delegate
+/// of its own, so this is attached per task rather than per session.
+/// `@unchecked Sendable` because the callback is the only state and it is
+/// immutable; libdispatch delivers the delegate calls on the session queue.
+nonisolated final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate,
+  @unchecked Sendable
+{
+  private let onFraction: @Sendable (Double) -> Void
+
+  init(onFraction: @escaping @Sendable (Double) -> Void) {
+    self.onFraction = onFraction
+  }
+
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask,
+    didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
+    totalBytesExpectedToSend: Int64
+  ) {
+    guard totalBytesExpectedToSend > 0 else { return }
+    onFraction(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+  }
+}
+
+/// Every stage the user can be waiting through gets its own case. They used to
+/// collapse into three, so a job held behind a recording, a job third in line,
+/// and a job an hour into offline retries all read "Queued for transcription"
+/// - which tells the user nothing about whether the wait is theirs to fix.
 nonisolated enum TranscriptionStatus: Equatable, Sendable {
   case idle
-  case uploading
+  /// Enqueued and not yet started, waiting for an upload slot, or submitted to
+  /// Soniox and waiting for it to begin.
   case queued
+  /// Re-encoding the two tracks into one file. Local, slow on a long call, and
+  /// entirely invisible before it had its own case.
+  case mixing(fraction: Double)
+  case uploading(fraction: Double)
   case transcribing
+  /// Network is unreachable; retrying without spending an attempt.
+  case offline
+  /// A recoverable failure is being retried, with which attempt this is.
+  case retrying(attempt: Int, of: Int)
+  /// The user asked to stop and the job has not finished unwinding yet.
+  case cancelling
   case completed
   case error(String)
+
+  /// True while the job is doing or waiting on work - anything that should show
+  /// progress rather than an action button.
+  var isActive: Bool {
+    switch self {
+    case .idle, .completed, .error: false
+    default: true
+    }
+  }
+
+  /// Determinate progress for the stages that can report it, nil for the rest.
+  var fraction: Double? {
+    switch self {
+    case .mixing(let f), .uploading(let f): f
+    default: nil
+    }
+  }
 }
 
 nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
@@ -144,6 +320,9 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
   case notReady(String)
   case balanceExhausted(String)
   case pollTimeout
+  /// Soniox answered normally with no tokens: the audio held no speech. Not a
+  /// failure of the pipeline, and retrying pays again for the same silence.
+  case noSpeechDetected
 
   var errorDescription: String? {
     switch self {
@@ -153,6 +332,7 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
     case .notReady(let msg): "Transcript not ready: \(msg)"
     case .balanceExhausted(let msg): "Soniox balance or budget exhausted: \(msg)"
     case .pollTimeout: "Transcription timed out"
+    case .noSpeechDetected: "No speech found in this recording"
     }
   }
 
@@ -162,7 +342,9 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
   var isRetryable: Bool {
     switch self {
     case .serverError, .pollTimeout, .notReady: true
-    case .uploadFailed, .transcriptionFailed, .balanceExhausted: false
+    // Not retryable on purpose: the audio held no speech, so another pass pays
+    // Soniox again for the same silence.
+    case .uploadFailed, .transcriptionFailed, .balanceExhausted, .noSpeechDetected: false
     }
   }
 }
@@ -181,15 +363,35 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
 protocol TranscriptionServicing: Sendable {
   /// Mixes multi-track audio into a single file when needed, uploads it, and
   /// returns the remote file id.
-  @concurrent func upload(fileURL: URL) async throws -> String
+  @concurrent func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String
   @concurrent func createTranscription(fileId: String, reference: String) async throws -> String
   @concurrent func awaitCompletion(transcriptionId: String) async throws
   @concurrent func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
-  @concurrent func deleteRemote(transcriptionIds: [String], fileIds: [String]) async
+  /// True only when Soniox has confirmed every artifact is gone. The caller
+  /// retires the record that names them on that answer, so "dispatched" is
+  /// not good enough: a 401 from a half-typed key, or an offline machine,
+  /// would otherwise erase the last trace of audio still sitting there.
+  @concurrent func deleteRemote(transcriptionIds: [String], fileIds: [String]) async -> Bool
 }
 
 nonisolated final class TranscriptionService: TranscriptionServicing {
   static let defaultModel = "stt-async-v5"
+  /// Offered in Settings. A free-text field meant a typo became a terminal
+  /// failure per recording, discovered one recording at a time and only after
+  /// an upload had already been paid for - while "Verify Key" happily reported
+  /// success, because it checks the key and not the model.
+  /// Only ids Soniox currently serves. `stt-async-preview` was offered here and
+  /// is not one of them - it is not a model or an alias, and the nearest real
+  /// name (`stt-async-preview-v1`) was retired in October 2025 - so picking it
+  /// produced exactly the terminal per-recording failure, after a paid-for
+  /// upload, that replacing the free-text field was meant to prevent.
+  /// A model this list does not know still works if it is already in defaults:
+  /// the picker surfaces the stored value, so a retirement does not need a
+  /// release. See `docs/specification.md` D14.
+  static let knownModels = [defaultModel]
   static let defaultBaseURL = "https://api.soniox.com"
   static let providerName = "soniox"
 
@@ -197,6 +399,12 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   private let model: String
   private let baseURL: String
   private static let mixPrefix = "blackbox-mixed-"
+  /// Prefixed like its sibling. `temporaryDirectory` is the user's shared
+  /// `$TMPDIR` for a non-sandboxed app, so sweeping a bare `.multipart` suffix
+  /// reached files this app never wrote - and, because onboarding's relaunch
+  /// overlaps two instances, the new one's launch sweep could unlink the old
+  /// one's in-flight upload body.
+  private static let uploadPrefix = "blackbox-upload-"
   private static let uploadSuffix = ".multipart"
   private static let pollCeiling = Duration.seconds(30 * 60)
   /// Soniox caps `client_reference_id` at 256 characters.
@@ -275,19 +483,28 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// For dual-track recordings (system audio + mic), tracks are mixed into a
   /// single file first so Soniox can diarize speakers from the combined audio,
   /// producing proper speaker separation and timestamps.
+  ///
+  /// Every Blackbox recording is dual-track, so the mix always runs - and on a
+  /// long call it is the slowest thing here, a full re-encode before a byte
+  /// leaves the machine. `onProgress` exists because that used to be minutes of
+  /// a spinner captioned "Uploading audio...", which is both the wrong stage
+  /// and no way to tell work from a stall.
   @concurrent
-  func upload(fileURL: URL) async throws -> String {
+  func upload(
+    fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-    guard tracks.count >= 2 else { return try await uploadFile(fileURL) }
+    guard tracks.count >= 2 else { return try await uploadFile(fileURL, onProgress: onProgress) }
 
     Log.info(
       Log.transcription, "transcription",
       "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
-    let mixedURL = try await Self.mix(asset: asset, tracks: tracks)
+    let mixedURL = try await Self.mix(asset: asset, tracks: tracks, onProgress: onProgress)
     defer { try? FileManager.default.removeItem(at: mixedURL) }
-    return try await uploadFile(mixedURL)
+    return try await uploadFile(mixedURL, onProgress: onProgress)
   }
 
   // MARK: - Audio Mixing & Export
@@ -295,7 +512,11 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// Takes an already-loaded asset so callers that had to inspect the track
   /// count first do not parse the container a second time.
   @concurrent
-  static func mix(asset: AVAsset, tracks: [AVAssetTrack]) async throws -> URL {
+  static func mix(
+    asset: AVAsset,
+    tracks: [AVAssetTrack],
+    onProgress: (@Sendable (TranscriptionUploadPhase) -> Void)? = nil
+  ) async throws -> URL {
     let composition = AVMutableComposition()
     let duration = try await asset.load(.duration)
 
@@ -327,7 +548,25 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     }
 
     do {
-      try await exporter.export(to: tempURL, as: .m4a)
+      if let onProgress {
+        onProgress(.mixing(0))
+        // `nonisolated(unsafe)` because `AVAssetExportSession` is not Sendable
+        // and both the export and its progress sequence need the same
+        // instance. Reading progress while an export runs is what the API is
+        // for - `states(updateInterval:)` exists to be consumed concurrently
+        // with `export(to:as:)`, and the sequence ends when the export does.
+        nonisolated(unsafe) let session = exporter
+        async let export: Void = session.export(to: tempURL, as: .m4a)
+        for await state in session.states(updateInterval: 0.5) {
+          if case .exporting(let progress) = state {
+            onProgress(.mixing(progress.fractionCompleted))
+          }
+        }
+        try await export
+        onProgress(.mixing(1))
+      } else {
+        try await exporter.export(to: tempURL, as: .m4a)
+      }
     } catch {
       throw TranscriptionError.transcriptionFailed(
         "track mixing failed: \(error.localizedDescription)")
@@ -347,7 +586,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       let names = try? FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path)
     else { return }
     for name in names
-    where name.hasPrefix(Self.mixPrefix) || name.hasSuffix(Self.uploadSuffix) {
+    where name.hasPrefix(Self.mixPrefix) || name.hasPrefix(Self.uploadPrefix) {
       try? FileManager.default.removeItem(at: temporaryDirectory.appendingPathComponent(name))
     }
   }
@@ -358,25 +597,33 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
+    // NSSavePanel's "Replace" confirmation does not remove the target, and
+    // `copyItem` throws on an existing file - so agreeing to replace produced a
+    // "file exists" error and left the old file untouched.
     guard tracks.count >= 2 else {
+      try? FileManager.default.removeItem(at: outputURL)
       try FileManager.default.copyItem(at: fileURL, to: outputURL)
       return
     }
     // Reuses the already-loaded asset rather than re-parsing the container.
     let mixed = try await mix(asset: asset, tracks: tracks)
     defer { try? FileManager.default.removeItem(at: mixed) }
+    try? FileManager.default.removeItem(at: outputURL)
     try FileManager.default.copyItem(at: mixed, to: outputURL)
   }
 
   // MARK: - Upload
 
   @concurrent
-  private func uploadFile(_ fileURL: URL) async throws -> String {
+  private func uploadFile(
+    _ fileURL: URL,
+    onProgress: @escaping @Sendable (TranscriptionUploadPhase) -> Void
+  ) async throws -> String {
     let boundary = UUID().uuidString
 
     // Build multipart body as a temp file to avoid loading entire audio into memory
     let tempURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent(UUID().uuidString + Self.uploadSuffix)
+      .appendingPathComponent(Self.uploadPrefix + UUID().uuidString + Self.uploadSuffix)
     defer { try? FileManager.default.removeItem(at: tempURL) }
     try Self.writeMultipartBody(audio: fileURL, boundary: boundary, to: tempURL)
 
@@ -384,7 +631,10 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     request.setValue(
       "multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-    let (data, response) = try await URLSession.shared.upload(for: request, fromFile: tempURL)
+    onProgress(.uploading(0))
+    let (data, response) = try await URLSession.shared.upload(
+      for: request, fromFile: tempURL,
+      delegate: UploadProgressDelegate { onProgress(.uploading($0)) })
     try checkHTTPResponse(response, data: data, context: "upload")
 
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -491,13 +741,16 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   @concurrent
   func awaitCompletion(transcriptionId: String) async throws {
+    // Measured on the clock, not by summing the sleeps: the round trips are not
+    // free, so a ceiling built from sleep durations alone is a floor.
+    let started = ContinuousClock.now
     var elapsed = Duration.zero
 
     while elapsed < Self.pollCeiling {
       try Task.checkCancellation()
       let interval = Self.pollInterval(after: elapsed)
       try await Task.sleep(for: interval)
-      elapsed += interval
+      elapsed = ContinuousClock.now - started
 
       let request = try makeRequest(.get, "/v1/transcriptions/\(transcriptionId)")
       let data: Data
@@ -554,9 +807,16 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     try checkHTTPResponse(response, data: data, context: "fetch transcript")
 
     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let tokens = json["tokens"] as? [[String: Any]], !tokens.isEmpty
+      let tokens = json["tokens"] as? [[String: Any]]
     else {
-      throw TranscriptionError.transcriptionFailed("empty or invalid transcript response")
+      throw TranscriptionError.transcriptionFailed("could not read the transcript response")
+    }
+    // A well-formed response with no tokens is not a failure - it is a
+    // recording with nothing audible in it. Reporting that as "Transcription
+    // failed" sent the user looking for a bug in a call that was simply silent,
+    // and offered a Retry that would upload and bill for the same silence.
+    guard !tokens.isEmpty else {
+      throw TranscriptionError.noSpeechDetected
     }
 
     var document = groupTokensIntoDocument(tokens)
@@ -633,20 +893,24 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// user's call audio living on Soniox indefinitely, so a silent miss is the
   /// one outcome that must not be invisible.
   @concurrent
-  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
+  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async -> Bool {
+    var allGone = true
     for tId in transcriptionIds {
-      await delete(path: "/v1/transcriptions/\(tId)", describing: "transcription \(tId)")
+      allGone =
+        await delete(path: "/v1/transcriptions/\(tId)", describing: "transcription \(tId)")
+        && allGone
     }
     for fId in fileIds {
-      await delete(path: "/v1/files/\(fId)", describing: "file \(fId)")
+      allGone = await delete(path: "/v1/files/\(fId)", describing: "file \(fId)") && allGone
     }
+    return allGone
   }
 
   @concurrent
-  private func delete(path: String, describing what: String) async {
+  private func delete(path: String, describing what: String) async -> Bool {
     guard let url = URL(string: "\(baseURL)\(path)") else {
       Log.error(Log.transcription, "transcription", "cannot delete \(what): invalid URL \(path)")
-      return
+      return false
     }
     var request = URLRequest(url: url)
     request.httpMethod = "DELETE"
@@ -657,18 +921,20 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
         Log.error(
           Log.transcription, "transcription",
           "cannot confirm deletion of \(what): no HTTP response; it may remain on Soniox")
-        return
+        return false
       }
       // 404 means it is already gone, which is the outcome we wanted.
-      guard !(200..<300).contains(http.statusCode), http.statusCode != 404 else { return }
+      guard !(200..<300).contains(http.statusCode), http.statusCode != 404 else { return true }
       Log.error(
         Log.transcription, "transcription",
         "failed to delete \(what) (HTTP \(http.statusCode)); it may remain on Soniox: \(Self.bodyExcerpt(from: data))"
       )
+      return false
     } catch {
       Log.error(
         Log.transcription, "transcription",
         "failed to delete \(what); it may remain on Soniox: \(error.localizedDescription)")
+      return false
     }
   }
 
@@ -686,6 +952,10 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     var request = URLRequest(url: url)
     request.httpMethod = method.rawValue
     request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    // Without this each stalled request can sit for URLSession's 60s default,
+    // and the poll loop issues up to 169 of them - so a ceiling described as
+    // thirty minutes became hours before it reported a timeout.
+    request.timeoutInterval = 30
     return request
   }
 
@@ -717,7 +987,11 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   private func checkHTTPResponse(
     _ response: URLResponse, data: Data, context: String
   ) throws {
-    guard let http = response as? HTTPURLResponse else { return }
+    // Not an HTTP response at all is a failure, not a success. Returning here
+    // let the caller carry on and fail opaquely at the JSON parse instead.
+    guard let http = response as? HTTPURLResponse else {
+      throw TranscriptionError.transcriptionFailed("\(context): no HTTP response")
+    }
     guard (200..<300).contains(http.statusCode) else {
       let envelope = Self.errorEnvelope(from: data)
       let apiMessage = envelope.message ?? "HTTP \(http.statusCode)"

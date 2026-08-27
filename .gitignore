@@ -38,3 +38,4 @@ DerivedData/
 
 # Playwright CLI cache
 .playwright-cli/
+.agents/handoff/

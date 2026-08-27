@@ -32,6 +32,13 @@ final class AudioMonitor {
   // returns slowly.
   private var autoStartTask: Task<Void, Never>?
   private var manualStartTask: Task<Void, Never>?
+  /// Every in-flight `recorder.stop()`. The four stop paths nil their recorder
+  /// and then launch an unstructured Task to do the stopping, so
+  /// `stopMonitoring()` - which only awaited the recorders themselves - was
+  /// awaiting two fields that were already nil. Stop a recording, quit within a
+  /// second or two, and the process exited mid-`finishWriting`, leaving a file
+  /// with no `moov` atom.
+  private var savingTasks: [UUID: Task<Void, Never>] = [:]
   // After a user-initiated stop (manual stop, or force-stop on auto), suppress
   // auto-restart of the same parent bundle until it disappears from the caller
   // set for one poll. Single-bundle: covers the reported Chrome case;
@@ -81,9 +88,11 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    // Screen Recording permission is requested at onboarding; if it was revoked
-    // or never granted, recording fails with .permissionDenied and the failure
-    // handler sets permissionNeeded = true.
+    // Screen Recording permission is requested at onboarding. `loadSettings`
+    // above has already seeded `permissionNeeded` from a preflight, and the
+    // 5-second poll below keeps it honest if the user revokes mid-session; the
+    // recorder's `.permissionDenied` failure path sets it too, as a backstop
+    // for the window between a revoke and the next poll.
 
     if !skipPermissionRequests {
       Task { @MainActor [weak self] in
@@ -135,9 +144,24 @@ final class AudioMonitor {
     await autoTask?.value
     await manualTask?.value
 
+    // And for any stop already in flight when quit arrived. Not bounded: only
+    // the SCStream stop inside it is (3s), and `finishWriting` after that runs
+    // as long as it runs - which is the point, since cancelling it deletes the
+    // file. The real backstop is `applicationShouldTerminate`'s own 8s reply
+    // timer; if finalization outlasts it the process exits mid-write, and the
+    // file is recoverable through `movieFragmentInterval` once the first
+    // fragment has flushed.
+    for task in savingTasks.values { await task.value }
+
     isRecording = false
     currentAppName = nil
     recordingStartTime = nil
+  }
+
+  /// Quit-time only. The delegate has no HUD of its own, and a second instance
+  /// would fight this one for the panel.
+  func showFinalizingToast() {
+    dependencies.hud.showFinalizing()
   }
 
   // MARK: - Error
@@ -275,7 +299,7 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0
@@ -307,6 +331,25 @@ final class AudioMonitor {
     }
   }
 
+  /// Runs a recorder stop as a tracked task, so `stopMonitoring()` can await it.
+  ///
+  /// The body has to be registered *and* removed from inside the task, because
+  /// the `Task` value does not exist until its initializer returns - by which
+  /// time a short body may already have finished. Inserting after the fact
+  /// would then leave a completed task in the set forever.
+  private func trackSaving(_ body: @escaping @MainActor () async -> Void) {
+    let id = UUID()
+    // Keyed by id rather than by the task itself: the `Task` value does not
+    // exist until its initializer returns, so a task cannot remove itself from
+    // a set it is not yet in. The assignment lands first regardless - this is
+    // main-actor code, so the body cannot start until the current synchronous
+    // region yields.
+    savingTasks[id] = Task { @MainActor in
+      await body()
+      savingTasks[id] = nil
+    }
+  }
+
   /// Announces a recording that reached disk. Every `stop()` that can return a
   /// URL funnels through here so post-processing sees failure-ended and
   /// quit-time recordings too, not just the two clean stop paths.
@@ -332,16 +375,21 @@ final class AudioMonitor {
     stopElapsedTimer()
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      // `updateAutoState` first: it is what clears `isRecording`, and
+      // `reportRecordingSaved` runs a consumer that reads it. Announcing the
+      // save while the just-finished recording still reads as live made the
+      // transcription coordinator hold every automatic job behind its
+      // recording gate for the gate's full duration, every time.
+      updateAutoState()
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
         reportRecordingSaved(url)
       }
-      updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
       lastKnownMicRunning = false
       evaluateCallState()
@@ -646,16 +694,18 @@ final class AudioMonitor {
     Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      // Ordered as in `stopManualRecording`, and for the same reason: the save
+      // must not be announced while `isRecording` still reads true.
+      updateAutoState()
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
         reportRecordingSaved(url)
       }
-      updateAutoState()
     }
   }
 
@@ -670,7 +720,7 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0
@@ -756,6 +806,17 @@ final class AudioMonitor {
       micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
     if micPermissionNeeded != nextMicPermissionNeeded {
       micPermissionNeeded = nextMicPermissionNeeded
+    }
+
+    // Asked here rather than only after a capture fails. Recording is the whole
+    // product, so an app that cannot record has to say so before the user
+    // relies on it, not after they have lost a call to it.
+    let nextPermissionNeeded = !dependencies.screenCaptureAccessGranted()
+    if permissionNeeded != nextPermissionNeeded {
+      Log.info(
+        Log.monitor, "monitor",
+        "screen recording permission \(nextPermissionNeeded ? "missing" : "granted")")
+      permissionNeeded = nextPermissionNeeded
     }
   }
 

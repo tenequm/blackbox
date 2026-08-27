@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import CoreGraphics
 import UserNotifications
 
 protocol RecorderSession: AnyObject {
@@ -59,6 +60,8 @@ protocol AudioMonitorHUD: AnyObject {
   func showRecordingStarted(appName: String)
   func showRecordingSaved(appName: String)
   func showError(message: String)
+  /// Shown for the duration of quit-time finalization; has no auto-hide.
+  func showFinalizing()
   var lastToast: HUDToast? { get }
 }
 
@@ -119,6 +122,14 @@ struct AudioMonitorDependencies {
   /// `deletingLastPathComponent()` once enqueued the whole recordings folder
   /// as a job.
   var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
+  /// Whether Screen Recording - which is what system audio capture rides on -
+  /// is currently granted. Polled rather than inferred from a failed recording:
+  /// the menu bar used to look healthy until the first recording failed, which
+  /// meant a denied user could sit through a whole call capturing nothing.
+  /// `CGPreflightScreenCaptureAccess` is cheap and never prompts, which is
+  /// exactly what makes it safe to call on the settings poll.
+  /// Defaults to granted so tests that build this struct by hand are unaffected.
+  var screenCaptureAccessGranted: @MainActor () -> Bool = { true }
 
   static let live = AudioMonitorDependencies(
     recorderFactory: LiveRecorderSessionFactory(),
@@ -193,6 +204,7 @@ struct AudioMonitorDependencies {
     now: { Date() },
     sleep: { duration in
       try? await Task.sleep(for: duration)
-    }
+    },
+    screenCaptureAccessGranted: { CGPreflightScreenCaptureAccess() }
   )
 }
