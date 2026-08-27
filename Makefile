@@ -77,8 +77,24 @@ test:
 
 smoke-install: install
 
+# The hardware suite needs things the machine only has one of: the real mic,
+# display capture, TCC grants, and a bundle ID LaunchServices treats as
+# singular. Concurrent runs produce spurious failures (observed: "Timed out
+# waiting for smoke state: recording saved" while another run was switching
+# the default output device), so runs serialize across worktrees.
+#
+# lockf(1) holds a kernel flock(2) for the life of the command, so a run
+# killed by -9 or a reboot leaves nothing behind to clean up. -k keeps the
+# lock file, which lockf(1) recommends whenever it is used for concurrency:
+# without it the unlink-on-release lets two processes hold locks on different
+# inodes at the same path.
+SMOKE_LOCK = /tmp/blackbox-smoke.lock
+
 smoke-test: bundle
-	BLACKBOX_RUN_HARDWARE_SMOKE=1 BLACKBOX_SMOKE_APP_PATH="$(PWD)/$(APP_BUNDLE)" swift test --disable-xctest
+	@/usr/bin/lockf -kt 0 $(SMOKE_LOCK) true 2>/dev/null || \
+	  echo "another Blackbox smoke run is active, waiting for it to finish..."
+	@/usr/bin/lockf -k $(SMOKE_LOCK) env BLACKBOX_RUN_HARDWARE_SMOKE=1 \
+	  BLACKBOX_SMOKE_APP_PATH="$(PWD)/$(APP_BUNDLE)" swift test --disable-xctest
 
 smoke: smoke-test
 
