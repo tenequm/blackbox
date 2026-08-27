@@ -257,6 +257,11 @@ protocol TranscriptionServicing: Sendable {
 
 nonisolated final class TranscriptionService: TranscriptionServicing {
   static let defaultModel = "stt-async-v5"
+  /// Offered in Settings. A free-text field meant a typo became a terminal
+  /// failure per recording, discovered one recording at a time and only after
+  /// an upload had already been paid for - while "Verify Key" happily reported
+  /// success, because it checks the key and not the model.
+  static let knownModels = ["stt-async-v5", "stt-async-preview"]
   static let defaultBaseURL = "https://api.soniox.com"
   static let providerName = "soniox"
 
