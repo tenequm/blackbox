@@ -318,7 +318,7 @@ struct SettingsView: View {
         keyCheckLabel
       }
       Text(
-        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription, and Blackbox deletes it from Soniox once the transcript comes back."
       )
       .font(.caption)
       .foregroundStyle(.secondary)

@@ -873,6 +873,9 @@ struct TranscriptionCoordinatorTests {
     #expect(coordinator.status(for: directory) == .idle)
   }
 
+  /// A control, not a regression test: it holds with the floor removed entirely,
+  /// because it asserts the absence of a behaviour. It catches an inverted
+  /// comparison, not a missing floor.
   @Test("a manual job is transcribed however short the recording is")
   func manualJobIgnoresDurationFloor() async throws {
     let harness = try TranscriptionHarness()
@@ -886,6 +889,7 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.uploadCount == 1)
   }
 
+  /// Also a control, for the same reason as the test above.
   @Test("an automatic job runs when the recording is long enough")
   func runsAutomaticJobAboveDurationFloor() async throws {
     let harness = try TranscriptionHarness()

@@ -501,7 +501,10 @@ final class TranscriptionCoordinator {
         // Deleted through `discardRemote` rather than awaited here: this task is
         // cancellable, and a cancel landing between the sidecar removal and the
         // DELETEs would strand the uploaded audio on Soniox with nothing left
-        // on disk that could name it.
+        // on disk that could name it. No test covers that race directly - one
+        // would have to hit a window between an HTTP response and the next
+        // executor hop - so this is defended by sharing `discardRemote` with the
+        // cancellation path, which is covered.
         releaseRemoteRecord(job, in: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
