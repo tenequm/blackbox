@@ -22,7 +22,7 @@ Last updated: 2026-08-27, after commit `a15bff1`.
 | # | Task | Status |
 |---|------|--------|
 | A | Land in-flight work: cancelWriting data loss, permission truth, 30s gate ordering, status enum + real progress, cancel state | **done** `a15bff1` |
-| B | Re-transcribe button (detail toolbar + row context menu) | todo |
+| B | Re-transcribe button (detail toolbar + row context menu) | **done** `9ebcc0c` |
 | C | Transcript: selectable/copyable text, always-readable contrast, auto-scroll, speed control, h:mm:ss timestamps | todo |
 | D | Scrubbing (`isDragging` never set) + rename `@FocusState` | todo |
 | E | Menu bar: saving state, error badge instead of hijack, timer clip past 1h, `0:60` countdown, mic-grant branch, pause auto-record, reveal in Finder, accessibility label, icon width (crash risk C1) | todo |

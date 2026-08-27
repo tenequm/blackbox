@@ -532,4 +532,5 @@ nonisolated enum SettingsKeys {
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
   static let sonioxAPIKey = "sonioxAPIKey"
+  static let playbackRate = "playbackRate"
 }

@@ -402,6 +402,12 @@ struct RecordingDetailView: View {
   @State private var showDeleteConfirmation = false
   @State private var showRetranscribeConfirmation = false
   @State private var isProcessingAEC = false
+  /// Set when the user scrolls the transcript themselves, so following the
+  /// playhead never yanks the view out from under them. Cleared by the
+  /// "Jump to current" button or by seeking.
+  @State private var isFollowSuspended = false
+  @State private var didCopyTranscript = false
+  @AppStorage(SettingsKeys.playbackRate) private var playbackRate: Double = 1
 
   // Metadata
   @State private var metadata: RecordingMetadata?
@@ -502,9 +508,17 @@ struct RecordingDetailView: View {
       HStack(spacing: 8) {
         if transcript != nil {
           Button {
+            copyTranscript()
+          } label: {
+            Image(systemName: didCopyTranscript ? "checkmark" : "doc.on.doc")
+          }
+          .accessibilityLabel("Copy Transcript")
+          .help("Copy the whole transcript")
+
+          Button {
             exportTranscript()
           } label: {
-            Image(systemName: "doc.text")
+            Image(systemName: "square.and.arrow.down")
           }
           .accessibilityLabel("Export Transcript")
           .help("Export Transcript")
@@ -534,6 +548,9 @@ struct RecordingDetailView: View {
               Image(systemName: "waveform.badge.magnifyingglass")
             }
           }
+          .accessibilityLabel(
+            isProcessingAEC ? "Removing echo" : "Remove Echo from Microphone Track"
+          )
           .help("Remove echo from mic track")
           .disabled(isProcessingAEC)
         }
@@ -543,6 +560,7 @@ struct RecordingDetailView: View {
         } label: {
           Image(systemName: "folder")
         }
+        .accessibilityLabel("Reveal in Finder")
         .help("Reveal in Finder")
 
         Button(role: .destructive) {
@@ -550,6 +568,7 @@ struct RecordingDetailView: View {
         } label: {
           Image(systemName: "trash")
         }
+        .accessibilityLabel("Delete Recording")
         .help("Delete")
       }
     }
@@ -577,9 +596,14 @@ struct RecordingDetailView: View {
       WaveformView(
         samples: waveformSamples,
         progress: duration > 0 ? currentTime / duration : 0,
-        onSeek: { fraction in
-          let time = fraction * duration
-          seekTo(time)
+        duration: duration,
+        onSeek: { fraction, isFinal in
+          // `isDragging` gates the 10 Hz time observer. It was declared and
+          // read but never assigned, so every observer tick overwrote the drag
+          // and the playhead snapped backwards under the cursor.
+          isDragging = !isFinal
+          seekTo(fraction * duration, exact: isFinal)
+          if isFinal { isFollowSuspended = false }
         }
       )
       .frame(height: 48)
@@ -590,23 +614,27 @@ struct RecordingDetailView: View {
           .foregroundStyle(.secondary)
         Spacer()
         if recording.hasProcessed {
-          Picker("", selection: $useProcessed) {
+          // Real titles rather than `Picker("")`: an empty label is not a
+          // hidden label, it is no accessibility name at all.
+          Picker("Audio", selection: $useProcessed) {
             Text("Original").tag(false)
-            Text("Processed").tag(true)
+            Text("Echo removed").tag(true)
           }
           .pickerStyle(.segmented)
-          .frame(width: 150)
+          .labelsHidden()
+          .fixedSize()
           .onChange(of: useProcessed) { _, _ in
             switchAudioSource()
           }
         }
-        Picker("", selection: $trackSelection) {
+        Picker("Voices", selection: $trackSelection) {
           ForEach(availableTrackSelections) { t in
             Text(t.label).tag(t)
           }
         }
         .pickerStyle(.segmented)
-        .frame(width: (metadata?.trackCount ?? 2) >= 3 ? 240 : 180)
+        .labelsHidden()
+        .fixedSize()
         .onChange(of: trackSelection) { _, newValue in
           applyTrackSelection(newValue)
         }
@@ -623,7 +651,9 @@ struct RecordingDetailView: View {
           Image(systemName: "gobackward.15")
             .font(.title3)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Skip Back 15 Seconds")
+        .help("Skip back 15 seconds")
 
         Button {
           togglePlayback()
@@ -631,7 +661,10 @@ struct RecordingDetailView: View {
           Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
             .font(.largeTitle)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
+        .accessibilityLabel(isPlaying ? "Pause" : "Play")
+        .accessibilityValue(isPlaying ? "Playing" : "Paused")
+        .help(isPlaying ? "Pause" : "Play")
 
         Button {
           skip(by: 15)
@@ -639,10 +672,44 @@ struct RecordingDetailView: View {
           Image(systemName: "goforward.15")
             .font(.title3)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Skip Forward 15 Seconds")
+        .help("Skip forward 15 seconds")
+
+        // Reviewing an hour-long call at 1x is the difference between a tool
+        // people use and one they abandon.
+        Menu {
+          Picker("Speed", selection: $playbackRate) {
+            ForEach(Self.playbackRates, id: \.self) { rate in
+              Text(Self.rateLabel(rate)).tag(rate)
+            }
+          }
+          .pickerStyle(.inline)
+          .labelsHidden()
+        } label: {
+          Text(Self.rateLabel(playbackRate))
+            .font(.caption.monospacedDigit())
+            .frame(minWidth: 34)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("Playback Speed")
+        .accessibilityValue(Self.rateLabel(playbackRate))
+        .help("Playback speed")
+        .onChange(of: playbackRate) { _, newValue in
+          // Only while playing: setting a non-zero rate on a paused player
+          // starts it.
+          if isPlaying { player?.rate = Float(newValue) }
+        }
       }
     }
     .padding()
+  }
+
+  private static let playbackRates: [Double] = [0.75, 1, 1.25, 1.5, 1.75, 2]
+
+  private static func rateLabel(_ rate: Double) -> String {
+    rate == rate.rounded() ? "\(Int(rate))x" : "\(rate)x"
   }
 
   private var activeAudioURL: URL {
@@ -736,14 +803,23 @@ struct RecordingDetailView: View {
     if isPlaying {
       player.pause()
     } else {
-      player.play()
+      // `rate` rather than `play()`, so resuming honours the chosen speed
+      // instead of silently snapping back to 1x.
+      player.rate = Float(playbackRate)
     }
     isPlaying = !isPlaying
   }
 
-  private func seekTo(_ time: TimeInterval) {
+  /// `exact` is false during a drag. A zero-tolerance seek per drag tick makes
+  /// the audio judder; one exact seek when the finger lifts is what the user
+  /// actually asked for.
+  private func seekTo(_ time: TimeInterval, exact: Bool = true) {
     let cmTime = CMTime(seconds: time, preferredTimescale: 600)
-    player?.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+    if exact {
+      player?.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+    } else {
+      player?.seek(to: cmTime)
+    }
     currentTime = time
   }
 
@@ -911,41 +987,91 @@ struct RecordingDetailView: View {
   }
 
   private func transcriptView(_ doc: TranscriptDocument) -> some View {
-    ScrollView {
-      LazyVStack(alignment: .leading, spacing: 12) {
-        ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
-          TranscriptSegmentView(
-            segment: segment,
-            speakerName: speakerName(for: segment.speaker),
-            isActive: isSegmentActive(at: index, in: doc),
-            onTap: { jumpTo(time: segment.time) },
-            onRenameSpeaker: { newName in
-              saveSpeakerName(newName, for: segment.speaker)
-            }
-          )
+    ScrollViewReader { proxy in
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 12) {
+          ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
+            TranscriptSegmentView(
+              segment: segment,
+              speakerName: speakerName(for: segment.speaker),
+              isActive: index == activeSegmentIndex,
+              onSeek: { jumpTo(time: segment.time) },
+              onRenameSpeaker: { newName in
+                saveSpeakerName(newName, for: segment.speaker)
+              }
+            )
+            .id(segment.id)
+          }
+        }
+        .padding()
+        // Long-form reading, not a data table: past roughly 700pt a line runs
+        // far enough that the eye loses its place returning to the next one.
+        .frame(maxWidth: 720, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
+      }
+      // Scrolling by hand stops the follow. Without this, reading back through
+      // a transcript while it plays is a fight with the scroll position.
+      .onScrollPhaseChange { _, phase in
+        if phase == .interacting { isFollowSuspended = true }
+      }
+      .overlay(alignment: .bottomTrailing) {
+        if isFollowSuspended, activeSegmentIndex != nil {
+          Button {
+            isFollowSuspended = false
+            scrollToActiveSegment(in: doc, proxy: proxy)
+          } label: {
+            Label("Jump to current", systemImage: "arrow.down.circle.fill")
+              .font(.caption)
+          }
+          .buttonStyle(.borderedProminent)
+          .padding()
         }
       }
-      .padding()
+      .onChange(of: activeSegmentIndex) { _, _ in
+        guard !isFollowSuspended else { return }
+        scrollToActiveSegment(in: doc, proxy: proxy)
+      }
     }
   }
 
-  /// Takes the index from the enclosing `ForEach`: this runs for every rendered
-  /// segment on every playback tick (10 Hz), so searching for the segment's own
-  /// position each time made it quadratic in transcript length.
-  private func isSegmentActive(at index: Int, in doc: TranscriptDocument) -> Bool {
-    guard isPlaying, doc.segments.indices.contains(index) else { return false }
-    let segment = doc.segments[index]
-    let nextTime: Double =
-      if index + 1 < doc.segments.count {
-        doc.segments[index + 1].time
+  /// Which segment the playhead is inside, or nil when it is past the end.
+  /// Computed once per tick rather than per row: asking each row "am I active?"
+  /// made highlighting quadratic in transcript length.
+  ///
+  /// Deliberately not gated on `isPlaying`. Pausing used to clear the highlight
+  /// entirely, which is precisely when the user wants to see where they are.
+  private var activeSegmentIndex: Int? {
+    guard let segments = transcript?.segments, !segments.isEmpty else { return nil }
+    // The playhead is normally inside or just past the previous match, so a
+    // linear scan from the start is wasteful but bounded; a binary search is
+    // the right shape and is what this is.
+    var low = 0
+    var high = segments.count - 1
+    var found: Int?
+    while low <= high {
+      let mid = (low + high) / 2
+      if segments[mid].time <= currentTime {
+        found = mid
+        low = mid + 1
       } else {
-        duration
+        high = mid - 1
       }
-    return currentTime >= segment.time && currentTime < nextTime
+    }
+    return found
+  }
+
+  private func scrollToActiveSegment(in doc: TranscriptDocument, proxy: ScrollViewProxy) {
+    guard let index = activeSegmentIndex, doc.segments.indices.contains(index) else { return }
+    withAnimation(.easeInOut(duration: 0.25)) {
+      proxy.scrollTo(doc.segments[index].id, anchor: .center)
+    }
   }
 
   private func jumpTo(time: Double) {
     seekTo(time)
+    // Clicking a timestamp is an explicit "take me here", so it re-engages
+    // following even if the user had scrolled away.
+    isFollowSuspended = false
     if !isPlaying { togglePlayback() }
   }
 
@@ -973,6 +1099,23 @@ struct RecordingDetailView: View {
   }
 
   // MARK: - Transcript Export
+
+  /// Plain text with speaker and timestamp, because that is what someone pastes
+  /// into a message or a doc. The JSON export stays for anything programmatic.
+  private func copyTranscript() {
+    guard let transcript, !transcript.segments.isEmpty else { return }
+    let body = transcript.segments.map { segment in
+      "[\(formatTime(segment.time))] \(speakerName(for: segment.speaker)): \(segment.text)"
+    }.joined(separator: "\n")
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(body, forType: .string)
+
+    didCopyTranscript = true
+    Task {
+      try? await Task.sleep(for: .seconds(2))
+      didCopyTranscript = false
+    }
+  }
 
   private func exportTranscript() {
     guard let transcript, !transcript.segments.isEmpty else { return }
@@ -1019,15 +1162,22 @@ struct RecordingDetailView: View {
 
 // MARK: - Transcript Segment View
 
+/// The row is deliberately NOT a `Button`. Wrapping it made the whole segment
+/// one tap target, which meant the transcript could not be selected or copied -
+/// the words were pixels. Seeking now lives on the timestamp, which is a
+/// discrete control, and the body text is ordinary selectable text.
 private struct TranscriptSegmentView: View {
   let segment: TranscriptSegment
   let speakerName: String
   let isActive: Bool
-  let onTap: () -> Void
+  let onSeek: () -> Void
   let onRenameSpeaker: (String) -> Void
 
+  @Environment(\.colorSchemeContrast) private var contrast
   @State private var showSpeakerPopover = false
   @State private var editedSpeakerName = ""
+  @FocusState private var speakerFieldFocused: Bool
+  @ScaledMetric(relativeTo: .caption) private var gutterWidth: CGFloat = 74
 
   private static let speakerColors: [Color] = [
     .blue, .green, .orange, .purple, .pink, .teal,
@@ -1037,66 +1187,104 @@ private struct TranscriptSegmentView: View {
 
   private var speakerColor: Color {
     if isLocalUser { return .accentColor }
-    return Self.speakerColors[segment.speaker % Self.speakerColors.count]
+    // `%` keeps the sign in Swift, so a negative speaker id from a hand-edited
+    // or corrupted sidecar indexed out of bounds and crashed the app.
+    let index = abs(segment.speaker) % Self.speakerColors.count
+    return Self.speakerColors[index]
   }
 
   var body: some View {
-    Button(action: onTap) {
-      HStack(alignment: .top, spacing: 10) {
-        VStack(alignment: .trailing, spacing: 2) {
+    HStack(alignment: .top, spacing: 10) {
+      VStack(alignment: .trailing, spacing: 2) {
+        Button {
+          editedSpeakerName = speakerName
+          showSpeakerPopover = true
+          speakerFieldFocused = true
+        } label: {
           Text(speakerName)
             .font(.caption.bold())
             .foregroundStyle(speakerColor)
-            .onTapGesture {
-              editedSpeakerName = speakerName
-              showSpeakerPopover = true
-            }
-            .popover(isPresented: $showSpeakerPopover) {
-              VStack(spacing: 8) {
-                Text("Speaker Name")
-                  .font(.caption.bold())
-                TextField(
-                  "Name", text: $editedSpeakerName,
-                  onCommit: {
-                    let trimmed = editedSpeakerName.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty {
-                      onRenameSpeaker(trimmed)
-                    }
-                    showSpeakerPopover = false
-                  }
-                )
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 140)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Rename speaker \(speakerName)")
+        .help("Rename this speaker")
+        .popover(isPresented: $showSpeakerPopover) {
+          VStack(spacing: 8) {
+            Text("Speaker Name")
+              .font(.caption.bold())
+            TextField("Name", text: $editedSpeakerName)
+              .textFieldStyle(.roundedBorder)
+              .frame(width: 140)
+              .focused($speakerFieldFocused)
+              .onSubmit {
+                let trimmed = editedSpeakerName.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { onRenameSpeaker(trimmed) }
+                showSpeakerPopover = false
               }
-              .padding(12)
-            }
+          }
+          .padding(12)
+        }
+
+        Button(action: onSeek) {
           Text(formatTimestamp(segment.time))
             .font(.caption2.monospacedDigit())
-            .foregroundStyle(.tertiary)
+            // Was `.tertiary`, which is under 3:1 at this size - and this is a
+            // functional control, not decoration.
+            .foregroundStyle(.secondary)
         }
-        .frame(width: 70, alignment: .trailing)
-
-        Text(segment.text)
-          .font(.body)
-          .foregroundStyle(isActive ? .primary : .secondary)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .fixedSize(horizontal: false, vertical: true)
+        .buttonStyle(.plain)
+        .accessibilityLabel("Play from \(formatTimestamp(segment.time))")
+        .help("Play from here")
       }
-      .padding(.vertical, 4)
-      .padding(.horizontal, 8)
-      .background(
-        isActive ? speakerColor.opacity(0.08) : Color.clear,
-        in: RoundedRectangle(cornerRadius: 6)
-      )
+      .frame(width: gutterWidth, alignment: .trailing)
+
+      Text(segment.text)
+        .font(.body)
+        // Always full contrast. This was `.secondary` for every inactive
+        // segment, and since "active" required playback to be running, a paused
+        // transcript - the normal reading state - was entirely grey.
+        .foregroundStyle(.primary)
+        .fontWeight(isActive ? .medium : .regular)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
     }
-    .buttonStyle(.plain)
+    .padding(.vertical, 4)
+    .padding(.horizontal, 8)
+    .background(
+      isActive ? speakerColor.opacity(contrast == .increased ? 0.22 : 0.10) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 6)
+    )
+    .overlay(alignment: .leading) {
+      // A non-colour cue for the active row: the tint alone is invisible under
+      // Increase Contrast and to a colourblind reader.
+      if isActive {
+        RoundedRectangle(cornerRadius: 2)
+          .fill(speakerColor)
+          .frame(width: 3)
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityAddTraits(isActive ? [.isSelected] : [])
+    .contextMenu {
+      Button("Copy") {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(segment.text, forType: .string)
+      }
+      Button("Play From Here", action: onSeek)
+    }
   }
 
   private func formatTimestamp(_ time: Double) -> String {
-    let total = Int(time)
-    let m = total / 60
+    let total = max(0, Int(time))
+    let h = total / 3600
+    let m = (total % 3600) / 60
     let s = total % 60
-    return String(format: "%d:%02d", m, s)
+    // Rolls to h:mm:ss past an hour. It used to emit "78:12" for a 78-minute
+    // call while the transport above it read "1:18:12".
+    return h > 0
+      ? String(format: "%d:%02d:%02d", h, m, s)
+      : String(format: "%d:%02d", m, s)
   }
 }
 
@@ -1137,7 +1325,12 @@ struct RecordingFile: Identifiable {
 private struct WaveformView: View {
   let samples: [Float]
   let progress: Double
-  let onSeek: (Double) -> Void
+  let duration: TimeInterval
+  let onSeek: (Double, _ isFinal: Bool) -> Void
+
+  @Environment(\.colorSchemeContrast) private var contrast
+
+  private var unplayedOpacity: Double { contrast == .increased ? 0.55 : 0.3 }
 
   var body: some View {
     GeometryReader { geo in
@@ -1158,7 +1351,8 @@ private struct WaveformView: View {
           let barHeight = max(2, amp * maxAmp)
           let x = CGFloat(i) * step
           let fraction = Double(i) / Double(barCount)
-          let color: Color = fraction <= progress ? .accentColor : .secondary.opacity(0.3)
+          let color: Color =
+            fraction <= progress ? .accentColor : .secondary.opacity(unplayedOpacity)
 
           let rect = CGRect(
             x: x,
@@ -1171,16 +1365,45 @@ private struct WaveformView: View {
             with: .color(color)
           )
         }
+
+        // An explicit playhead, so the played/unplayed boundary does not rest
+        // on colour alone.
+        let headX = size.width * progress
+        context.fill(
+          Path(CGRect(x: max(0, headX - 0.5), y: 0, width: 1.5, height: size.height)),
+          with: .color(.primary))
       }
       .contentShape(Rectangle())
       .gesture(
         DragGesture(minimumDistance: 0)
           .onChanged { value in
             let fraction = max(0, min(1, value.location.x / geo.size.width))
-            onSeek(fraction)
+            onSeek(fraction, false)
+          }
+          .onEnded { value in
+            let fraction = max(0, min(1, value.location.x / geo.size.width))
+            onSeek(fraction, true)
           }
       )
+      // A `Canvas` is invisible to VoiceOver and its only affordance was a drag,
+      // so scrubbing was mouse-only. As an adjustable element it is reachable
+      // with the arrow keys and announces where it is.
+      .accessibilityElement()
+      .accessibilityLabel("Playback Position")
+      .accessibilityValue(Self.timeDescription(progress * duration))
+      .accessibilityAdjustableAction { direction in
+        let step = 0.02
+        let next = direction == .increment ? progress + step : progress - step
+        onSeek(max(0, min(1, next)), true)
+      }
     }
+  }
+
+  private static func timeDescription(_ seconds: TimeInterval) -> String {
+    let total = max(0, Int(seconds))
+    let minutes = total / 60
+    let secs = total % 60
+    return "\(minutes) minutes \(secs) seconds"
   }
 }
 
