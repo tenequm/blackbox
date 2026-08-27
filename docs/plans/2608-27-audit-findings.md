@@ -11,28 +11,53 @@ Anything needing hardware or a runtime observation says so instead of asserting.
 
 ## Status
 
-All of this was fixed on `feat/ux-improvements`, which is PR #25:
+Fixed on `feat/ux-improvements` (PR #25), then re-reviewed and corrected in a
+second pass. **The first version of this section overstated what had landed** -
+T9 was listed as fixed when nothing about it had changed, and T2's row described
+a "2s re-ask" gate that was never shipped. Both are corrected below and in their
+own rows.
 
-**Fixed:** D1, D2, D3, D5, D6 (every data-loss item), C1, C3, T2, T5, T6, T7,
-T8, T9, and the whole user-experience and accessibility sections.
+**Fixed:** D1, D2, D3, D5, D6, C1, C3, T2 (the ordering only - the gate was
+deleted outright, not shortened), T5, T6, T7, T8, T9, plus the accessibility
+pass and most of the user-experience section.
 
-**Not fixed, and deliberately out of scope for that branch** - these want their
-own follow-up, roughly in this order:
+**Deliberately not fixed, and why:**
 
-- **P1** the waveform extractor: 0.5-1 GB per selection, uncancellable,
-  unserialized, uncached. The largest single item left.
-- **C4** the same extractor blocking cooperative-pool threads.
-- **S1-S4** the silent-capture-failure set: mic start failure swallowed, denied
-  mic producing a silent track, no detection of a flowing-but-silent system
-  track, and SCStream error codes falling through to a non-restarting `.other`.
-- **C2** `precondition` on a losing start/stop race.
-- **C5** unbounded spin in AEC backpressure.
-- **S6** Sparkle can relaunch mid-recording.
-- **T1**, **T3**, **T4**, **T10-T14**, **P2-P11**.
+- Everything in the capture path. `AudioRecorder`, the live `RecordingPipeline`
+  paths and the `AudioMonitor` stop/start sequencing were left alone on the
+  owner's instruction: that code was expensive to get right and is not worth
+  churning for cleanups. That defers, with evidence recorded in the review:
+  the unbounded `finishWriting` inside the 8s quit budget; a manual-stop-then-
+  quit sequence that can start a new recorder inside teardown (only with two or
+  more distinct callers); the fact that `movieFragmentInterval` protects
+  nothing until the first fragment flushes, so a hard kill in the first ~10s
+  leaves a non-empty unopenable file; the permission-denied retry loop; and the
+  now-consumerless `audioLevel` metering chain.
+- **P1/C4** the waveform extractor (0.5-1 GB per selection, uncancellable,
+  uncached, and running its decode loop on the cooperative pool). Confirmed
+  unchanged by this branch, and confirmed *not* made worse by it - multi-select
+  makes it strictly less reachable.
+- **S1-S4** the silent-capture-failure set, **C2**, **C5**, **S6**, **T1**,
+  **T3**, **T4**, **T10-T14**, **P2-P11**.
+- Residual UX items that were scope calls rather than oversights: no sort
+  control, no global hotkey, inverted menu-bar icon weights, the All/System/App/
+  Mic track vocabulary, and no string catalog.
 
----
+**Dropped on evidence during the review** (each was a real-looking claim that
+did not survive):
 
-# Data loss
+- The consent-dialog work was removed entirely, not fixed. It added friction for
+  a single-user app that sells nothing, and comparable tools prompt for none of
+  this. `acceptedTranscriptionTerms` and its sheet are gone.
+- A permanently un-quittable app via `isTerminating` - refuted by probe:
+  `reply(true)` always kills the process and this app never calls
+  `reply(false)`, so that branch is unreachable. A *different* hang was real and
+  is fixed: terminating from inside a main-queue block starves the main queue.
+- A killed AEC run leaving a non-empty unreadable `audio-processed.m4a` - no
+  longer reachable, because the scratch-file scheme means that artefact lands on
+  a filename nothing consults.
+- Unthrottled upload progress - measured at ~4 callbacks/second for a 20 MB
+  upload, because Foundation coalesces by time.
 
 ## D1. `cancelWriting` deletes the recording, and the code treats that as success [verified] - FIXED
 
@@ -254,14 +279,14 @@ terminates the app. All four hooks exist in the pinned Sparkle 2.9.6:
 | # | Finding | Location |
 |---|---------|----------|
 | T1 | Mic resampling adds 0.044% of samples per buffer on non-integer ratios - about 1.5s of desync per hour. 44.1kHz interfaces affected; 24k/16k are exact ratios, which is why AirPods testing never caught it. Needs hardware verification | `RecordingPipeline.swift:781`, `:813-820` |
-| T2 | The recording gate was a single blind 30s sleep with no early exit, and `reportRecordingSaved` fired before `updateAutoState` cleared `isRecording` - so every automatic job waited the full gate for a condition already false. **Fixed**: ordering swapped on both stop paths, gate is now a 2s re-ask | `AudioMonitor.swift:656`/`:658`, `TranscriptionCoordinator.swift:375` |
+| T2 | The recording gate was a single blind 30s sleep with no early exit, and `reportRecordingSaved` fired before `updateAutoState` cleared `isRecording` - so every automatic job waited the full gate for a condition already false. **Fixed**: ordering swapped on both stop paths, and the gate was deleted outright rather than shortened - `suspendNewJobs()` now does the quit-time deferral it happened to provide | `AudioMonitor.swift:378`/`:695`, `BlackboxApp.swift` |
 | T3 | Leading-silence fill is one-shot; the comment at `:735-737` claims callers reattempt, and they cannot - the branch is gated on `!nextExpected.isValid`, which is set unconditionally | `RecordingPipeline.swift:513-536` |
 | T4 | `.displayLost` restarts with no rate limit. If `-3815` fires while a display is still enumerable, `waitForDisplay` returns immediately and the loop is hot, creating a directory per iteration | `AudioMonitor.swift:686-688` |
 | T5 | Quit budget had zero headroom: 3s stream stop + 5s finish equalled the 8s allowance exactly, and two recorders stop serially. **Partly fixed** by D1 removing the 5s half | `BlackboxApp.swift:202` |
 | T6 | Export silently exports the 16kHz mono AEC output. Playback has an Original/Processed picker; export has no choice | `MainWindowView.swift:150`, `:196` |
 | T7 | Export to an existing file fails after the user agreed to replace it - `copyItem` throws on existing and NSSavePanel's Replace does not unlink | `TranscriptionService.swift:362`, `:368` |
 | T8 | A failed trash is a silent no-op, but the transcription job was already cancelled and its remote artifacts deleted | `MainWindowView.swift:229-242` |
-| T9 | Detail-view metadata is cached at `onAppear` and `.id(id)` does not change on rename, so a speaker rename reverts a sidebar rename | `MainWindowView.swift:391-395` |
+| T9 | Detail-view metadata is cached at `onAppear` and `.id(id)` does not change on rename, so a speaker rename reverts a sidebar rename. **Fixed** in the second pass, having been wrongly reported as fixed in the first: the view now reloads its cache on `recording.title`, and all three metadata writes go through one helper that surfaces a failed save | `MainWindowView.swift` `loadMetadata` / `writeMetadata` |
 | T10 | `RecordingPipeline.stop()` runs off `audioQueue` while the class comment claims all mutation happens on it. Currently safe only because `AudioRecorder` nils `self.pipeline` before the await - an undocumented invariant that `@unchecked Sendable` will never catch a regression against | `RecordingPipeline.swift:69-74`, `:301` |
 | T11 | A hung `stopCapture` abandons a live SCStream; the log line acknowledges it and nothing acts on it | `AudioRecorder.swift:396-414` |
 | T12 | Every start and restart re-runs `SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)`, the slow variant, uncached - implicated in the D13 ghost-recording incident | `AudioRecorder.swift:433-434` |
