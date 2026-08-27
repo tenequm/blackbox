@@ -1,9 +1,18 @@
 import AppKit
 import SwiftUI
 
+/// The text of a HUD toast, retained after dismissal so smoke tests can assert
+/// what was shown without racing the panel's display window.
+struct HUDToast: Equatable, Sendable {
+  var title: String
+  var subtitle: String
+}
+
 final class RecordingHUD {
   private var panel: HUDPanel?
   private var hideTask: Task<Void, Never>?
+  private(set) var lastToast: HUDToast?
+  private(set) var isToastVisible = false
 
   func showRecordingStarted(appName: String) {
     show(
@@ -79,6 +88,8 @@ final class RecordingHUD {
     }
 
     self.panel = panel
+    lastToast = HUDToast(title: content.title, subtitle: content.subtitle)
+    isToastVisible = true
 
     NSAccessibility.post(
       element: panel as Any, notification: .announcementRequested,
@@ -92,6 +103,7 @@ final class RecordingHUD {
   }
 
   private func dismiss() {
+    isToastVisible = false
     guard let panel else { return }
     self.panel = nil
     NSAnimationContext.runAnimationGroup { ctx in

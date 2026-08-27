@@ -94,17 +94,27 @@ final class FakeHUD: AudioMonitorHUD {
   private(set) var startedApps: [String] = []
   private(set) var savedApps: [String] = []
   private(set) var errors: [String] = []
+  private(set) var lastToast: HUDToast?
+  private(set) var isToastVisible = false
 
   func showRecordingStarted(appName: String) {
     startedApps.append(appName)
+    record(title: "Recording Started", subtitle: appName)
   }
 
   func showRecordingSaved(appName: String) {
     savedApps.append(appName)
+    record(title: "Recording Saved", subtitle: appName)
   }
 
   func showError(message: String) {
     errors.append(message)
+    record(title: "Error", subtitle: message)
+  }
+
+  private func record(title: String, subtitle: String) {
+    lastToast = HUDToast(title: title, subtitle: subtitle)
+    isToastVisible = true
   }
 }
 

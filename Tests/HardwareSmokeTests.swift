@@ -32,9 +32,13 @@ struct HardwareSmokeTests {
 
     let logMarker = Date()
     client.post(.startManualRecording)
-    _ = try await client.waitUntil(description: "manual recording started") { snapshot in
-      snapshot.isRecording && snapshot.isManualRecording
+    let startedSnapshot = try await client.waitUntil(description: "manual recording started") {
+      snapshot in
+      snapshot.isRecording && snapshot.isManualRecording && snapshot.hudTitle != nil
     }
+    #expect(startedSnapshot.hudTitle == "Recording Started")
+    #expect(startedSnapshot.hudSubtitle == "Manual recording")
+    #expect(startedSnapshot.hudVisible, "Start toast should still be on screen while recording")
 
     try client.playSystemAudioFixture()
     try? await Task.sleep(for: .seconds(4))
@@ -43,7 +47,9 @@ struct HardwareSmokeTests {
     client.post(.stopManualRecording)
     let finalSnapshot = try await client.waitUntil(description: "recording saved") { snapshot in
       !snapshot.isRecording && !snapshot.isSaving && snapshot.lastSavedRecordingPath != nil
+        && snapshot.hudTitle == "Recording Saved"
     }
+    #expect(finalSnapshot.hudSubtitle == "Manual recording")
 
     let recordingDir =
       try finalSnapshot.lastSavedRecordingPath.map(URL.init(fileURLWithPath:))
