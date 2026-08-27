@@ -79,9 +79,25 @@ jobs:
       # Exercises clone, download, hash and sed against the LAST published
       # release, which must produce no diff - the cask is already at that
       # version. Proves every step short of the push.
+      # Uses the real tap token, so a missing or expired one is caught here
+      # rather than at the cask step of an actual release - by which point the
+      # DMG is already published and the run goes red after the fact.
+      - name: Verify the tap token can write
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set - the cask step will be skipped at release time." >&2
+            exit 1
+          fi
+          push="$(gh api repos/tenequm/homebrew-tap -q .permissions.push)"
+          echo "push permission on tenequm/homebrew-tap: $push"
+          [ "$push" = "true" ] || { echo "token cannot push to the tap" >&2; exit 1; }
+
       - name: Dry-run the cask bump
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
           TAG: v0.9.3
         run: |
           set -euo pipefail
