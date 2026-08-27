@@ -42,6 +42,25 @@ final class RecordingHUD {
     )
   }
 
+  /// Shown while quit finalizes a recording. `LSUIElement` means there is no
+  /// Dock icon to carry a "quitting" state and the menu has already closed, so
+  /// without this the status item just sits there with a stale icon for up to
+  /// eight seconds. The natural read is that the app has hung, and the natural
+  /// response - Force Quit - is the one action that damages the file this code
+  /// is busy saving.
+  ///
+  /// No auto-hide: it is dismissed by the process exiting.
+  func showFinalizing() {
+    show(
+      content: HUDContentView(
+        title: "Saving Recording…",
+        subtitle: "Blackbox will quit when the file is written",
+        icon: NSApplication.shared.applicationIconImage
+      ),
+      duration: .infinity
+    )
+  }
+
   func showError(message: String) {
     show(
       content: HUDContentView(
@@ -76,10 +95,20 @@ final class RecordingHUD {
     panel.hidesOnDeactivate = false
     panel.contentView = hosting
     panel.onClick = onClick
+    // A toast with nothing to click must not swallow clicks. This panel sits in
+    // the top-right corner for seconds at a time, over whatever the user is
+    // doing - including a call app's own controls.
+    panel.ignoresMouseEvents = onClick == nil
 
-    if let screen = NSScreen.main {
+    // The screen under the pointer, not `NSScreen.main`: with no key window on
+    // a multi-display setup, `main` is not reliably the one being looked at.
+    let mouse = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+    if let screen {
       let x = screen.visibleFrame.maxX - size.width - 16
-      let y = screen.visibleFrame.maxY - size.height - 16
+      // Below the Notification Center banner zone, so the two do not stack on
+      // top of each other.
+      let y = screen.visibleFrame.maxY - size.height - 76
       panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
@@ -93,14 +122,25 @@ final class RecordingHUD {
     self.panel = panel
     lastToast = HUDToast(title: content.title, subtitle: content.subtitle)
 
+    // Both strings, and at high priority. Announcing only the title meant an
+    // error toast - whose whole message lives in the subtitle - said "Error"
+    // and nothing else, and unprioritized announcements are the ones VoiceOver
+    // drops first under load.
+    let announcement =
+      content.subtitle.isEmpty
+      ? content.title : "\(content.title). \(content.subtitle)"
     NSAccessibility.post(
-      element: panel as Any, notification: .announcementRequested,
-      userInfo: [.announcement: content.title])
+      element: NSApp as Any, notification: .announcementRequested,
+      userInfo: [
+        .announcement: announcement,
+        .priority: NSAccessibilityPriorityLevel.high.rawValue,
+      ])
 
-    hideTask = Task {
+    guard duration.isFinite else { return }
+    hideTask = Task { [weak self] in
       try? await Task.sleep(for: .seconds(duration))
       guard !Task.isCancelled else { return }
-      self.dismiss()
+      self?.dismiss()
     }
   }
 

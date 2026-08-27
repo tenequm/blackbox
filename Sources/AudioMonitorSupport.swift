@@ -60,6 +60,8 @@ protocol AudioMonitorHUD: AnyObject {
   func showRecordingStarted(appName: String)
   func showRecordingSaved(appName: String)
   func showError(message: String)
+  /// Shown for the duration of quit-time finalization; has no auto-hide.
+  func showFinalizing()
   var lastToast: HUDToast? { get }
 }
 

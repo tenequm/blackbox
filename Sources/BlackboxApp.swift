@@ -41,31 +41,101 @@ struct BlackboxApp: App {
     delegate.transcriptionCoordinator = coordinator
   }
 
+  /// Every branch draws its icon at the same fixed width, and the icon does not
+  /// change with audio level.
+  ///
+  /// Both of those are load-bearing. The label used to pick between `waveform`,
+  /// `waveform.mid` and `waveform.low` from `audioLevel`, which is published
+  /// four times a second - three glyphs of different widths meant the status
+  /// item re-laid-out at 4 Hz with an oscillating intrinsic width for the whole
+  /// recording. That is the documented shape of an intermittent
+  /// `_postWindowNeedsUpdateConstraints` crash, and under `LSUIElement` such a
+  /// crash is invisible: the icon simply disappears and the user goes on
+  /// believing the call is being captured. `symbolEffect(.variableColor)` gives
+  /// the liveness the level-driven glyph was there for, without the relayout.
+  @ViewBuilder private var menuBarLabel: some View {
+    let iconWidth: CGFloat = 16
+    if monitor.isRecording {
+      HStack(spacing: 4) {
+        // Recording state wins the icon even when there is an error. A benign,
+        // self-healing status like "Display slept - resuming recording..."
+        // used to replace the glyph with a bare warning triangle for ten
+        // seconds while capture continued perfectly well, which reads as "my
+        // recording just died".
+        Image(
+          systemName: monitor.errorMessage != nil ? "waveform.badge.exclamationmark" : "waveform"
+        )
+        .symbolEffect(.variableColor, isActive: monitor.errorMessage == nil)
+        .frame(width: iconWidth)
+        if let grace = monitor.graceCountdown {
+          Text(Self.countdownText(grace))
+            .monospacedDigit()
+            .frame(minWidth: 32, alignment: .leading)
+        } else if let elapsed = monitor.formattedElapsed {
+          // `minWidth`, not a hard `width`: the old fixed 38pt clipped
+          // "1:02:33" exactly when a user most wants to know how long they have
+          // been recording, and clipped far sooner at accessibility text sizes.
+          Text(elapsed)
+            .monospacedDigit()
+            .frame(minWidth: 38, alignment: .leading)
+        }
+      }
+      .accessibilityLabel(accessibilityStatus)
+      .help(accessibilityStatus)
+    } else if monitor.isSaving {
+      Image(systemName: "waveform.circle")
+        .symbolEffect(.pulse)
+        .frame(width: iconWidth)
+        .accessibilityLabel("Blackbox - saving recording")
+        .help("Saving recording")
+    } else if monitor.permissionNeeded || monitor.errorMessage != nil {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .frame(width: iconWidth)
+        .accessibilityLabel(accessibilityStatus)
+        .help(accessibilityStatus)
+    } else {
+      Image(systemName: "waveform.circle.fill")
+        .frame(width: iconWidth)
+        .accessibilityLabel("Blackbox - idle")
+        .help("Blackbox - not recording")
+    }
+  }
+
+  /// The menu bar item's whole meaning is its glyph, so it needs a name.
+  private var accessibilityStatus: String {
+    if monitor.permissionNeeded {
+      return "Blackbox - screen recording permission required"
+    }
+    if monitor.isRecording {
+      let app = monitor.currentAppName ?? "audio"
+      let elapsed = monitor.formattedElapsed.map { ", \($0) elapsed" } ?? ""
+      if let error = monitor.errorMessage {
+        return "Blackbox - recording \(app)\(elapsed). \(error)"
+      }
+      return "Blackbox - recording \(app)\(elapsed)"
+    }
+    if let error = monitor.errorMessage { return "Blackbox - \(error)" }
+    return "Blackbox - idle"
+  }
+
+  /// Rolls over correctly at the top of the range. The old
+  /// `String(format: "0:%02d", …)` hardcoded the minutes digit, so the maximum
+  /// grace period of 60s rendered as "0:60".
+  private static func countdownText(_ remaining: TimeInterval) -> String {
+    let total = max(0, Int(ceil(remaining)))
+    return String(format: "%d:%02d", total / 60, total % 60)
+  }
+
   var body: some Scene {
     MenuBarExtra {
       MenuContent(monitor: monitor, updater: updaterController.updater, selectedTab: $selectedTab)
     } label: {
-      if monitor.permissionNeeded || monitor.errorMessage != nil {
-        Image(systemName: "exclamationmark.triangle.fill")
-      } else if monitor.isRecording {
-        if let grace = monitor.graceCountdown {
-          HStack(spacing: 4) {
-            Image(systemName: "waveform.circle")
-            Text(String(format: "0:%02d", Int(ceil(grace))))
-              .frame(width: 32, alignment: .leading)
-          }
-        } else {
-          HStack(spacing: 4) {
-            Image(systemName: recordingWaveformIcon(level: monitor.audioLevel))
-            if let elapsed = monitor.formattedElapsed {
-              Text(elapsed)
-                .frame(width: 38, alignment: .leading)
-            }
-          }
-        }
-      } else {
-        Image(systemName: "waveform.circle.fill")
-      }
+      menuBarLabel
+      // Zero-sized, and here rather than in the window because the status item
+      // is the one view alive for the whole process. `openWindow` exists only
+      // in a view's environment, and the delegate - which owns the toast-click
+      // observer - has no environment of its own.
+      OpenWindowRegistrar(delegate: delegate)
     }
     .menuBarExtraStyle(.menu)
 
@@ -75,6 +145,9 @@ struct BlackboxApp: App {
     }
     .defaultSize(width: 700, height: 500)
     .defaultPosition(.center)
+    // A background recorder should not shove its window in front of the user at
+    // every login just because it happened to be open at quit.
+    .restorationBehavior(.disabled)
 
     Window("About Blackbox", id: "about") {
       AboutView()
@@ -86,11 +159,16 @@ struct BlackboxApp: App {
   final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var monitor: AudioMonitor?
     var transcriptionCoordinator: TranscriptionCoordinator?
+    /// Set by the app body so the toast can reach the same window-opening path
+    /// the menu uses.
+    var openMainWindow: (() -> Void)?
     private var onboardingWindow: NSWindow?
     private var testController: BlackboxTestController?
+    private var openWindowObserver: (any NSObjectProtocol)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       installCrashHandler()
+      observeToastClicks()
       if !BlackboxTestMode.isEnabled {
         launchWatchdog()
       }
@@ -120,6 +198,27 @@ struct BlackboxApp: App {
 
       if willOnboard {
         showOnboarding()
+      }
+    }
+
+    /// Lives on the delegate, which is alive for the whole process.
+    ///
+    /// This observer used to hang off `.onReceive` on the Quit button inside
+    /// `MenuContent`. With `.menuBarExtraStyle(.menu)` that content is only
+    /// materialized while the menu is open - and the "Recording Saved" toast
+    /// fires when a recording ends, which is precisely when the menu is closed.
+    /// So the app's most discoverable affordance, "I just recorded something,
+    /// take me to it", was a no-op in normal use.
+    private func observeToastClicks() {
+      openWindowObserver = NotificationCenter.default.addObserver(
+        forName: RecordingHUD.openMainWindowNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          self?.openMainWindow?()
+          NSApplication.shared.activate()
+        }
       }
     }
 
@@ -174,7 +273,7 @@ struct BlackboxApp: App {
       window.contentView = hosting
       window.center()
       window.makeKeyAndOrderFront(nil)
-      NSApplication.shared.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate()
       onboardingWindow = window
     }
 
@@ -187,33 +286,76 @@ struct BlackboxApp: App {
       onboardingWindow = nil
     }
 
+    /// Instance state, not a local. The menu bar stays fully interactive during
+    /// the `.terminateLater` window, so a second quit - the menu item pressed
+    /// twice, a logout Apple Event, Sparkle - re-enters this method. A local
+    /// flag gives each invocation its own, and both can then call
+    /// `reply(toApplicationShouldTerminate:)`, which is unbalanced and
+    /// undefined.
+    private var hasRepliedToTerminate = false
+    private var isTerminating = false
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+      guard !isTerminating else { return .terminateLater }
+      isTerminating = true
       testController?.stop()
-      if !BlackboxTestMode.isEnabled {
-        UserDefaults.standard.set(false, forKey: "processRunning")
-      }
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
+        if !BlackboxTestMode.isEnabled {
+          UserDefaults.standard.set(false, forKey: "processRunning")
+        }
         return .terminateNow
       }
       Log.info(Log.app, "app", "terminating, cleaning up recordings")
-      var hasReplied = false
-      let timeoutTask = Task {
+      // No Dock icon to carry a "quitting" state and the menu has already
+      // closed, so a recording that takes seconds to finalize looks like a
+      // hang. The user's next move is Force Quit, which is the one thing that
+      // damages the file being written.
+      if monitor.isRecording || monitor.isSaving {
+        monitor.showFinalizingToast()
+      }
+      let timeoutTask = Task { [weak self] in
         try? await Task.sleep(for: .seconds(8))
-        guard !Task.isCancelled, !hasReplied else { return }
-        hasReplied = true
+        guard !Task.isCancelled, self?.hasRepliedToTerminate == false else { return }
+        self?.hasRepliedToTerminate = true
         Log.error(Log.app, "app", "termination cleanup timed out after 8s")
+        self?.markCleanExit()
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
-      Task {
+      Task { [weak self] in
         await monitor.stopMonitoring()
         timeoutTask.cancel()
-        guard !hasReplied else { return }
-        hasReplied = true
+        guard self?.hasRepliedToTerminate == false else { return }
+        self?.hasRepliedToTerminate = true
+        self?.markCleanExit()
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
       }
       return .terminateLater
     }
+
+    /// Written from the reply paths rather than on entry. Clearing it first
+    /// meant a crash *during* the eight-second cleanup - the riskiest moment in
+    /// the process - was recorded as a clean exit.
+    private func markCleanExit() {
+      guard !BlackboxTestMode.isEnabled else { return }
+      UserDefaults.standard.set(false, forKey: "processRunning")
+    }
+  }
+}
+
+// MARK: - Window Opener
+
+/// Hands the delegate a way to open the main window. Draws nothing.
+private struct OpenWindowRegistrar: View {
+  let delegate: BlackboxApp.AppDelegate
+  @Environment(\.openWindow) private var openWindow
+
+  var body: some View {
+    Color.clear
+      .frame(width: 0, height: 0)
+      .onAppear {
+        delegate.openMainWindow = { openWindow(id: "main") }
+      }
   }
 }
 
@@ -223,8 +365,12 @@ struct MenuContent: View {
   let monitor: AudioMonitor
   let updater: SPUUpdater
   @Binding var selectedTab: MainTab
-  @Environment(\.dismiss) private var dismiss
   @Environment(\.openWindow) private var openWindow
+  /// Written straight to defaults; `AudioMonitor` picks it up on its next
+  /// settings pass, the same way the Settings window's toggle works.
+  @AppStorage(SettingsKeys.autoRecord) private var autoRecord = true
+  @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
+    defaultSaveDirectoryPath
 
   var body: some View {
     // Primary action
@@ -240,7 +386,14 @@ struct MenuContent: View {
       Button("Record Now") {
         monitor.startManualRecording()
       }
+      .keyboardShortcut("r")
     }
+
+    // The realistic case is a call the user does not want recorded, decided
+    // seconds before it starts. Without this the options were: open the window,
+    // find Settings, toggle, remember to toggle back - or quit the app and
+    // forget to relaunch it, silently losing every recording afterwards.
+    Toggle("Record Calls Automatically", isOn: $autoRecord)
 
     Divider()
 
@@ -257,10 +410,29 @@ struct MenuContent: View {
         )
       }
     } else if monitor.micPermissionNeeded {
-      Text("Microphone permission needed for manual recordings")
+      // Both recording paths use the microphone, not just manual ones - a user
+      // who read the old wording concluded their automatic call recordings were
+      // fine without it, and they are not: they would be missing their own
+      // voice.
+      Text("Microphone permission needed - recordings will not include your voice")
         .foregroundStyle(.orange)
-      Button("Grant Microphone Access") {
-        Task { await AVCaptureDevice.requestAccess(for: .audio) }
+      // `requestAccess` silently does nothing once the user has denied, so the
+      // button offered to fix the problem did nothing at all and got clicked
+      // repeatedly. Prompt only where a prompt is possible; otherwise send them
+      // where the switch actually is.
+      if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+        Button("Grant Microphone Access") {
+          Task { await AVCaptureDevice.requestAccess(for: .audio) }
+        }
+      } else {
+        Button("Open System Settings…") {
+          NSWorkspace.shared.open(
+            URL(
+              string:
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
+            )!
+          )
+        }
       }
     } else if let errorMsg = monitor.errorMessage {
       Text(errorMsg)
@@ -279,17 +451,26 @@ struct MenuContent: View {
     Divider()
 
     Button("Open Blackbox") {
-      selectedTab = .recordings
+      // Deliberately does not force the tab: reopening from the menu used to
+      // discard whichever tab the user had been on.
       openWindow(id: "main")
-      NSApplication.shared.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate()
     }
     .keyboardShortcut("o")
+
+    // The app's output is files on disk, and there was no one-click route to
+    // them from the menu.
+    Button("Reveal Recordings in Finder") {
+      NSWorkspace.shared.selectFile(
+        monitor.lastSavedRecordingURL?.path,
+        inFileViewerRootedAtPath: saveDirectoryPath)
+    }
 
     Divider()
 
     Button("About Blackbox") {
       openWindow(id: "about")
-      NSApplication.shared.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate()
     }
 
     Button("Check for Updates...") {
@@ -303,7 +484,7 @@ struct MenuContent: View {
     Button("Settings...") {
       selectedTab = .settings
       openWindow(id: "main")
-      NSApplication.shared.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate()
     }
     .keyboardShortcut(",", modifiers: .command)
 
@@ -313,13 +494,6 @@ struct MenuContent: View {
       NSApplication.shared.terminate(nil)
     }
     .keyboardShortcut("q")
-    .onReceive(
-      NotificationCenter.default.publisher(for: RecordingHUD.openMainWindowNotification)
-    ) { _ in
-      selectedTab = .recordings
-      openWindow(id: "main")
-      NSApplication.shared.activate(ignoringOtherApps: true)
-    }
   }
 
 }

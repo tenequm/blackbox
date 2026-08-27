@@ -271,6 +271,16 @@ private struct RecordingRow: View {
   @Environment(TranscriptionCoordinator.self) private var transcription
   @State private var isEditing = false
   @State private var editedTitle = ""
+  @FocusState private var titleFieldFocused: Bool
+
+  /// Focus has to be requested explicitly. Swapping in a `TextField` does not
+  /// make it first responder, so renaming used to present a caret-less field
+  /// that swallowed the first thing you typed.
+  private func beginRename() {
+    editedTitle = recording.title
+    isEditing = true
+    titleFieldFocused = true
+  }
 
   /// Each stage gets its own glyph rather than one shared spinner: in this row
   /// the indicator is the only signal a recording is being transcribed at all,
@@ -330,27 +340,24 @@ private struct RecordingRow: View {
     VStack(alignment: .leading, spacing: 4) {
       HStack {
         if isEditing {
-          TextField(
-            "Title", text: $editedTitle,
-            onCommit: {
+          TextField("Title", text: $editedTitle)
+            .onSubmit {
               let trimmed = editedTitle.trimmingCharacters(in: .whitespaces)
               if !trimmed.isEmpty {
                 onRename(trimmed)
               }
               isEditing = false
             }
-          )
-          .textFieldStyle(.plain)
-          .lineLimit(1)
-          .onExitCommand { isEditing = false }
+            .focused($titleFieldFocused)
+            .textFieldStyle(.plain)
+            .lineLimit(1)
+            .onExitCommand { isEditing = false }
         } else {
           Text(recording.title)
             .lineLimit(1)
             .truncationMode(.middle)
-            .onTapGesture(count: 2) {
-              editedTitle = recording.title
-              isEditing = true
-            }
+            .help(recording.title)
+            .onTapGesture(count: 2) { beginRename() }
         }
         if recording.hasProcessed {
           Image(systemName: "waveform.badge.magnifyingglass")
@@ -412,6 +419,7 @@ struct RecordingDetailView: View {
   // Metadata
   @State private var metadata: RecordingMetadata?
   @State private var isEditingTitle = false
+  @FocusState private var titleFieldFocused: Bool
   @State private var editedTitle = ""
 
   // Transcription
@@ -473,26 +481,23 @@ struct RecordingDetailView: View {
     HStack {
       VStack(alignment: .leading, spacing: 4) {
         if isEditingTitle {
-          TextField(
-            "Title", text: $editedTitle,
-            onCommit: {
+          TextField("Title", text: $editedTitle)
+            .onSubmit {
               let trimmed = editedTitle.trimmingCharacters(in: .whitespaces)
               if !trimmed.isEmpty {
                 saveTitle(trimmed)
               }
               isEditingTitle = false
             }
-          )
-          .font(.headline)
-          .textFieldStyle(.plain)
-          .onExitCommand { isEditingTitle = false }
+            .focused($titleFieldFocused)
+            .font(.headline)
+            .textFieldStyle(.plain)
+            .onExitCommand { isEditingTitle = false }
         } else {
           Text(recording.title)
             .font(.headline)
-            .onTapGesture(count: 2) {
-              editedTitle = recording.title
-              isEditingTitle = true
-            }
+            .onTapGesture(count: 2) { beginRename() }
+            .help("Double-click to rename")
         }
         HStack(spacing: 8) {
           Text(recording.date.formatted(.dateTime.year().month().day().hour().minute()))
@@ -868,6 +873,12 @@ struct RecordingDetailView: View {
 
   private func loadMetadata() {
     metadata = RecordingMetadata.load(in: recording.url)
+  }
+
+  private func beginRename() {
+    editedTitle = recording.title
+    isEditingTitle = true
+    titleFieldFocused = true
   }
 
   private func saveTitle(_ newTitle: String) {

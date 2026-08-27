@@ -142,6 +142,12 @@ final class AudioMonitor {
     recordingStartTime = nil
   }
 
+  /// Quit-time only. The delegate has no HUD of its own, and a second instance
+  /// would fight this one for the panel.
+  func showFinalizingToast() {
+    dependencies.hud.showFinalizing()
+  }
+
   // MARK: - Error
 
   func clearError() { errorMessage = nil }
