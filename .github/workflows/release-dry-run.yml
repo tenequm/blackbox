@@ -95,11 +95,17 @@ jobs:
           .github/scripts/bump-cask.sh
           git checkout Info.plist
 
-      - name: Verify release-please would update Info.plist
+      # release-please reads its config over the API from the target branch, not
+      # from the checkout, so this has to name the branch under test - on main
+      # the default is correct and the flag is unnecessary.
+      - name: Verify release-please can parse the config
+        env:
+          TARGET_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           npx --yes release-please@latest release-pr \
             --repo-url=tenequm/blackbox \
+            --target-branch="$TARGET_BRANCH" \
             --config-file=.github/release-please-config.json \
             --manifest-file=.github/.release-please-manifest.json \
             --token="${{ github.token }}" \
