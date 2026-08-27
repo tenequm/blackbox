@@ -99,12 +99,14 @@ nonisolated enum TranscriptionStatus: Equatable, Sendable {
 nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
   case uploadFailed(String)
   case transcriptionFailed(String)
+  case serverError(Int, String)
   case pollTimeout
 
   var errorDescription: String? {
     switch self {
     case .uploadFailed(let msg): "Upload failed: \(msg)"
     case .transcriptionFailed(let msg): "Transcription failed: \(msg)"
+    case .serverError(let code, let msg): "Soniox error \(code): \(msg)"
     case .pollTimeout: "Transcription timed out"
     }
   }
@@ -112,7 +114,23 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
 
 // MARK: - Soniox API Client
 
-final class TranscriptionService {
+/// Stage-level transcription API. `TranscriptionCoordinator` drives the state
+/// machine, so a job interrupted by quit or a network failure resumes from its
+/// persisted stage instead of re-uploading.
+protocol TranscriptionServicing: Sendable {
+  /// Mixes multi-track audio into a single file when needed, uploads it, and
+  /// returns the remote file id.
+  func upload(fileURL: URL) async throws -> String
+  func createTranscription(fileId: String) async throws -> String
+  func awaitCompletion(
+    transcriptionId: String,
+    onStatus: @escaping @Sendable (TranscriptionStatus) -> Void
+  ) async throws
+  func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
+  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async
+}
+
+nonisolated final class TranscriptionService: TranscriptionServicing {
   private let apiKey: String
   private static let baseURL = "https://api.soniox.com"
 
@@ -120,55 +138,28 @@ final class TranscriptionService {
     self.apiKey = apiKey
   }
 
-  /// Transcribes an audio file. For dual-track recordings (system audio + mic),
-  /// tracks are mixed into a single file first so Soniox can diarize speakers
-  /// from the combined audio, producing proper speaker separation and timestamps.
-  func transcribe(
-    fileURL: URL,
-    onStatus: @escaping (TranscriptionStatus) -> Void
-  ) async throws -> TranscriptDocument {
+  /// For dual-track recordings (system audio + mic), tracks are mixed into a
+  /// single file first so Soniox can diarize speakers from the combined audio,
+  /// producing proper speaker separation and timestamps.
+  @concurrent
+  func upload(fileURL: URL) async throws -> String {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-    var uploadURL = fileURL
-    var needsCleanup = false
+    guard tracks.count >= 2 else { return try await uploadFile(fileURL) }
 
-    if tracks.count >= 2 {
-      Log.info(
-        Log.transcription, "transcription",
-        "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
-      uploadURL = try await Self.mixTracks(from: fileURL)
-      needsCleanup = true
-    }
-
-    defer {
-      if needsCleanup {
-        try? FileManager.default.removeItem(at: uploadURL)
-      }
-    }
-
-    onStatus(.uploading)
-    let fileId = try await uploadFile(uploadURL)
-    var transcriptionId: String?
-
-    do {
-      onStatus(.queued)
-      transcriptionId = try await createTranscription(fileId: fileId, enableDiarization: true)
-      try await pollUntilComplete(transcriptionId: transcriptionId!, onStatus: onStatus)
-      let doc = try await fetchTranscript(transcriptionId: transcriptionId!)
-      onStatus(.completed)
-      fireAndForgetCleanup(transcriptionIds: [transcriptionId!], fileIds: [fileId])
-      return doc
-    } catch {
-      fireAndForgetCleanup(
-        transcriptionIds: [transcriptionId].compactMap { $0 }, fileIds: [fileId])
-      throw error
-    }
+    Log.info(
+      Log.transcription, "transcription",
+      "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
+    let mixedURL = try await Self.mixTracks(from: fileURL)
+    defer { try? FileManager.default.removeItem(at: mixedURL) }
+    return try await uploadFile(mixedURL)
   }
 
   // MARK: - Audio Mixing & Export
 
   /// Mixes all audio tracks into a single-track M4A for unified transcription/export.
+  @concurrent
   static func mixTracks(from fileURL: URL) async throws -> URL {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -216,6 +207,7 @@ final class TranscriptionService {
   }
 
   /// Exports a single-track M4A copy. Mixes tracks first if multi-track.
+  @concurrent
   static func exportM4A(from fileURL: URL, to outputURL: URL) async throws {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -231,6 +223,7 @@ final class TranscriptionService {
 
   // MARK: - Upload
 
+  @concurrent
   private func uploadFile(_ fileURL: URL) async throws -> String {
     let boundary = UUID().uuidString
     let filename = fileURL.lastPathComponent
@@ -295,17 +288,13 @@ final class TranscriptionService {
 
   // MARK: - Create Transcription
 
-  private func createTranscription(
-    fileId: String, enableDiarization: Bool
-  ) async throws -> String {
-    var config: [String: Any] = [
+  func createTranscription(fileId: String) async throws -> String {
+    let config: [String: Any] = [
       "model": "stt-async-v5",
       "file_id": fileId,
       "enable_language_identification": true,
+      "enable_speaker_diarization": true,
     ]
-    if enableDiarization {
-      config["enable_speaker_diarization"] = true
-    }
 
     var request = try makeRequest(.post, "/v1/transcriptions")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -325,9 +314,9 @@ final class TranscriptionService {
 
   // MARK: - Poll
 
-  private func pollUntilComplete(
+  func awaitCompletion(
     transcriptionId: String,
-    onStatus: @escaping (TranscriptionStatus) -> Void
+    onStatus: @escaping @Sendable (TranscriptionStatus) -> Void
   ) async throws {
     var didReportTranscribing = false
 
@@ -373,7 +362,7 @@ final class TranscriptionService {
 
   // MARK: - Fetch Transcript
 
-  private func fetchTranscript(
+  func fetchTranscript(
     transcriptionId: String
   ) async throws -> TranscriptDocument {
     let request = try makeRequest(
@@ -452,18 +441,10 @@ final class TranscriptionService {
 
   // MARK: - Cleanup
 
-  private func fireAndForgetCleanup(transcriptionIds: [String], fileIds: [String]) {
-    let key = apiKey
-    Task.detached {
-      await TranscriptionService.cleanup(
-        transcriptionIds: transcriptionIds, fileIds: fileIds, apiKey: key)
-    }
-  }
-
-  nonisolated private static func cleanup(
-    transcriptionIds: [String], fileIds: [String], apiKey: String
-  ) async {
-    let base = "https://api.soniox.com"
+  /// Best-effort removal of the remote file and transcription so the account
+  /// does not accumulate artifacts. Failures are ignored by design.
+  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
+    let base = Self.baseURL
     for tId in transcriptionIds {
       guard let url = URL(string: "\(base)/v1/transcriptions/\(tId)") else { continue }
       var req = URLRequest(url: url)
@@ -514,8 +495,10 @@ final class TranscriptionService {
       } else {
         apiMsg = "HTTP \(http.statusCode)"
       }
-      throw TranscriptionError.transcriptionFailed(
-        "\(context): \(apiMsg)")
+      if http.statusCode >= 500 || http.statusCode == 429 {
+        throw TranscriptionError.serverError(http.statusCode, "\(context): \(apiMsg)")
+      }
+      throw TranscriptionError.transcriptionFailed("\(context): \(apiMsg)")
     }
   }
 }

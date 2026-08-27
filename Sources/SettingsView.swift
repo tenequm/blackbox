@@ -18,6 +18,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnError") private var notifyOnError = true
   @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+  @AppStorage("autoTranscribe") private var autoTranscribe = false
 
   @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -292,6 +293,14 @@ struct SettingsView: View {
       SecureField("Soniox API Key", text: $sonioxAPIKey)
       Text(
         "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
+        .disabled(sonioxAPIKey.isEmpty)
+      Text(
+        "Every finished recording is uploaded to Soniox as soon as it is saved, with no further prompt. Leave this off to transcribe one recording at a time from its detail view."
       )
       .font(.caption)
       .foregroundStyle(.secondary)

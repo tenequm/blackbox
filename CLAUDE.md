@@ -13,6 +13,8 @@ Sources/
   AudioRecorder.swift                      - SCStream (system audio) + AVAudioEngine (mic), dual-track capture
   RecordingPipeline.swift                  - AVAssetWriter management, gap filling, tail padding, audio level metering
   AECProcessor.swift                       - DTLN-aec CoreML post-processing: echo cancellation on mic track
+  TranscriptionService.swift               - Soniox stage-level client (upload/create/poll/fetch), TranscriptDocument sidecar
+  TranscriptionCoordinator.swift           - App-level transcription queue: auto-trigger, one job at a time, resumable job sidecar
   BlackboxTestMode.swift                   - Test mode flags (--ui-test-mode), IPC types for smoke tests
   BlackboxTestController.swift             - File-based IPC controller for smoke test automation
   MainWindowView.swift                     - Main window: TabView with Recordings table + Settings
@@ -28,6 +30,7 @@ Tests/
   AudioMonitorIntegrationTests.swift       - AudioMonitor integration tests with fake dependencies
   RecordingPipelineIntegrationTests.swift  - RecordingPipeline file output, gap fill, tail padding tests
   AudioRecorderRaceTests.swift             - Start/stop race tests (live SCK gated by BLACKBOX_RUN_LIVE_SCK)
+  TranscriptionCoordinatorTests.swift      - Trigger decision, queueing, retry/failure, cancel, launch resume (fake Soniox client)
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
   Fixtures/Recordings/                     - Reference recordings for AEC regression tests
@@ -127,6 +130,8 @@ self-updates. Both steps are covered by the release-dmg skill file.
 - **RecordingPipeline** (`@unchecked Sendable`) handles AVAssetWriter management, gap filling, tail padding, and audio level metering. Extracted from AudioRecorder for testability. All access serialized by AudioRecorder's `audioQueue` - the pipeline has no internal synchronization. `nonisolated(unsafe)` state is safe because AudioRecorder guarantees single-threaded access.
 - **AudioMonitor dependency injection**: `AudioMonitorDependencies` struct injects all external dependencies (recorder factory, HUD, settings, clock, sleep, process query). Enables deterministic testing via `MonitorHarness` with `TestClock` and `TestRecorderFactory`. `RecorderSession` protocol abstracts over `AudioRecorder` for test doubles.
 - **2-track M4A**: Track 0 = system audio (2ch stereo 48kHz 128 kbps AAC, SCStream buffers appended directly). Track 1 = mic (1ch mono 48kHz 64 kbps AAC, resampled/downmixed via `resampleToMono48k`). Session starts on whichever track delivers the first sample. Gap fill (D8), leading silence, and tail padding run on the mic track only (v0.6.0 parity). Legacy 3-track recordings (pre-v0.7.0) remain playable.
+- **Transcription is app-level, not view-level.** `TranscriptionCoordinator` (`@Observable`, MainActor, created in `BlackboxApp` and injected into the window environment) owns every transcription; the detail view only observes it. One job runs at a time, and each job's stage is persisted to a `transcription-job.json` sidecar in the recording directory so an interrupted job resumes by polling the existing `transcriptionId` instead of re-uploading. Auto-trigger fires through `AudioMonitorDependencies.onRecordingSaved`, which every `stop()` returning a URL funnels into - including recorder failures and the quit path. Gated on the `autoTranscribe` setting (default off) plus a Keychain API key. Jobs are held while a recording is active. Nothing on this path may join `applicationShouldTerminate`'s 8s budget. See D14 in `docs/specification.md`.
+- **Path spelling is load-bearing.** Transcription status is keyed by recording-directory path. `FileManager.contentsOfDirectory(at:)` resolves symlinks in its base and returns a different spelling than the recorder produces, so directory scans enumerate by name (`contentsOfDirectory(atPath:)`) and build child URLs from the caller's base.
 - **Echo cancellation post-processing**: User-triggered, not automatic - the only call site is `runAEC()` in `MainWindowView.swift`, invoked from the recordings table. DTLN-aec CoreML (256-unit model) processes the mic track using the system audio track (track 0) as the AEC reference and writes `audio-processed.m4a` alongside the original; errors are logged and the original is never modified. The decode loop runs on `AECProcessor.workQueue`, never on the Swift cooperative pool: `AVAssetReader.copyNextSampleBuffer` blocks its thread and delivers via libdispatch, so running it on the pool deadlocks once every pool thread is parked inside it.
 - **`applicationShouldTerminate` returns `.terminateLater`** to allow async cleanup (stop AVAudioEngine, stop SCStream capture, finalize AVAssetWriter) before process exit. 8-second timeout with `hasReplied` flag to prevent double-reply race.
 - **Auto-recovery**: `RecorderFailure` enum categorizes stream errors (system stopped, permission denied). AudioMonitor auto-restarts on recoverable failures.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Transcribe recordings automatically. Turn on "Transcribe recordings automatically" in Settings > Transcription and every finished call is sent to Soniox as soon as it is saved, with the transcript waiting when you open it. Off by default and unavailable without an API key, because it means your call audio leaves the machine every time. Transcription is now owned by the app rather than by the recording window, so a transcript keeps going when you close the window, queues up behind whatever is already running, and picks up where it left off after a quit or a crash instead of re-uploading. Recordings that end because of a permission loss or a quit are transcribed too, not just cleanly stopped ones.
+
+### Changed
+
+- The recordings list shows transcription progress and failures per recording, and a failed transcription can be retried from the recording itself.
+- Uploading and mixing audio for transcription no longer runs on the main thread, so the app stays responsive while a long recording is being prepared. Transcription also waits while a call is being recorded, so it never competes with the recorder for the machine.
+
 ## [0.9.3] - 2026-08-20
 
 ### Fixed

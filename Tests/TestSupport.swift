@@ -255,6 +255,7 @@ final class MonitorHarness {
   var activeCallers: [String?] = []
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
   private(set) var permissionLostNotifications = 0
+  private(set) var savedRecordings: [URL] = []
 
   func makeMonitor() -> AudioMonitor {
     AudioMonitor(
@@ -288,6 +289,9 @@ final class MonitorHarness {
         },
         sleep: { [clock] duration in
           await clock.sleep(for: duration)
+        },
+        onRecordingSaved: { [weak self] url in
+          self?.savedRecordings.append(url)
         }
       ))
   }

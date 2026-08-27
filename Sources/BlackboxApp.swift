@@ -6,7 +6,8 @@ import SwiftUI
 @main
 struct BlackboxApp: App {
   @NSApplicationDelegateAdaptor private var delegate: AppDelegate
-  @State private var monitor = AudioMonitor()
+  @State private var monitor: AudioMonitor
+  @State private var transcriptionCoordinator: TranscriptionCoordinator
   @State private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
@@ -14,8 +15,21 @@ struct BlackboxApp: App {
   init() {
     LogFile.rotateIfNeeded()
     Log.info(Log.app, "app", "launched")
-    // Set monitor reference on delegate for graceful shutdown and startup.
+
+    let coordinator = TranscriptionCoordinator()
+    var dependencies = AudioMonitorDependencies.live
+    dependencies.onRecordingSaved = { [weak coordinator] url in
+      coordinator?.recordingFinished(audioFileURL: url)
+    }
+    let monitor = AudioMonitor(dependencies: dependencies)
+    coordinator.isRecordingActive = { [weak monitor] in monitor?.isRecording ?? false }
+
+    _monitor = State(initialValue: monitor)
+    _transcriptionCoordinator = State(initialValue: coordinator)
+
+    // Set references on delegate for graceful shutdown and startup.
     delegate.monitor = monitor
+    delegate.transcriptionCoordinator = coordinator
   }
 
   var body: some Scene {
@@ -48,6 +62,7 @@ struct BlackboxApp: App {
 
     Window("Blackbox", id: "main") {
       MainWindowView(selectedTab: $selectedTab)
+        .environment(transcriptionCoordinator)
     }
     .defaultSize(width: 700, height: 500)
     .defaultPosition(.center)
@@ -61,6 +76,7 @@ struct BlackboxApp: App {
 
   final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var monitor: AudioMonitor?
+    var transcriptionCoordinator: TranscriptionCoordinator?
     private var onboardingWindow: NSWindow?
     private var testController: BlackboxTestController?
 
@@ -90,6 +106,8 @@ struct BlackboxApp: App {
       // Start monitoring AFTER the onboarding decision so the fallback
       // permission requests don't race with the onboarding UI.
       monitor?.startMonitoring(skipPermissionRequests: willOnboard)
+      // Pick up anything a previous session left mid-flight.
+      transcriptionCoordinator?.resumePendingJobs()
 
       if willOnboard {
         showOnboarding()

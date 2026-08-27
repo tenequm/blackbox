@@ -120,12 +120,12 @@ final class AudioMonitor {
     let manualTask = manualStartTask
 
     if let recorder = autoRecorder {
-      _ = await recorder.stop()
+      reportRecordingSaved(await recorder.stop())
       autoRecorder = nil
     }
 
     if let recorder = manualRecorder {
-      _ = await recorder.stop()
+      reportRecordingSaved(await recorder.stop())
       manualRecorder = nil
       isManualRecording = false
     }
@@ -276,7 +276,7 @@ final class AudioMonitor {
     savingCount += 1
     isSaving = true
     Task {
-      _ = await failedRecorder.stop()
+      reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0
     }
@@ -307,6 +307,14 @@ final class AudioMonitor {
     }
   }
 
+  /// Announces a recording that reached disk. Every `stop()` that can return a
+  /// URL funnels through here so post-processing sees failure-ended and
+  /// quit-time recordings too, not just the two clean stop paths.
+  private func reportRecordingSaved(_ url: URL?) {
+    guard let url else { return }
+    dependencies.onRecordingSaved(url)
+  }
+
   func forceStopAutoRecording() {
     cancelGracePeriod()
     stopAutoRecording(suppressBundleAfterStop: true)
@@ -331,6 +339,7 @@ final class AudioMonitor {
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
+        reportRecordingSaved(url)
       }
       updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
@@ -644,6 +653,7 @@ final class AudioMonitor {
       if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
+        reportRecordingSaved(url)
       }
       updateAutoState()
     }
@@ -661,7 +671,7 @@ final class AudioMonitor {
     savingCount += 1
     isSaving = true
     Task {
-      _ = await failedRecorder.stop()
+      reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0
     }

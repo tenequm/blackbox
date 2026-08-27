@@ -379,3 +379,23 @@ File-size trade-off: stereo 128 kbps vs mono 64 kbps means the system track roug
 **Monitor cooperation:** `AudioMonitor` tracks the in-flight `start()` Task per recorder kind (`autoStartTask`, `manualStartTask`). The Task body uses an identity guard (`autoRecorder === recorder`) before promoting state, so a stop-during-startup race lands silently in the catch path - no error toast on legit user-initiated stop. `RecorderError.cancelled` and lost-race conditions are matched as silent. `stopMonitoring` snapshots both start tasks before awaiting recorder stops, then awaits the Task bodies so the 8 s termination budget covers the full unwind.
 
 **Suppression:** After a user-initiated stop (manual stop, force-stop on auto), `AudioMonitor` records the resolved parent bundle ID in `suppressedBundleID: String?`. `evaluateCallState` filters that bundle out of the eligible-caller set; suppression clears the first poll the bundle disappears from the full caller set. Grace-expiry stops do not suppress - the bundle has already left, and re-detection should be free to record again. Single-bundle by design: covers the reported Chrome case; multi-bundle suppression is speculative and out of scope.
+
+### D14: Auto-transcription - app-level coordinator with a resumable job sidecar
+
+**Decision:** Transcription is owned by `TranscriptionCoordinator`, an `@Observable` MainActor object created in `BlackboxApp` and injected into the window's environment. It runs one job at a time and persists each job's stage to a `transcription-job.json` sidecar inside the recording directory. `TranscriptionService` exposes stage-level calls (`upload` -> `createTranscription` -> `awaitCompletion` -> `fetchTranscript` -> `deleteRemote`) behind the `TranscriptionServicing` protocol; the coordinator drives the state machine.
+
+**Why:** Transcription previously lived in `RecordingDetailView` as `@State`, with `.onDisappear` cancelling the task - closing the window killed the job, and an automatic trigger had nowhere to live. Splitting the service into stages is what makes the sidecar useful: a job interrupted after upload resumes by polling the existing `transcriptionId` instead of paying for a second upload.
+
+**Trigger:** `AudioMonitorDependencies.onRecordingSaved` fires for every `stop()` that returns a URL - the two clean stop paths, both recorder-failure paths, and the quit path - so a recording ended by a permission revocation or by quitting is transcribed like any other. The monitor itself stays independent: the default hook is a no-op, and `BlackboxApp` is the only place that wires it to the coordinator. Auto-transcription additionally requires the `autoTranscribe` setting (default off) and a Soniox key in the Keychain; the manual button in the detail view routes through the same coordinator and ignores the setting.
+
+**Which audio file:** `audio-processed.m4a` when echo cancellation has been run, otherwise `audio.m4a`, resolved at job run time rather than enqueue time. One rule, matching what the detail view plays back, and it lets a resumed job pick up an AEC pass that finished in between.
+
+**Failure policy:** Offline is a wait, not a failure - it retries on a fixed interval without consuming an attempt. Transient failures (5xx, 429, `pollTimeout`, dropped connections) retry three times with 30s/2m/8m backoff. Everything else is terminal: the sidecar is kept with `lastError` set so the recording row shows the failure and the detail view offers a retry, and launch resume deliberately surfaces those jobs instead of re-running them - spending another upload is the user's call. A transcript that cannot be written to disk is reported as a failure rather than retried, because the paid-for result is already in hand.
+
+**Quit:** Nothing on this path joins `applicationShouldTerminate`'s 8s budget. An in-flight job dies with the process and is picked up by `resumePendingJobs()` on the next launch.
+
+**Backpressure:** Jobs are held while a recording is active (`isRecordingActive`, late-bound because the monitor and the coordinator are constructed together). Mixing re-encodes the whole file; a live call must never compete with it for CPU or disk.
+
+**Path spelling:** Job status is keyed by recording-directory path, so every URL in the app has to spell that path the same way. `FileManager.contentsOfDirectory(at:)` resolves symlinks in its base and returns a different spelling than the recorder produces; both the coordinator's resume scan and `RecordingsView.loadRecordings` therefore enumerate by name and build child URLs from the caller's base.
+
+**Consent:** Audio leaves the machine on every recording once this is on, so the setting is opt-in, defaults off, is disabled without an API key, and says plainly what it does.

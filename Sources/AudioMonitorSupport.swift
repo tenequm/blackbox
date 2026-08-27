@@ -106,6 +106,11 @@ struct AudioMonitorDependencies {
   var findActiveCallingProcesses: @MainActor () -> [String?]
   var now: @MainActor () -> Date
   var sleep: @Sendable (Duration) async -> Void
+  /// Called with the saved audio file for every recording that reaches disk,
+  /// including ones ended by a recorder failure or by quit. Wired to the
+  /// transcription coordinator in `BlackboxApp`; a no-op by default so the
+  /// monitor stays independent of it.
+  var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
 
   static let live = AudioMonitorDependencies(
     recorderFactory: LiveRecorderSessionFactory(),
