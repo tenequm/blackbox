@@ -32,6 +32,13 @@ final class AudioMonitor {
   // returns slowly.
   private var autoStartTask: Task<Void, Never>?
   private var manualStartTask: Task<Void, Never>?
+  /// Every in-flight `recorder.stop()`. The four stop paths nil their recorder
+  /// and then launch an unstructured Task to do the stopping, so
+  /// `stopMonitoring()` - which only awaited the recorders themselves - was
+  /// awaiting two fields that were already nil. Stop a recording, quit within a
+  /// second or two, and the process exited mid-`finishWriting`, leaving a file
+  /// with no `moov` atom.
+  private var savingTasks: [UUID: Task<Void, Never>] = [:]
   // After a user-initiated stop (manual stop, or force-stop on auto), suppress
   // auto-restart of the same parent bundle until it disappears from the caller
   // set for one poll. Single-bundle: covers the reported Chrome case;
@@ -136,6 +143,11 @@ final class AudioMonitor {
     // so applicationShouldTerminate's 8s budget is honored.
     await autoTask?.value
     await manualTask?.value
+
+    // And for any stop already in flight when quit arrived. Bounded by the same
+    // stream-stop timeout the recorder already applies, so this cannot blow the
+    // termination budget on its own.
+    for task in savingTasks.values { await task.value }
 
     isRecording = false
     currentAppName = nil
@@ -283,7 +295,7 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0
@@ -315,6 +327,25 @@ final class AudioMonitor {
     }
   }
 
+  /// Runs a recorder stop as a tracked task, so `stopMonitoring()` can await it.
+  ///
+  /// The body has to be registered *and* removed from inside the task, because
+  /// the `Task` value does not exist until its initializer returns - by which
+  /// time a short body may already have finished. Inserting after the fact
+  /// would then leave a completed task in the set forever.
+  private func trackSaving(_ body: @escaping @MainActor () async -> Void) {
+    let id = UUID()
+    // Keyed by id rather than by the task itself: the `Task` value does not
+    // exist until its initializer returns, so a task cannot remove itself from
+    // a set it is not yet in. The assignment lands first regardless - this is
+    // main-actor code, so the body cannot start until the current synchronous
+    // region yields.
+    savingTasks[id] = Task { @MainActor in
+      await body()
+      savingTasks[id] = nil
+    }
+  }
+
   /// Announces a recording that reached disk. Every `stop()` that can return a
   /// URL funnels through here so post-processing sees failure-ended and
   /// quit-time recordings too, not just the two clean stop paths.
@@ -340,7 +371,7 @@ final class AudioMonitor {
     stopElapsedTimer()
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
@@ -659,7 +690,7 @@ final class AudioMonitor {
     Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
@@ -685,7 +716,7 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       reportRecordingSaved(await failedRecorder.stop())
       savingCount -= 1
       isSaving = savingCount > 0

@@ -14,6 +14,39 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
 
   static let fileName = "metadata.json"
 
+  init(
+    title: String, createdAt: Date, appName: String, speakers: [String: String],
+    perAppBundleID: String? = nil, perAppName: String? = nil, trackCount: Int? = nil
+  ) {
+    self.title = title
+    self.createdAt = createdAt
+    self.appName = appName
+    self.speakers = speakers
+    self.perAppBundleID = perAppBundleID
+    self.perAppName = perAppName
+    self.trackCount = trackCount
+  }
+
+  /// Hand-written for the same reason `TranscriptionJob`'s is: the synthesized
+  /// decoder throws on a missing key rather than falling back to the property's
+  /// default, and `load` swallows that with `try?`. Adding one non-optional
+  /// field would therefore make every metadata file a previous build wrote
+  /// undecodable at once - and the three rename paths rebuild a fresh record
+  /// from `load(...) ?? RecordingMetadata(...)` and write it back, so a single
+  /// unreadable decode plus one rename permanently loses the title, the date and
+  /// every speaker name. Every key is optional here so the format stays
+  /// additive.
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    appName = try container.decodeIfPresent(String.self, forKey: .appName) ?? ""
+    speakers = try container.decodeIfPresent([String: String].self, forKey: .speakers) ?? [:]
+    perAppBundleID = try container.decodeIfPresent(String.self, forKey: .perAppBundleID)
+    perAppName = try container.decodeIfPresent(String.self, forKey: .perAppName)
+    trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
+  }
+
   static func load(in directory: URL) -> RecordingMetadata? {
     let url = directory.appendingPathComponent(fileName)
     guard let data = try? Data(contentsOf: url) else { return nil }
@@ -90,6 +123,30 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   /// something to label them with.
   var provider: String?
   var model: String?
+
+  init(
+    segments: [TranscriptSegment], language: String? = nil, createdAt: Date,
+    provider: String? = nil, model: String? = nil
+  ) {
+    self.segments = segments
+    self.language = language
+    self.createdAt = createdAt
+    self.provider = provider
+    self.model = model
+  }
+
+  /// Hand-written for the same reason as `RecordingMetadata`'s. Here the cost of
+  /// an undecodable file is a paid-for transcript vanishing from the detail
+  /// view, the user pressing Transcribe, and the intact file being overwritten
+  /// by a re-billed one.
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
+    language = try container.decodeIfPresent(String.self, forKey: .language)
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    provider = try container.decodeIfPresent(String.self, forKey: .provider)
+    model = try container.decodeIfPresent(String.self, forKey: .model)
+  }
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
     recordingURL.appendingPathComponent("transcript.json")

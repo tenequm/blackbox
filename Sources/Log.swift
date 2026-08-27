@@ -69,9 +69,13 @@ nonisolated enum LogFile {
       let line = "\(timestamp) [\(level)] [\(category)] \(message)\n"
       guard let data = line.data(using: .utf8) else { return }
       if let handle = try? FileHandle(forWritingTo: file) {
-        handle.seekToEndOfFile()
-        handle.write(data)
-        handle.closeFile()
+        // `try?` on the throwing overload, not the non-throwing `write(_:)`.
+        // That one raises an ObjC exception on ENOSPC, which nothing catches -
+        // so a disk that filled mid-recording killed the process with SIGABRT
+        // on the next log line.
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+        try? handle.close()
       } else {
         fm.createFile(atPath: file.path, contents: data)
       }

@@ -825,6 +825,36 @@ struct TranscriptionCoordinatorTests {
 
   // MARK: Sidecar format
 
+  /// The job sidecar was hardened against this and these two were not, which is
+  /// worse: the three rename paths rebuild metadata from
+  /// `load(...) ?? RecordingMetadata(fresh)` and write it back, so one
+  /// unreadable decode plus one rename permanently loses the title, the date and
+  /// every speaker name.
+  @Test("a metadata file written before a field existed still decodes")
+  func metadataDecodesWithMissingKeys() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"title":"Standup","appName":"Zoom"}"#
+    try Data(json.utf8).write(to: directory.appendingPathComponent(RecordingMetadata.fileName))
+
+    let loaded = try #require(RecordingMetadata.load(in: directory))
+    #expect(loaded.title == "Standup")
+    #expect(loaded.appName == "Zoom")
+    #expect(loaded.speakers.isEmpty)
+  }
+
+  @Test("a transcript written before a field existed still decodes")
+  func transcriptDecodesWithMissingKeys() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"segments":[{"speaker":1,"time":0,"text":"hello"}]}"#
+    try Data(json.utf8).write(to: TranscriptDocument.sidecarURL(for: directory))
+
+    let loaded = try #require(TranscriptDocument.load(for: directory))
+    #expect(loaded.segments.count == 1)
+    #expect(loaded.segments.first?.text == "hello")
+  }
+
   @Test("a job sidecar written before a field existed still decodes")
   func decodesSidecarMissingNewerFields() throws {
     // Exactly what an earlier build wrote. The synthesized decoder throws on a
