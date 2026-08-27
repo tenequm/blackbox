@@ -456,13 +456,18 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
+    // NSSavePanel's "Replace" confirmation does not remove the target, and
+    // `copyItem` throws on an existing file - so agreeing to replace produced a
+    // "file exists" error and left the old file untouched.
     guard tracks.count >= 2 else {
+      try? FileManager.default.removeItem(at: outputURL)
       try FileManager.default.copyItem(at: fileURL, to: outputURL)
       return
     }
     // Reuses the already-loaded asset rather than re-parsing the container.
     let mixed = try await mix(asset: asset, tracks: tracks)
     defer { try? FileManager.default.removeItem(at: mixed) }
+    try? FileManager.default.removeItem(at: outputURL)
     try FileManager.default.copyItem(at: mixed, to: outputURL)
   }
 

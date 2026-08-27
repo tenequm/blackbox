@@ -10,7 +10,6 @@ struct BlackboxApp: App {
   // rejects pairing a declaration initial value with assignment in an initializer.
   @State private var monitor: AudioMonitor
   @State private var transcriptionCoordinator: TranscriptionCoordinator
-  @State private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
@@ -128,7 +127,7 @@ struct BlackboxApp: App {
 
   var body: some Scene {
     MenuBarExtra {
-      MenuContent(monitor: monitor, updater: updaterController.updater, selectedTab: $selectedTab)
+      MenuContent(monitor: monitor, updater: updaterController.updater)
     } label: {
       menuBarLabel
       // Zero-sized, and here rather than in the window because the status item
@@ -140,19 +139,55 @@ struct BlackboxApp: App {
     .menuBarExtraStyle(.menu)
 
     Window("Blackbox", id: "main") {
-      MainWindowView(selectedTab: $selectedTab)
+      RecordingsView()
         .environment(transcriptionCoordinator)
+        .frame(minWidth: 700, minHeight: 450)
     }
-    .defaultSize(width: 700, height: 500)
+    .defaultSize(width: 900, height: 600)
     .defaultPosition(.center)
     // A background recorder should not shove its window in front of the user at
     // every login just because it happened to be open at quit.
     .restorationBehavior(.disabled)
-
-    Window("About Blackbox", id: "about") {
-      AboutView()
+    .commands {
+      // Menu-item shortcuts on a `MenuBarExtra` only fire while that menu is
+      // open, so the app had no working Cmd+, from the window a user was
+      // actually looking at, and no Cmd+W, Cmd+Delete or Cmd+F at all.
+      CommandGroup(replacing: .appInfo) {
+        Button("About Blackbox") {
+          NSApplication.shared.orderFrontStandardAboutPanel(nil)
+        }
+      }
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") {
+          NSApplication.shared.activate()
+          updaterController.updater.checkForUpdates()
+        }
+      }
+      CommandMenu("Recording") {
+        Button("Record Now") { monitor.startManualRecording() }
+          .keyboardShortcut("r")
+          .disabled(monitor.isRecording)
+        Button("Stop Recording") {
+          if monitor.isManualRecording {
+            monitor.stopManualRecording()
+          } else {
+            monitor.forceStopAutoRecording()
+          }
+        }
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .disabled(!monitor.isRecording)
+      }
     }
-    .windowResizability(.contentSize)
+
+    // A real Settings scene rather than a tab inside the library window. Cmd+,
+    // is reserved by the system and is muscle memory; it did nothing here. This
+    // also lets the recordings window's sidebar own the titlebar, which a
+    // `TabView` wrapped around a `NavigationSplitView` cannot.
+    Settings {
+      SettingsView()
+        .environment(transcriptionCoordinator)
+        .frame(width: 560)
+    }
 
   }
 
@@ -255,11 +290,27 @@ struct BlackboxApp: App {
       NSSetUncaughtExceptionHandler(uncaughtExceptionHandler)
     }
 
-    private func showOnboarding() {
+    /// Also reachable from the menu, not only on a failed preflight at launch.
+    /// A user who dismissed the welcome window with the X - the reflex for an
+    /// unexpected window - could never see it again, and it is the only place
+    /// the app explains that it does not record your screen.
+    func showOnboarding() {
+      if let existing = onboardingWindow {
+        existing.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate()
+        return
+      }
       let onboarding = OnboardingView(onComplete: { [weak self] in
-        let window = self?.onboardingWindow
-        self?.onboardingWindow = nil  // Clear first so windowWillClose guard fails
-        window?.close()
+        // Close first, drop the reference on the next turn. Releasing the
+        // window inside a SwiftUI action hosted by that very window's content
+        // view deallocates the hosting view mid-unwind.
+        guard let window = self?.onboardingWindow else { return }
+        self?.isDismissingOnboarding = true
+        window.close()
+        DispatchQueue.main.async {
+          self?.onboardingWindow = nil
+          self?.isDismissingOnboarding = false
+        }
       })
       let hosting = NSHostingView(rootView: onboarding)
       let window = NSWindow(
@@ -277,12 +328,12 @@ struct BlackboxApp: App {
       onboardingWindow = window
     }
 
+    private var isDismissingOnboarding = false
+
     func windowWillClose(_ notification: Notification) {
-      guard let window = notification.object as? NSWindow, window === onboardingWindow else {
-        return
-      }
-      // User closed onboarding via X button - mark complete so it doesn't nag
-      UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+      guard !isDismissingOnboarding,
+        let window = notification.object as? NSWindow, window === onboardingWindow
+      else { return }
       onboardingWindow = nil
     }
 
@@ -364,7 +415,6 @@ private struct OpenWindowRegistrar: View {
 struct MenuContent: View {
   let monitor: AudioMonitor
   let updater: SPUUpdater
-  @Binding var selectedTab: MainTab
   @Environment(\.openWindow) private var openWindow
   /// Written straight to defaults; `AudioMonitor` picks it up on its next
   /// settings pass, the same way the Settings window's toggle works.
@@ -477,14 +527,16 @@ struct MenuContent: View {
       updater.checkForUpdates()
     }
 
+    Button("Setup Assistant…") {
+      (NSApplication.shared.delegate as? BlackboxApp.AppDelegate)?.showOnboarding()
+    }
+
     Button("Report a Bug") {
       NSWorkspace.shared.open(URL(string: "https://github.com/tenequm/blackbox/issues/new")!)
     }
 
-    Button("Settings...") {
-      selectedTab = .settings
-      openWindow(id: "main")
-      NSApplication.shared.activate()
+    SettingsLink {
+      Text("Settings…")
     }
     .keyboardShortcut(",", modifiers: .command)
 
