@@ -118,11 +118,11 @@ jobs:
           sudo sqlite3 "$SYS" "SELECT service,client,auth_value FROM access WHERE client LIKE '%Blackbox%';" 2>&1
           sudo sqlite3 "$USR" "SELECT service,client,auth_value FROM access WHERE client LIKE '%Blackbox%';" 2>&1
 
-      - name: Does the app see the grant
+      - name: Full hardware suite
         continue-on-error: true
         run: |
           BLACKBOX_RUN_HARDWARE_SMOKE=1 BLACKBOX_SMOKE_APP_PATH="$PWD/build/Blackbox.app" \
-            swift test --disable-xctest --filter idleAppStartsNoCapture 2>&1 | tail -30
+            swift test --disable-xctest --filter HardwareSmokeTests 2>&1 | rg -v '^\[[0-9]+/' | tail -60
 
       - name: App log
         if: always()
