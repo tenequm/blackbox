@@ -276,7 +276,8 @@ struct RecordingsView: View {
       panel.canChooseDirectories = true
       panel.canCreateDirectories = true
       panel.prompt = "Export"
-      panel.message = "Choose a folder to export \(selected.count) recordings as M4A"
+      panel.message =
+        "Choose a folder to export \(selected.count) \(selected.count == 1 ? "recording" : "recordings") as M4A"
       guard panel.runModal() == .OK, let dest = panel.url else { return }
       Task {
         var failed = 0
@@ -290,7 +291,8 @@ struct RecordingsView: View {
           }
         }
         if failed > 0 {
-          exportError = "Failed to export \(failed) of \(selected.count) recordings"
+          exportError =
+            "Failed to export \(failed) of \(selected.count) \(selected.count == 1 ? "recording" : "recordings")"
         }
       }
     }
@@ -398,6 +400,23 @@ private struct RecordingRow: View {
     }
   }
 
+  /// One utterance per row rather than four loose elements, and it carries the
+  /// transcription state, which was otherwise conveyed only by a spinner.
+  private var accessibilityDescription: String {
+    var parts = [recording.title, recording.date.formatted(date: .abbreviated, time: .shortened)]
+    if recording.hasTranscript { parts.append("transcribed") }
+    if recording.hasProcessed { parts.append("echo removed") }
+    let status = transcription.status(for: recording.url)
+    if status.isActive { parts.append(Self.statusText(status)) }
+    return parts.joined(separator: ", ")
+  }
+
+  private static func rowDateFormat(for date: Date) -> Date.FormatStyle {
+    Calendar.current.isDate(date, equalTo: Date(), toGranularity: .year)
+      ? .dateTime.month().day().hour().minute()
+      : .dateTime.year().month().day().hour().minute()
+  }
+
   /// Shared with the detail view so a row and the pane it opens can never
   /// describe the same job differently.
   static func statusText(_ status: TranscriptionStatus) -> String {
@@ -453,7 +472,9 @@ private struct RecordingRow: View {
         transcriptionIndicator
       }
       HStack {
-        Text(recording.date, format: .dateTime.month().day().hour().minute())
+        // Relative for recent items and year-qualified beyond this one: a call
+        // from last March was indistinguishable from one this March.
+        Text(recording.date, format: Self.rowDateFormat(for: recording.date))
         Spacer()
         Text(recording.sizeFormatted)
       }
@@ -461,6 +482,8 @@ private struct RecordingRow: View {
       .foregroundStyle(.secondary)
     }
     .padding(.vertical, 2)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(accessibilityDescription)
   }
 }
 
@@ -630,6 +653,7 @@ struct RecordingDetailView: View {
             if isProcessingAEC {
               ProgressView()
                 .controlSize(.small)
+                .accessibilityHidden(true)
             } else {
               Image(systemName: "waveform.badge.magnifyingglass")
             }

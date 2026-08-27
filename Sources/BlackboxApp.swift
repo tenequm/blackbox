@@ -64,7 +64,11 @@ struct BlackboxApp: App {
         Image(
           systemName: monitor.errorMessage != nil ? "waveform.badge.exclamationmark" : "waveform"
         )
-        .symbolEffect(.variableColor, isActive: monitor.errorMessage == nil)
+        .symbolEffect(
+          .variableColor,
+          isActive: monitor.errorMessage == nil
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
         .frame(width: iconWidth)
         if let grace = monitor.graceCountdown {
           Text(Self.countdownText(grace))
@@ -83,7 +87,9 @@ struct BlackboxApp: App {
       .help(accessibilityStatus)
     } else if monitor.isSaving {
       Image(systemName: "waveform.circle")
-        .symbolEffect(.pulse)
+        .symbolEffect(
+          .pulse, isActive: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
         .frame(width: iconWidth)
         .accessibilityLabel("Blackbox - saving recording")
         .help("Saving recording")

@@ -393,9 +393,11 @@ struct SettingsView: View {
         Button("Choose…") { pickFolder() }
       }
       if let stats = storageStats {
-        Text("\(stats.count) recordings, \(stats.sizeFormatted)")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        Text(
+          "\(stats.count) \(stats.count == 1 ? "recording" : "recordings"), \(stats.sizeFormatted)"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
 
       TextField("Name prefix", text: $namePrefixTemplate)
@@ -633,7 +635,7 @@ struct SettingsView: View {
     case .untested:
       EmptyView()
     case .checking:
-      ProgressView().controlSize(.small)
+      ProgressView().controlSize(.small).accessibilityLabel("Checking key")
     case .valid:
       Label("Key works", systemImage: "checkmark.circle.fill")
         .font(.caption)

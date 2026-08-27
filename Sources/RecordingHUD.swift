@@ -115,7 +115,7 @@ final class RecordingHUD {
     panel.alphaValue = 0
     panel.orderFrontRegardless()
     NSAnimationContext.runAnimationGroup { ctx in
-      ctx.duration = 0.25
+      ctx.duration = Self.fadeDuration
       panel.animator().alphaValue = 1
     }
 
@@ -144,11 +144,17 @@ final class RecordingHUD {
     }
   }
 
+  /// A cross-fade is the recommended Reduce Motion substitute, so this is a
+  /// small thing - but the setting was consulted nowhere in the app.
+  private static var fadeDuration: Double {
+    NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.25
+  }
+
   private func dismiss() {
     guard let panel else { return }
     self.panel = nil
     NSAnimationContext.runAnimationGroup { ctx in
-      ctx.duration = 0.25
+      ctx.duration = Self.fadeDuration
       panel.animator().alphaValue = 0
     } completionHandler: {
       Task { @MainActor in
