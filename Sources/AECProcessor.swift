@@ -1,5 +1,4 @@
 @preconcurrency import AVFoundation
-import CoreML
 import CoreMedia
 import DTLNAecCoreML
 
@@ -18,9 +17,7 @@ enum AECProcessor {
   private static let workQueue = DispatchQueue(
     label: "com.tenequm.blackbox.aec", qos: .utility)
 
-  /// Process a recording directory. No-op if already processed or single-track.
-  /// Fire-and-forget: errors are logged, original file is never modified.
-  nonisolated static let modelBundleName = "DTLNAecCoreML_DTLNAec256.bundle"
+  nonisolated private static let modelBundleName = "DTLNAecCoreML_DTLNAec256.bundle"
 
   /// Resolves the CoreML model bundle ourselves rather than through
   /// `DTLNAec256.bundle`, which is SwiftPM's generated `Bundle.module`.
@@ -35,7 +32,7 @@ enum AECProcessor {
   /// cancellation crashed the app outright rather than failing.
   ///
   /// Returning nil here turns that into an ordinary thrown error.
-  nonisolated static func modelBundle() -> Bundle? {
+  nonisolated private static func modelBundle() -> Bundle? {
     var candidates: [URL] = []
     // The `.app` layout, where codesigning requires resources to live.
     if let resources = Bundle.main.resourceURL {
@@ -69,14 +66,44 @@ enum AECProcessor {
     return nil
   }
 
-  static func process(recordingDirectory: URL) async throws {
+  /// Directories with a run in flight. Two runs for one recording used to be
+  /// reachable by clicking away and back: the button is gated on
+  /// `isProcessingAEC`, which is `@State` on a view carrying `.id(recording.id)`,
+  /// so reselecting the row rebuilt it as false while the first run - an
+  /// unstructured `Task` nothing cancels - was still going. The second run's
+  /// scratch cleanup then unlinked the first run's output from under it.
+  private static var runningDirectories: Set<String> = []
+
+  /// What a run did, so the caller can say so. All three non-outcomes used to
+  /// be a bare `return`, which the button rendered as a spinner that stopped
+  /// and nothing else - the same silence the error path was changed to remove.
+  enum Outcome {
+    case processed
+    case alreadyProcessed
+    case alreadyRunning
+    /// No mic track to clean. Legitimate: the microphone is a user setting.
+    case nothingToProcess
+  }
+
+  /// Runs echo cancellation over a recording directory, writing
+  /// `audio-processed.m4a` beside the original. Does nothing if the recording
+  /// is already processed, is single-track, or is already being processed, and
+  /// says which. Throws on failure; the original is never modified.
+  @discardableResult
+  static func process(recordingDirectory: URL) async throws -> Outcome {
     let inputURL = recordingDirectory.appendingPathComponent(RecordingStore.audioName)
     let outputURL = recordingDirectory.appendingPathComponent(
       RecordingStore.processedAudioName)
 
     // Usable, not merely present: an empty file from a killed run must not
     // read as "already processed" and block a re-run forever.
-    guard !RecordingStore.isUsable(outputURL) else { return }
+    guard !RecordingStore.isUsable(outputURL) else { return .alreadyProcessed }
+
+    let key = recordingDirectory.path
+    guard !runningDirectories.contains(key) else { return .alreadyRunning }
+    runningDirectories.insert(key)
+    defer { runningDirectories.remove(key) }
+
     try? FileManager.default.removeItem(at: outputURL)
 
     // Written to a scratch name and moved into place only on success. Writing
@@ -86,19 +113,32 @@ enum AECProcessor {
     // transcription source (and got billed), the export source and the playback
     // source, while `hasProcessed` went true from a successful stat, hiding the
     // button that could have regenerated it.
-    let scratchURL = recordingDirectory.appendingPathComponent(Self.partialAudioName)
-    try? FileManager.default.removeItem(at: scratchURL)
+    //
+    // The name carries a UUID so two runs - in this process or in an overlapping
+    // second instance, which onboarding's relaunch creates - cannot share one
+    // scratch path.
+    let scratchURL = recordingDirectory.appendingPathComponent(
+      RecordingStore.partialProcessedName())
 
     do {
-      try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
+      let wroteOutput = try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Bool, Error>) in
         workQueue.async {
           continuation.resume(
             with: Result { try Self.run(inputURL: inputURL, outputURL: scratchURL) })
         }
       }
+      // `run` reports whether it produced a file. A single-track recording is a
+      // legitimate no-op - the mic is a user setting - and moving a scratch file
+      // that was never created threw a filesystem error the user read as "echo
+      // cancellation failed".
+      guard wroteOutput else {
+        Log.info(Log.recorder, "aec", "nothing to process")
+        return .nothingToProcess
+      }
       try FileManager.default.moveItem(at: scratchURL, to: outputURL)
       Log.info(Log.recorder, "aec", "echo cancellation complete")
+      return .processed
     } catch {
       Log.error(Log.recorder, "aec", "failed: \(error.localizedDescription)")
       try? FileManager.default.removeItem(at: scratchURL)
@@ -106,23 +146,22 @@ enum AECProcessor {
     }
   }
 
-  /// Scratch name for an in-progress run. Swept at launch, because a killed run
-  /// cannot clean up after itself.
-  nonisolated static let partialAudioName = "audio-processed.partial.m4a"
-
   /// Removes scratch files a killed echo-cancellation run left behind.
   nonisolated static func sweepPartialFiles(in saveDirectory: URL) {
     for directory in RecordingStore.directories(in: saveDirectory) {
-      let scratch = directory.appendingPathComponent(partialAudioName)
-      if FileManager.default.fileExists(atPath: scratch.path) {
-        try? FileManager.default.removeItem(at: scratch)
+      let names =
+        (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+      for name in names where RecordingStore.isPartialProcessedName(name) {
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
       }
     }
   }
 
   // MARK: - Streaming Pipeline (background thread)
 
-  nonisolated private static func run(inputURL: URL, outputURL: URL) throws {
+  /// Returns true when it produced a file at `outputURL`, false when there was
+  /// nothing to do. The caller only publishes the output when this is true.
+  nonisolated private static func run(inputURL: URL, outputURL: URL) throws -> Bool {
     let sampleRate: Double = 16000
     let chunkSize = 1024
 
@@ -130,7 +169,7 @@ enum AECProcessor {
     let tracks = try loadAudioTracksBlocking(asset)
     guard tracks.count >= 2 else {
       Log.info(Log.recorder, "aec", "single-track recording, skipping")
-      return
+      return false
     }
 
     // Track layout:
@@ -219,6 +258,12 @@ enum AECProcessor {
     var micWritten = 0
 
     while true {
+      // A writer that has already failed accepts nothing, so decoding both
+      // tracks and running inference to the end of the file buys nothing - and
+      // at 16kHz/1024 that is ~56k wasted CoreML passes on an hour-long call.
+      // The status check after the loop reports it.
+      guard writer.status == .writing else { break }
+
       // Refill staging buffers from readers
       while sysBuf.count < chunkSize, !sysDone {
         if let sb = sysOutput.copyNextSampleBuffer() {
@@ -286,6 +331,7 @@ enum AECProcessor {
     guard writer.status == .completed else {
       throw AECError.writeFailed(writer.error?.localizedDescription ?? "writer failed")
     }
+    return true
   }
 
   // MARK: - Helpers
