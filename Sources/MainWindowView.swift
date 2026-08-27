@@ -27,7 +27,8 @@ struct MainWindowView: View {
 
 struct RecordingsView: View {
   @Environment(TranscriptionCoordinator.self) private var transcription
-  @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
+  @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
+    defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
   @State private var selectedRecordingID: String?
   @State private var exportError: String?
@@ -136,18 +137,20 @@ struct RecordingsView: View {
       var results: [RecordingFile] = []
 
       for url in RecordingStore.directories(in: dir) {
+        // One stat per file: a successful `resourceValues` is itself the
+        // existence check, so probing with `fileExists` first only doubled the
+        // syscalls on a scan that runs for every recording.
         let originalURL = url.appendingPathComponent(RecordingStore.audioName)
-        guard FileManager.default.fileExists(atPath: originalURL.path) else { continue }
+        guard let originalValues = try? originalURL.resourceValues(forKeys: [.fileSizeKey])
+        else { continue }
         // Prefer processed file for playback when available
         let processedURL = url.appendingPathComponent(RecordingStore.processedAudioName)
-        let hasProcessed = FileManager.default.fileExists(atPath: processedURL.path)
+        let processedValues = try? processedURL.resourceValues(forKeys: [.fileSizeKey])
+        let hasProcessed = processedValues != nil
         let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
-        let originalSize =
-          (try? originalURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        let processedSize =
-          hasProcessed
-          ? ((try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) : 0
+        let originalSize = originalValues.fileSize ?? 0
+        let processedSize = processedValues?.fileSize ?? 0
         let sidecar = TranscriptDocument.sidecarURL(for: url)
         results.append(
           RecordingFile(
@@ -391,6 +394,10 @@ struct RecordingDetailView: View {
       loadTranscript()
     }
     .onChange(of: transcription.revision) { _, _ in
+      // Decoding a transcript is main-thread JSON work proportional to call
+      // length, so only the recording that actually finished reloads - not
+      // every open detail view every time any job anywhere completes.
+      guard transcription.lastFinishedPath == recording.url.path else { return }
       loadTranscript()
     }
     .onDisappear {
@@ -820,11 +827,11 @@ struct RecordingDetailView: View {
   private func transcriptView(_ doc: TranscriptDocument) -> some View {
     ScrollView {
       LazyVStack(alignment: .leading, spacing: 12) {
-        ForEach(doc.segments) { segment in
+        ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
           TranscriptSegmentView(
             segment: segment,
             speakerName: speakerName(for: segment.speaker),
-            isActive: isSegmentActive(segment, in: doc),
+            isActive: isSegmentActive(at: index, in: doc),
             onTap: { jumpTo(time: segment.time) },
             onRenameSpeaker: { newName in
               saveSpeakerName(newName, for: segment.speaker)
@@ -836,16 +843,15 @@ struct RecordingDetailView: View {
     }
   }
 
-  private func isSegmentActive(
-    _ segment: TranscriptSegment, in doc: TranscriptDocument
-  ) -> Bool {
-    guard isPlaying else { return false }
-    guard let idx = doc.segments.firstIndex(where: { $0.id == segment.id }) else {
-      return false
-    }
+  /// Takes the index from the enclosing `ForEach`: this runs for every rendered
+  /// segment on every playback tick (10 Hz), so searching for the segment's own
+  /// position each time made it quadratic in transcript length.
+  private func isSegmentActive(at index: Int, in doc: TranscriptDocument) -> Bool {
+    guard isPlaying, doc.segments.indices.contains(index) else { return false }
+    let segment = doc.segments[index]
     let nextTime: Double =
-      if idx + 1 < doc.segments.count {
-        doc.segments[idx + 1].time
+      if index + 1 < doc.segments.count {
+        doc.segments[index + 1].time
       } else {
         duration
       }

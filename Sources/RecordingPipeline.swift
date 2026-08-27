@@ -198,8 +198,8 @@ final class RecordingPipeline: @unchecked Sendable {
     // Without this, pipeline.stop() reads `fileURL` (nil) and leaves an
     // orphan directory in the user's recordings folder.
     do {
-      let audioURL = dirURL.appendingPathComponent("audio.m4a")
-      Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
+      let audioURL = dirURL.appendingPathComponent(RecordingStore.audioName)
+      Log.info(Log.recorder, "recorder", "writing to \(dirName)/\(RecordingStore.audioName)")
 
       let metadata = RecordingMetadata(
         title: titlePrefix + appName,

@@ -52,10 +52,16 @@ nonisolated enum RecordingStore {
   /// resolves symlinks in its base and hands back a different spelling of the
   /// same path than the recorder produces. Transcription status is keyed by
   /// path, so the two spellings have to agree.
+  /// Dotfiles are filtered here because the path-based enumeration has no
+  /// equivalent of `.skipsHiddenFiles`, and without it every scan stats
+  /// `.DS_Store` looking for a recording inside it.
   static func directories(in saveDirectory: URL) -> [URL] {
     guard let names = try? FileManager.default.contentsOfDirectory(atPath: saveDirectory.path)
     else { return [] }
-    return names.map { saveDirectory.appendingPathComponent($0, isDirectory: true) }
+    return
+      names
+      .filter { !$0.hasPrefix(".") }
+      .map { saveDirectory.appendingPathComponent($0, isDirectory: true) }
   }
 }
 
@@ -149,6 +155,16 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
     case .pollTimeout: "Transcription timed out"
     }
   }
+
+  /// Whether another pass is worth attempting. Lives with the error rather than
+  /// with the caller so adding a case forces the decision here, where the
+  /// status codes it came from are documented.
+  var isRetryable: Bool {
+    switch self {
+    case .serverError, .pollTimeout, .notReady: true
+    case .uploadFailed, .transcriptionFailed, .balanceExhausted: false
+    }
+  }
 }
 
 // MARK: - Soniox API Client
@@ -183,6 +199,9 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   private static let mixPrefix = "blackbox-mixed-"
   private static let uploadSuffix = ".multipart"
   private static let pollCeiling = Duration.seconds(30 * 60)
+  /// Soniox caps `client_reference_id` at 256 characters.
+  private static let referenceLimit = 256
+  private static let bodyLogLimit = 512
 
   /// Falls back to the default when the stored model is blank - the Settings
   /// field is free text, and an empty `model` is rejected by every request.
@@ -244,15 +263,6 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   }
 
   // MARK: - Audio Mixing & Export
-
-  /// Mixes all audio tracks into a single-track M4A for unified transcription/export.
-  @concurrent
-  static func mixTracks(from fileURL: URL) async throws -> URL {
-    let asset = AVURLAsset(url: fileURL)
-    let tracks = try await asset.loadTracks(withMediaType: .audio)
-    guard tracks.count >= 2 else { return fileURL }
-    return try await mix(asset: asset, tracks: tracks)
-  }
 
   /// Takes an already-loaded asset so callers that had to inspect the track
   /// count first do not parse the container a second time.
@@ -320,13 +330,14 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
 
-    if tracks.count >= 2 {
-      let mixed = try await mixTracks(from: fileURL)
-      defer { try? FileManager.default.removeItem(at: mixed) }
-      try FileManager.default.copyItem(at: mixed, to: outputURL)
-    } else {
+    guard tracks.count >= 2 else {
       try FileManager.default.copyItem(at: fileURL, to: outputURL)
+      return
     }
+    // Reuses the already-loaded asset rather than re-parsing the container.
+    let mixed = try await mix(asset: asset, tracks: tracks)
+    defer { try? FileManager.default.removeItem(at: mixed) }
+    try FileManager.default.copyItem(at: mixed, to: outputURL)
   }
 
   // MARK: - Upload
@@ -429,7 +440,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       "enable_speaker_diarization": true,
       // Ties the remote job back to a recording directory, so an artifact this
       // client loses track of is still identifiable in the Soniox console.
-      "client_reference_id": String(reference.prefix(256)),
+      "client_reference_id": String(reference.prefix(Self.referenceLimit)),
     ]
 
     var request = try makeRequest(.post, "/v1/transcriptions")
@@ -589,22 +600,47 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   // MARK: - Cleanup
 
   /// Best-effort removal of the remote file and transcription so the account
-  /// does not accumulate artifacts. Failures are ignored by design.
+  /// does not accumulate artifacts. A failure here does not fail the job, but it
+  /// is logged: this is the only thing standing between a finished job and the
+  /// user's call audio living on Soniox indefinitely, so a silent miss is the
+  /// one outcome that must not be invisible.
   @concurrent
   func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
     for tId in transcriptionIds {
-      guard let url = URL(string: "\(baseURL)/v1/transcriptions/\(tId)") else { continue }
-      var req = URLRequest(url: url)
-      req.httpMethod = "DELETE"
-      req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-      _ = try? await URLSession.shared.data(for: req)
+      await delete(path: "/v1/transcriptions/\(tId)", describing: "transcription \(tId)")
     }
     for fId in fileIds {
-      guard let url = URL(string: "\(baseURL)/v1/files/\(fId)") else { continue }
-      var req = URLRequest(url: url)
-      req.httpMethod = "DELETE"
-      req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-      _ = try? await URLSession.shared.data(for: req)
+      await delete(path: "/v1/files/\(fId)", describing: "file \(fId)")
+    }
+  }
+
+  @concurrent
+  private func delete(path: String, describing what: String) async {
+    guard let url = URL(string: "\(baseURL)\(path)") else {
+      Log.error(Log.transcription, "transcription", "cannot delete \(what): invalid URL \(path)")
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse else {
+        Log.error(
+          Log.transcription, "transcription",
+          "cannot confirm deletion of \(what): no HTTP response; it may remain on Soniox")
+        return
+      }
+      // 404 means it is already gone, which is the outcome we wanted.
+      guard !(200..<300).contains(http.statusCode), http.statusCode != 404 else { return }
+      Log.error(
+        Log.transcription, "transcription",
+        "failed to delete \(what) (HTTP \(http.statusCode)); it may remain on Soniox: \(Self.bodyExcerpt(from: data))"
+      )
+    } catch {
+      Log.error(
+        Log.transcription, "transcription",
+        "failed to delete \(what); it may remain on Soniox: \(error.localizedDescription)")
     }
   }
 
@@ -639,6 +675,17 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     )
   }
 
+  /// A prefix of the raw body, for the failures that carry no Soniox envelope
+  /// at all - a proxy's HTML error page, an empty 502, a truncated response.
+  /// Without this the log says only "HTTP 502" and the cause is unrecoverable.
+  nonisolated private static func bodyExcerpt(from data: Data) -> String {
+    guard !data.isEmpty else { return "empty body" }
+    let text = String(decoding: data.prefix(bodyLogLimit), as: UTF8.self)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return "\(data.count) non-text bytes" }
+    return data.count > bodyLogLimit ? text + "... (\(data.count) bytes)" : text
+  }
+
   private func checkHTTPResponse(
     _ response: URLResponse, data: Data, context: String
   ) throws {
@@ -648,7 +695,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       let apiMessage = envelope.message ?? "HTTP \(http.statusCode)"
       Log.error(
         Log.transcription, "transcription",
-        "\(context) failed (\(http.statusCode) \(envelope.errorType ?? "unknown")): \(apiMessage) [request_id=\(envelope.requestId ?? "none")]"
+        "\(context) failed (\(http.statusCode) \(envelope.errorType ?? "unknown")): \(apiMessage) [request_id=\(envelope.requestId ?? "none")] body=\(Self.bodyExcerpt(from: data))"
       )
       let detail = "\(context): \(apiMessage)"
 

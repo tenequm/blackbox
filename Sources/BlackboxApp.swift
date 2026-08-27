@@ -18,8 +18,15 @@ struct BlackboxApp: App {
 
     let coordinator = TranscriptionCoordinator()
     var dependencies = AudioMonitorDependencies.live
-    dependencies.onRecordingSaved = { [weak coordinator] url in
-      coordinator?.recordingFinished(audioFileURL: url)
+    // Not wired under `--ui-test-mode`. The smoke suite records real audio on a
+    // developer's machine, and this hook reads the real setting and the real
+    // Keychain key - so with auto-transcribe on, `make smoke-test` would upload
+    // its own test recordings and bill the developer's Soniox account. They are
+    // 4s and ~12s, both over the duration floor.
+    if !BlackboxTestMode.isEnabled {
+      dependencies.onRecordingSaved = { [weak coordinator] url in
+        coordinator?.recordingFinished(audioFileURL: url)
+      }
     }
     let monitor = AudioMonitor(dependencies: dependencies)
     coordinator.isRecordingActive = { [weak monitor] in monitor?.isRecording ?? false }

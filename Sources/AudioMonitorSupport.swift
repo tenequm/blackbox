@@ -131,19 +131,20 @@ struct AudioMonitorDependencies {
       }
 
       let defaults = UserDefaults.standard
-      let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
+      let path = defaults.string(forKey: SettingsKeys.saveDirectoryPath) ?? defaultSaveDirectoryPath
       return AudioMonitorSettings(
-        autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
-        gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
-        micEnabled: defaults.object(forKey: "micEnabled") as? Bool ?? true,
+        autoRecord: defaults.object(forKey: SettingsKeys.autoRecord) as? Bool ?? true,
+        gracePeriod: defaults.double(forKey: SettingsKeys.gracePeriod).clamped(
+          to: 5...60, default: 5),
+        micEnabled: defaults.object(forKey: SettingsKeys.micEnabled) as? Bool ?? true,
         saveDirectory: URL(fileURLWithPath: path),
-        notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
-        notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
-        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
+        notifyOnStart: defaults.object(forKey: SettingsKeys.notifyOnStart) as? Bool ?? true,
+        notifyOnSaved: defaults.object(forKey: SettingsKeys.notifyOnSaved) as? Bool ?? true,
+        notifyOnError: defaults.object(forKey: SettingsKeys.notifyOnError) as? Bool ?? true,
+        namePrefixTemplate: defaults.string(forKey: SettingsKeys.namePrefixTemplate) ?? "YYMM-DD-",
         excludedBundleIDs: Set(
           AudioMonitorSettings.parseBundleIDList(
-            defaults.string(forKey: "excludedBundleIDs") ?? ""))
+            defaults.string(forKey: SettingsKeys.excludedBundleIDs) ?? ""))
       )
     },
     microphoneAuthorizationStatus: {

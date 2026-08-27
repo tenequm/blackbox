@@ -172,11 +172,11 @@ nonisolated final class StubHTTPServer: @unchecked Sendable {
     lock.unlock()
 
     let response = handler(request)
-    var head2 = "HTTP/1.1 \(response.status) \(Self.reason(response.status))\r\n"
-    head2 += "Content-Type: application/json\r\n"
-    head2 += "Content-Length: \(response.body.count)\r\n"
-    head2 += "Connection: close\r\n\r\n"
-    var payload = Data(head2.utf8)
+    var responseHead = "HTTP/1.1 \(response.status) \(Self.reason(response.status))\r\n"
+    responseHead += "Content-Type: application/json\r\n"
+    responseHead += "Content-Length: \(response.body.count)\r\n"
+    responseHead += "Connection: close\r\n\r\n"
+    var payload = Data(responseHead.utf8)
     payload.append(response.body)
     write(payload, to: client)
   }
@@ -379,16 +379,16 @@ struct SonioxContractTests {
     }
     let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL)
 
-    await #expect(throws: TranscriptionError.self) {
-      _ = try await service.fetchTranscript(transcriptionId: "t-1")
-    }
     do {
       _ = try await service.fetchTranscript(transcriptionId: "t-1")
+      Issue.record("expected a throw")
     } catch let error as TranscriptionError {
       guard case .notReady = error else {
         Issue.record("expected .notReady, got \(error)")
         return
       }
+      // Retryability is what makes 409 different from a real failure.
+      #expect(error.isRetryable)
     }
   }
 
