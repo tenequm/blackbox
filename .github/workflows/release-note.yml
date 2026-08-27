@@ -1,0 +1,123 @@
+# Release-note plumbing on feature PRs: lint the title (it becomes the squash
+# subject and the changelog headline) and the `## Release notes` section (it
+# becomes the changelog entry), reporting every problem at once as a sticky
+# comment that clears itself when fixed.
+#
+# Separate from ci.yml because of the `edited` trigger: the input here is the PR
+# *description*, and editing one fires only `edited`. Adding that to ci.yml would
+# start the full test matrix - the image build included - on every keystroke
+# saved in the description box.
+#
+# The changelog is generated from squash-commit messages at release time (see
+# .github/cliff.toml), so this is the last moment feedback can still change the
+# message cheaply. It is not the last line of defence: a squash that lands with
+# an empty body is repaired at generation time from the PR description
+# (ops/scripts/release-note-from-pr.sh), so a merge can no longer lose the note.
+name: release-note
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: release-note-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  release-note-lint:
+    # The release PR is generated, not authored - nothing to lint.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Title/body go through env, never inline interpolation (script injection).
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      # One step, every rule, all failures collected - an author fixing the note
+      # should see the whole list at once, not one rule per push.
+      - name: Check the PR title and release note
+        run: |
+          problems=""
+          fail() { problems="${problems}- $1"$'\n'; }
+
+          if ! printenv PR_TITLE | grep -qE '^(feat|fix|perf|revert|refactor|docs|chore|ci|build|test)(\([a-zA-Z0-9._/-]+\))?!?: .+'; then
+            fail "The PR title must be a conventional commit (\`type(scope): description\`). It becomes the squash-commit subject and the changelog headline."
+          fi
+
+          # A body line that STARTS with `word(` whose `)` closes on a later line
+          # is read by release-please's commit parser as `type(scope` with an
+          # unterminated paren. It does not error - the commit is dropped and the
+          # release is skipped with nothing red anywhere (googleapis/release-please#2564).
+          if printenv PR_BODY | grep -nE '^[^[:space:]]+\(' | grep -v ')' | head -1 | grep -q .; then
+            line=$(printenv PR_BODY | grep -nE '^[^[:space:]]+\(' | grep -v ')' | head -1)
+            fail "Line \`${line}\` starts with \`word(\` and does not close the paren on the same line. release-please's parser reads that as \`type(scope\` and SILENTLY DROPS the whole commit, skipping the release with CI green. Reflow the line, or move the \`(\` off the start."
+          fi
+
+          # perl -0777, not sed: an HTML comment can span lines, and a line-based
+          # strip would leave it behind and read as a filled note.
+          section=$(printenv PR_BODY | awk '/^## Release notes/{f=1; next} f && /^## /{exit} f{print}')
+          filled=$(printf '%s' "$section" | perl -0777 -pe 's/<!--.*?-->//gs' | tr -d '[:space:]')
+
+          if printenv PR_TITLE | grep -qE '^(feat|fix|perf|revert)' && [ -z "$filled" ]; then
+            fail "feat/fix/perf/revert PRs need a non-empty \`## Release notes\` section - it becomes the changelog entry."
+          fi
+
+          # The changelog template extracts this section from the squash body but
+          # cannot strip HTML comments (Tera has no multi-line regex), so one
+          # inside the section would ship verbatim. Checked on every PR type -
+          # chore/docs bodies reach the changelog too.
+          if printf '%s\n' "$section" | grep -q '<!--'; then
+            fail "The \`## Release notes\` section contains an HTML comment - the changelog template cannot strip it, so it would ship verbatim. Move it above the header."
+          fi
+
+          if printenv PR_BODY | grep -q '^## Release notes'; then
+            after=$(printenv PR_BODY | awk '/^## Release notes/{f=1; next} f && /^## /{print; exit}')
+            if [ -n "$after" ]; then
+              fail "The \`## Release notes\` section must be the LAST section of the PR body (\"$after\" follows it)."
+            fi
+            # Shape and size apply to the per-PR part only; a release-wide lead
+            # after a lone `[release-note]` line is exempt, since lead paragraphs
+            # plus an Upgrading block are legitimately longer.
+            entry=$(printenv PR_BODY | awk '/^## Release notes/{f=1; next} f && /^## /{exit} f{print}' | awk '/^\[release-note\]$/{exit} {print}')
+            if printf '%s\n' "$entry" | grep -qE '^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]'; then
+              fail "The \`## Release notes\` section must be one paragraph, not a list. State what changed for the user in prose; reviewer detail belongs in the sections above."
+            fi
+            # sed strips leading/trailing blank lines so only interior ones fail.
+            if printf '%s\n' "$entry" | sed -e '/./,$!d' -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' | grep -qE '^[[:space:]]*$'; then
+              fail "The \`## Release notes\` section must be a single paragraph - remove the blank line inside it."
+            fi
+            chars=$(printf '%s' "$entry" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' | wc -c | tr -d ' ')
+            if [ "$chars" -gt 300 ]; then
+              fail "The \`## Release notes\` section is $chars characters (cap: 300) - one to three sentences on what changed for the user and what they must do."
+            fi
+          fi
+
+          if [ -n "$problems" ]; then
+            { echo '<!-- release-note-lint -->'; echo '### Release note needs a fix'; echo; printf '%s' "$problems"; echo; echo 'See [CLAUDE.md](https://github.com/tenequm/blackbox/blob/main/CLAUDE.md#release-process). This comment disappears once the description passes.'; } > "$RUNNER_TEMP/comment.md"
+            cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s' "$problems" >&2
+          fi
+
+          # The comment is best-effort: a fork PR's token is read-only, and the
+          # step summary above still carries the detail.
+          existing=$(gh api "repos/$REPO/issues/$(printenv PR_NUMBER)/comments" --paginate -q '.[] | select(.body | startswith("<!-- release-note-lint -->")) | .id' 2>/dev/null | head -1 || true)
+          if [ -n "$problems" ]; then
+            if [ -n "$existing" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null 2>&1 || true
+            else
+              gh api -X POST "repos/$REPO/issues/$(printenv PR_NUMBER)/comments" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null 2>&1 || true
+            fi
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            gh api -X DELETE "repos/$REPO/issues/comments/$existing" >/dev/null 2>&1 || true
+          fi

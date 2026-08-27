@@ -1,157 +1,98 @@
 ---
 name: release-dmg
-description: Full macOS DMG release - validate, build, sign, changelog, git tag, GitHub release
+description: Manual fallback for cutting a macOS DMG release when CI cannot
 argument-hint: <version>
 disable-model-invocation: true
 ---
 
-# Release DMG
+# Release DMG (manual fallback)
 
-Automate the full release pipeline for Blackbox. Execute each step sequentially. Stop immediately on any failure.
+**Releases are automated.** Merging the release PR that release-please keeps open
+builds, signs, notarizes, staples, publishes and bumps the Homebrew cask by
+itself. See "Release Process" in CLAUDE.md.
+
+Use this file only when CI cannot do it - a runner outage, an expired secret, or
+a release that must go out while the pipeline is broken. Everything below runs on
+a Mac with the Developer ID certificate in the login keychain and the `blackbox`
+notarytool keychain profile configured.
 
 **Target version:** $ARGUMENTS
 
-## Pre-flight Checks
+## 1. Set the version
 
-Run all checks in parallel where possible:
+`Info.plist` is the single source of truth; the Makefile reads `VERSION` from it.
 
-1. **Version argument**: Verify `$ARGUMENTS` is provided and matches semver format (X.Y.Z). If missing or invalid, ask the user and stop.
-2. **Git working tree**: Run `git status --porcelain`. Uncommitted changes are OK if they are part of this release (version was bumped ahead of time). Note them and continue.
-3. **Branch**: Confirm on `main`. If not, warn and ask to confirm.
-4. **Version comparison**: Read current version from `Makefile` (`VERSION = ...` line). If `$ARGUMENTS` equals the current version, skip the version bump step (already done). If greater, proceed normally. If less, stop.
-5. **Version sync**: Verify `Makefile` VERSION and `Info.plist` CFBundleShortVersionString match each other. If they don't, stop and report the mismatch.
-6. **Changelog**: Read `CHANGELOG.md` and verify the `[Unreleased]` section has content (at least one list item under Added/Changed/Fixed/Removed). If empty, stop and tell the user to add changelog entries first.
-7. **Tools**: Verify `create-dmg` is installed (`command -v create-dmg`).
+- `CFBundleShortVersionString` -> `$ARGUMENTS` (keep the `x-release-please-version` comment on that line)
+- `CFBundleVersion` -> `.github/scripts/bump-build-number.sh`, which derives it
+  from the last release tag. Never hand-pick it: Sparkle compares this field, and
+  a value that goes backwards silently stops updates for everyone on the higher
+  number.
+- `.github/.release-please-manifest.json` -> `$ARGUMENTS`, so the automation
+  picks up where you left off.
 
-If any check fails, report all failures together and stop.
+## 2. Validate
 
-## Step 1: Version Bump
-
-**Skip this step if pre-flight detected version already matches `$ARGUMENTS`.**
-
-1. Update `Makefile`: change `VERSION = X.Y.Z` to the new version.
-2. Update `Info.plist`:
-   - `CFBundleShortVersionString` to the new version
-   - `CFBundleVersion`: read the current integer value and increment by 1
-3. Update `CHANGELOG.md`:
-   - Change `## [Unreleased]` to `## [Unreleased]` followed by a blank line and `## [X.Y.Z] - YYYY-MM-DD` (today's date)
-   - Add link reference at bottom: `[X.Y.Z]: https://github.com/tenequm/blackbox/compare/vPREVIOUS...vX.Y.Z`
-   - Update `[unreleased]` link to compare from `vX.Y.Z...HEAD`
-
-## Step 2: Format, Build, Test
-
-Run the full validation pipeline:
-
-```bash
+```sh
 make check
 ```
 
-This runs: `make format` (auto-fix) -> `make build` (Swift 6.2, warnings-as-errors) -> `make test`.
+Format, build with warnings-as-errors, and the full test suite including the
+hardware smoke tests. Do not proceed past a failure.
 
-If any step fails, stop and report. Do NOT proceed to artifact creation with broken code.
+## 3. Build, notarize, staple
 
-## Step 3: Build, Notarize, Staple DMG
-
-Build the DMG, submit for notarization, and staple the ticket:
-
-```bash
+```sh
 make release
 ```
 
-This runs: `make dmg` -> `xcrun notarytool submit --wait` -> `xcrun stapler staple`.
+This gates on the notarization JSON `status` - `notarytool submit --wait` exits 0
+even when the notary returns `Invalid`. On HTTP 403 "A required agreement is
+missing or has expired", accept the updated agreement at
+developer.apple.com/account (check App Store Connect too), wait a few minutes for
+it to propagate, and re-run.
 
-If notarization fails with HTTP 403 "A required agreement is missing or has expired": the user must accept the updated Apple Developer agreement at developer.apple.com/account (sometimes App Store Connect). Acceptance takes a few minutes to propagate - retry `xcrun notarytool submit build/Blackbox-X.Y.Z.dmg --keychain-profile blackbox --wait` every ~60s until Accepted, then `xcrun stapler staple` manually.
+Then confirm Gatekeeper's verdict on the app, not the DMG container
+(`spctl -t open` on a .dmg reports "no usable signature" by design):
 
-Verify the DMG exists at `build/Blackbox-X.Y.Z.dmg` and report its file size. Then verify Gatekeeper end-to-end: `xcrun stapler validate` on the DMG, and mount it + `spctl -a -t exec -v /Volumes/Blackbox/Blackbox.app` -> must report `Notarized Developer ID`. (`spctl -t open` on the DMG itself reports "no usable signature" - expected; the DMG container is unsigned, the app inside is what matters.)
-
-## Step 4: Sparkle Signature
-
-Generate the Sparkle EdDSA signature:
-
-```bash
-.build/artifacts/sparkle/Sparkle/bin/sign_update build/Blackbox-X.Y.Z.dmg
+```sh
+hdiutil attach -nobrowse "build/Blackbox-$ARGUMENTS.dmg"
+spctl -a -t exec -vv /Volumes/Blackbox/Blackbox.app   # must say: Notarized Developer ID
+hdiutil detach /Volumes/Blackbox
 ```
 
-Parse the output to extract `sparkle:edSignature="..."` and `length="..."` values. These are needed for the appcast.
+## 4. Changelog and appcast
 
-## Step 5: Generate appcast.xml
-
-Create `appcast.xml` in the project root:
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-  <channel>
-    <title>Blackbox</title>
-    <item>
-      <title>Version X.Y.Z</title>
-      <pubDate>RFC 2822 DATE</pubDate>
-      <sparkle:version>BUILD_NUMBER</sparkle:version>
-      <sparkle:shortVersionString>X.Y.Z</sparkle:shortVersionString>
-      <enclosure
-        url="https://github.com/tenequm/blackbox/releases/download/vX.Y.Z/Blackbox-X.Y.Z.dmg"
-        type="application/octet-stream"
-        sparkle:edSignature="SIGNATURE"
-        length="FILE_SIZE_BYTES"
-      />
-    </item>
-  </channel>
-</rss>
+```sh
+git-cliff --config .github/cliff.toml --tag "v$ARGUMENTS" -o CHANGELOG.md
+SPARKLE_PRIVATE_KEY="$(security find-generic-password -s https://sparkle-project.org -a ed25519 -w)" \
+  TAG="v$ARGUMENTS" .github/scripts/make-appcast.sh
 ```
 
-Replace placeholders with actual values. `sparkle:version` is the `CFBundleVersion` integer. Use `date -R` format for pubDate. Get file size with `stat -f%z`.
+## 5. Commit, tag, publish
 
-## Step 6: Commit and Push
-
-```bash
-git add Makefile Info.plist CHANGELOG.md Sources/ Tests/
-git commit -m "chore: release vX.Y.Z"
+```sh
+git add Info.plist CHANGELOG.md .github/.release-please-manifest.json
+git commit -m "chore: release v$ARGUMENTS"
 git push
-```
-
-Use the exact version in the commit message. Only stage known files - never `git add -A`.
-
-## Step 7: GitHub Release
-
-Extract the changelog section for version X.Y.Z from `CHANGELOG.md` (everything between `## [X.Y.Z]` and the next `## [` heading). Use this as the release body.
-
-```bash
-gh release create vX.Y.Z build/Blackbox-X.Y.Z.dmg appcast.xml \
-  --title "Blackbox X.Y.Z" \
-  --notes "CHANGELOG_CONTENT"
-```
-
-Use a heredoc for the notes to preserve formatting.
-
-## Step 8: Homebrew Tap Bump
-
-A GitHub release does NOT update Homebrew - the cask is pinned in tenequm/homebrew-tap.
-
-```bash
-cd ~/Projects/homebrew-tap && git pull
-curl -sL https://github.com/tenequm/blackbox/releases/download/vX.Y.Z/Blackbox-X.Y.Z.dmg | shasum -a 256
-```
-
-Update `Casks/blackbox-recorder.rb`: `version "X.Y.Z"` and the new `sha256`. Always hash the **published GitHub asset** (curl above), not the local file, so the cask matches what brew downloads. Then:
-
-```bash
-git add Casks/blackbox-recorder.rb && git commit -m "chore(blackbox): bump to X.Y.Z" && git push
-```
-
-Keep `auto_updates true` in the cask: Sparkle self-updates the app, so plain `brew upgrade` intentionally skips it (users can force with `--greedy`). Removing it would let a lagging cask downgrade a Sparkle-updated install.
-
-## Step 9: Cleanup
-
-```bash
+git tag "v$ARGUMENTS" && git push --tags
+gh release create "v$ARGUMENTS" "build/Blackbox-$ARGUMENTS.dmg" appcast.xml \
+  --title "Blackbox $ARGUMENTS" \
+  --notes "$(git-cliff --config .github/cliff.toml --strip header --latest)"
 rm -f appcast.xml
 ```
 
-## Step 10: Summary
+## 6. Homebrew cask
 
-Report:
-- Version released: X.Y.Z
-- DMG: file size
-- GitHub release URL (from `gh release view vX.Y.Z --json url -q .url`)
-- Sparkle appcast: attached to release; verify the feed serves the new version: `curl -sL https://github.com/tenequm/blackbox/releases/latest/download/appcast.xml`
-- Notarization: stapled
-- Homebrew cask: bumped
+```sh
+GH_TOKEN="$(gh auth token)" TAG="v$ARGUMENTS" .github/scripts/bump-cask.sh
+```
+
+Hashes the published asset rather than the local file, so the cask matches what
+brew actually downloads. Keep `auto_updates true` in the cask.
+
+## 7. Verify
+
+```sh
+curl -sL https://github.com/tenequm/blackbox/releases/latest/download/appcast.xml
+xcrun stapler validate "build/Blackbox-$ARGUMENTS.dmg"
+```

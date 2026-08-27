@@ -39,15 +39,149 @@ jobs:
       - name: Lint formatting
         run: make format-check
 
-      # --build-tests builds the test bundle in one pass; `make test-ci` then
-      # runs with --skip-build. Debug only - the release build is verified on
-      # main, not on every PR, since it doubles compile time for the same code.
-      - name: Build tests
-        run: swift build --build-tests
+      - uses: ./.github/actions/signed-bundle
+        with:
+          p12-base64: ${{ secrets.APPLE_P12_BASE64 }}
+          p12-password: ${{ secrets.APPLE_P12_PASSWORD }}
+
+      # Everything the hardware suite needs that a headless runner cannot be
+      # asked for interactively. `make test` then runs the same set the
+      # developer runs locally - no CI-only subset to drift out of sync.
+      - uses: ./.github/actions/grant-recording
 
       - name: Test
         run: make test
 
-      - name: Release build
-        if: github.ref == 'refs/heads/main'
-        run: make build
+  # release-please keeps the release PR up to date; merging it cuts the tag, and
+  # the gated steps below publish the DMG in the same run.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      release_pr: ${{ steps.rp.outputs.pr }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      version: ${{ steps.rp.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+      - uses: actions/checkout@v5
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/signed-bundle
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          p12-base64: ${{ secrets.APPLE_P12_BASE64 }}
+          p12-password: ${{ secrets.APPLE_P12_PASSWORD }}
+
+      - name: Build, notarize and staple the DMG
+        if: steps.rp.outputs.release_created == 'true'
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          brew install create-dmg
+          export APPLE_ASC_KEY_PATH="$RUNNER_TEMP/asc.p8"
+          printf '%s' "$APPLE_ASC_KEY_P8" | base64 --decode > "$APPLE_ASC_KEY_PATH"
+          make release
+          rm -f "$APPLE_ASC_KEY_PATH"
+
+      # Gatekeeper's verdict on the app inside the DMG, not the DMG container -
+      # `spctl -t open` on the .dmg reports "no usable signature" by design.
+      - name: Verify Gatekeeper accepts the app
+        if: steps.rp.outputs.release_created == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)"
+          hdiutil attach -nobrowse -quiet "build/Blackbox-$VERSION.dmg"
+          spctl -a -t exec -vv /Volumes/Blackbox/Blackbox.app 2>&1 | tee /tmp/spctl.txt
+          grep -q "Notarized Developer ID" /tmp/spctl.txt
+          hdiutil detach -quiet /Volumes/Blackbox
+
+      - name: Sign the Sparkle appcast
+        if: steps.rp.outputs.release_created == 'true'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: .github/scripts/make-appcast.sh
+
+      - name: Attach artifacts to the release
+        if: steps.rp.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)"
+          gh release upload "$TAG" "build/Blackbox-$VERSION.dmg" appcast.xml --clobber
+
+      # A GitHub release does not update Homebrew; the cask is pinned in a
+      # separate repo, which needs a token GITHUB_TOKEN cannot provide. Skipped
+      # rather than failed when the secret is absent, so the release still ships.
+      - name: Bump the Homebrew cask
+        if: steps.rp.outputs.release_created == 'true' && secrets.HOMEBREW_TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: .github/scripts/bump-cask.sh
+
+  # git-cliff owns CHANGELOG.md; release-please runs with skip-changelog and
+  # never writes it. Regenerating the whole file onto the release PR's branch
+  # makes the output a pure function of the commits, so a re-run that would
+  # change nothing commits nothing.
+  release-changelog:
+    needs: release
+    if: needs.release.outputs.release_pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJSON(needs.release.outputs.release_pr).headBranchName }}
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Write the changelog and bump the build number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ fromJSON(needs.release.outputs.release_pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r '.["."]' .github/.release-please-manifest.json)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Both writes are idempotent against the branch point, so a retry after
+          # losing a race with release-please's force-push recomputes rather than
+          # compounding - the build number in particular must not double-bump.
+          for _ in 1 2 3; do
+            git-cliff --config .github/cliff.toml --tag "v$version" -o CHANGELOG.md
+            .github/scripts/bump-build-number.sh
+            git diff --quiet CHANGELOG.md Info.plist && break
+            git commit -q -m "chore: regenerate the changelog and bump the build number" CHANGELOG.md Info.plist
+            git push && break
+            git fetch origin "$BRANCH"
+            git reset -q --hard "origin/$BRANCH"
+          done
+          if ! git diff --quiet CHANGELOG.md Info.plist; then
+            echo "could not push the changelog after 3 attempts" >&2
+            exit 1
+          fi
