@@ -35,3 +35,6 @@ DerivedData/
 # npx skills: .claude/skills is a symlink to the .agents/skills store
 .claude/skills
 .claude/worktrees
+
+# Playwright CLI cache
+.playwright-cli/
