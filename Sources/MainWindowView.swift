@@ -26,7 +26,9 @@ struct MainWindowView: View {
 // MARK: - Recordings
 
 struct RecordingsView: View {
-  @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
+  @Environment(TranscriptionCoordinator.self) private var transcription
+  @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
+    defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
   @State private var selectedRecordingID: String?
   @State private var exportError: String?
@@ -42,7 +44,6 @@ struct RecordingsView: View {
         RecordingDetailView(
           recording: recording,
           onDelete: { deleteRecordings(Set([id])) },
-          onTranscriptChanged: { Task { await loadRecordings() } },
           onTitleChanged: { Task { await loadRecordings() } }
         )
         .id(id)
@@ -55,6 +56,9 @@ struct RecordingsView: View {
       }
     }
     .task { await loadRecordings() }
+    .onChange(of: transcription.revision) { _, _ in
+      Task { await loadRecordings() }
+    }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
     ) { _ in
@@ -130,31 +134,23 @@ struct RecordingsView: View {
   private func loadRecordings() async {
     let dir = URL(fileURLWithPath: saveDirectoryPath)
     let loaded: [RecordingFile] = await Task.detached {
-      guard
-        let files = try? FileManager.default.contentsOfDirectory(
-          at: dir,
-          includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-          options: .skipsHiddenFiles)
-      else { return [] }
-
       var results: [RecordingFile] = []
 
-      for url in files
-      where FileManager.default.fileExists(
-        atPath: url.appendingPathComponent("audio.m4a").path)
-      {
-        let originalURL = url.appendingPathComponent("audio.m4a")
-        guard FileManager.default.fileExists(atPath: originalURL.path) else { continue }
+      for url in RecordingStore.directories(in: dir) {
+        // One stat per file: a successful `resourceValues` is itself the
+        // existence check, so probing with `fileExists` first only doubled the
+        // syscalls on a scan that runs for every recording.
+        let originalURL = url.appendingPathComponent(RecordingStore.audioName)
+        guard let originalValues = try? originalURL.resourceValues(forKeys: [.fileSizeKey])
+        else { continue }
         // Prefer processed file for playback when available
-        let processedURL = url.appendingPathComponent("audio-processed.m4a")
-        let hasProcessed = FileManager.default.fileExists(atPath: processedURL.path)
+        let processedURL = url.appendingPathComponent(RecordingStore.processedAudioName)
+        let processedValues = try? processedURL.resourceValues(forKeys: [.fileSizeKey])
+        let hasProcessed = processedValues != nil
         let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
-        let originalSize =
-          (try? originalURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        let processedSize =
-          hasProcessed
-          ? ((try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) : 0
+        let originalSize = originalValues.fileSize ?? 0
+        let processedSize = processedValues?.fileSize ?? 0
         let sidecar = TranscriptDocument.sidecarURL(for: url)
         results.append(
           RecordingFile(
@@ -232,6 +228,11 @@ struct RecordingsView: View {
 
   private func deleteRecordings(_ ids: Set<String>) {
     for recording in recordings where ids.contains(recording.id) {
+      // Drop any queued transcription so it does not spend an upload on a
+      // recording that is going away. Cancelling an already-running job is
+      // asynchronous, so the job itself also re-checks that the directory still
+      // exists before writing its transcript.
+      transcription.cancel(recordingDirectory: recording.url)
       try? FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
     }
     if let selectedRecordingID, ids.contains(selectedRecordingID) {
@@ -261,8 +262,27 @@ private struct RecordingRow: View {
   let recording: RecordingFile
   var onRename: (String) -> Void
 
+  @Environment(TranscriptionCoordinator.self) private var transcription
   @State private var isEditing = false
   @State private var editedTitle = ""
+
+  @ViewBuilder private var transcriptionIndicator: some View {
+    switch transcription.status(for: recording.url) {
+    case .idle, .completed:
+      EmptyView()
+    case .error:
+      Image(systemName: "exclamationmark.triangle")
+        .font(.caption2)
+        .foregroundStyle(.orange)
+        .help("Transcription failed - open the recording to retry")
+    case .uploading, .queued, .transcribing:
+      ProgressView()
+        .controlSize(.small)
+        .scaleEffect(0.6)
+        .frame(width: 12, height: 12)
+        .help("Transcribing...")
+    }
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
@@ -301,6 +321,7 @@ private struct RecordingRow: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
+        transcriptionIndicator
       }
       HStack {
         Text(recording.date, format: .dateTime.month().day().hour().minute())
@@ -319,10 +340,9 @@ private struct RecordingRow: View {
 struct RecordingDetailView: View {
   let recording: RecordingFile
   var onDelete: () -> Void
-  var onTranscriptChanged: () -> Void
   var onTitleChanged: () -> Void
 
-  @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+  @Environment(TranscriptionCoordinator.self) private var transcription
 
   // Playback
   @State private var player: AVPlayer?
@@ -347,8 +367,6 @@ struct RecordingDetailView: View {
 
   // Transcription
   @State private var transcript: TranscriptDocument?
-  @State private var transcriptionStatus: TranscriptionStatus = .idle
-  @State private var transcriptionTask: Task<Void, Never>?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -371,14 +389,19 @@ struct RecordingDetailView: View {
       }
     }
     .onAppear {
-      sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
       loadMetadata()
       setupPlayer()
       loadTranscript()
     }
+    .onChange(of: transcription.revision) { _, _ in
+      // Decoding a transcript is main-thread JSON work proportional to call
+      // length, so only the recording that actually finished reloads - not
+      // every open detail view every time any job anywhere completes.
+      guard transcription.lastFinishedPath == recording.url.path else { return }
+      loadTranscript()
+    }
     .onDisappear {
       teardownPlayer()
-      cancelTranscription()
     }
     .focusable()
     .onKeyPress(.space) {
@@ -559,9 +582,9 @@ struct RecordingDetailView: View {
 
   private var activeAudioURL: URL {
     if useProcessed, recording.hasProcessed {
-      return recording.url.appendingPathComponent("audio-processed.m4a")
+      return recording.url.appendingPathComponent(RecordingStore.processedAudioName)
     }
-    return recording.url.appendingPathComponent("audio.m4a")
+    return recording.url.appendingPathComponent(RecordingStore.audioName)
   }
 
   private func switchAudioSource() {
@@ -744,6 +767,10 @@ struct RecordingDetailView: View {
 
   // MARK: - Transcript
 
+  private var transcriptionStatus: TranscriptionStatus {
+    transcription.status(for: recording.url)
+  }
+
   private var transcriptArea: some View {
     Group {
       if let transcript, !transcript.segments.isEmpty {
@@ -773,7 +800,7 @@ struct RecordingDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         VStack(spacing: 12) {
-          if sonioxAPIKey.isEmpty {
+          if !transcription.hasAPIKey {
             Text("Add your Soniox API key in Settings to enable transcription")
               .font(.caption)
               .foregroundStyle(.secondary)
@@ -800,11 +827,11 @@ struct RecordingDetailView: View {
   private func transcriptView(_ doc: TranscriptDocument) -> some View {
     ScrollView {
       LazyVStack(alignment: .leading, spacing: 12) {
-        ForEach(doc.segments) { segment in
+        ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
           TranscriptSegmentView(
             segment: segment,
             speakerName: speakerName(for: segment.speaker),
-            isActive: isSegmentActive(segment, in: doc),
+            isActive: isSegmentActive(at: index, in: doc),
             onTap: { jumpTo(time: segment.time) },
             onRenameSpeaker: { newName in
               saveSpeakerName(newName, for: segment.speaker)
@@ -816,16 +843,15 @@ struct RecordingDetailView: View {
     }
   }
 
-  private func isSegmentActive(
-    _ segment: TranscriptSegment, in doc: TranscriptDocument
-  ) -> Bool {
-    guard isPlaying else { return false }
-    guard let idx = doc.segments.firstIndex(where: { $0.id == segment.id }) else {
-      return false
-    }
+  /// Takes the index from the enclosing `ForEach`: this runs for every rendered
+  /// segment on every playback tick (10 Hz), so searching for the segment's own
+  /// position each time made it quadratic in transcript length.
+  private func isSegmentActive(at index: Int, in doc: TranscriptDocument) -> Bool {
+    guard isPlaying, doc.segments.indices.contains(index) else { return false }
+    let segment = doc.segments[index]
     let nextTime: Double =
-      if idx + 1 < doc.segments.count {
-        doc.segments[idx + 1].time
+      if index + 1 < doc.segments.count {
+        doc.segments[index + 1].time
       } else {
         duration
       }
@@ -841,61 +867,14 @@ struct RecordingDetailView: View {
 
   private func loadTranscript() {
     transcript = TranscriptDocument.load(for: recording.url)
-    transcriptionStatus = .idle
   }
 
   private func startTranscription() {
-    guard !sonioxAPIKey.isEmpty else { return }
-
-    transcriptionTask = Task {
-      let service = TranscriptionService(apiKey: sonioxAPIKey)
-      transcriptionStatus = .uploading
-
-      do {
-        let doc = try await service.transcribe(
-          fileURL: recording.audioURL,
-          onStatus: { status in
-            transcriptionStatus = status
-          }
-        )
-        // Show transcript immediately, then persist
-        transcript = doc
-        transcriptionStatus = .completed
-        onTranscriptChanged()
-        do {
-          try doc.save(for: recording.url)
-        } catch {
-          Log.error(
-            Log.transcription, "transcription",
-            "failed to save transcript: \(error.localizedDescription)")
-        }
-      } catch is CancellationError {
-        transcriptionStatus = .idle
-      } catch let error as URLError where error.code == .cancelled {
-        // URLSession throws URLError.cancelled when Task is cancelled
-        if Task.isCancelled {
-          transcriptionStatus = .idle
-        } else {
-          transcriptionStatus = .error(error.localizedDescription)
-        }
-      } catch {
-        if Task.isCancelled {
-          transcriptionStatus = .idle
-        } else {
-          transcriptionStatus = .error(error.localizedDescription)
-          Log.error(
-            Log.transcription, "transcription",
-            "failed: \(error.localizedDescription)")
-        }
-      }
-    }
+    transcription.transcribe(recordingDirectory: recording.url)
   }
 
   private func cancelTranscription() {
-    transcriptionTask?.cancel()
-    transcriptionTask = nil
-    if case .error = transcriptionStatus { return }
-    transcriptionStatus = .idle
+    transcription.cancel(recordingDirectory: recording.url)
   }
 
   // MARK: - Transcript Export

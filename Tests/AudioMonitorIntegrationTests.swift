@@ -501,4 +501,53 @@ struct AudioMonitorIntegrationTests {
 
     await monitor.stopMonitoring()
   }
+
+  @Test("reports the saved recording directory for a manually stopped recording")
+  func reportsSavedRecordingOnManualStop() async {
+    let harness = MonitorHarness()
+    let saved = FileManager.default.temporaryDirectory
+      .appendingPathComponent("call-1")
+    harness.recorderFactory.stopURL = saved
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    monitor.stopManualRecording()
+    await settle()
+
+    #expect(harness.savedRecordings == [saved])
+  }
+
+  @Test("reports the saved recording directory when a recording ends in a failure")
+  func reportsSavedRecordingOnFailure() async throws {
+    let harness = MonitorHarness()
+    let saved = FileManager.default.temporaryDirectory
+      .appendingPathComponent("call-1")
+    harness.recorderFactory.stopURL = saved
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    session.emitFailure(.permissionDenied)
+    await settle()
+
+    #expect(harness.savedRecordings == [saved])
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("reports nothing when a recording produced no file")
+  func reportsNothingWithoutAFile() async {
+    let harness = MonitorHarness()
+    harness.recorderFactory.stopURL = nil
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    monitor.stopManualRecording()
+    await settle()
+
+    #expect(harness.savedRecordings.isEmpty)
+  }
 }

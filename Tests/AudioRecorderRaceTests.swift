@@ -1,15 +1,13 @@
+import CoreGraphics
 import Foundation
 import Testing
 
 @testable import Blackbox
 
-/// Live-SCK tests below hit `SCShareableContent.excludingDesktopWindows`,
-/// which requires Screen Recording entitlement. Off by default; enable
-/// locally with `BLACKBOX_RUN_LIVE_SCK=1` after granting permission.
-/// Top-level constant so `@Test(.disabled(if:))` can reference it from the
-/// macro-generated `Sendable` closure.
-private nonisolated let liveSCKDisabled: Bool =
-  ProcessInfo.processInfo.environment["BLACKBOX_RUN_LIVE_SCK"] == nil
+/// Non-prompting capability check, the same source of truth the app itself uses
+/// for this permission. Top-level so the `@Test` macro's `Sendable` closure can
+/// reference it.
+private nonisolated let screenRecordingGranted: Bool = CGPreflightScreenCaptureAccess()
 
 @Suite("AudioRecorder Start/Stop Race")
 struct AudioRecorderRaceTests {
@@ -94,10 +92,20 @@ struct AudioRecorderRaceTests {
     #expect(newEntries.isEmpty, "no recording dirs should remain on disk: \(newEntries)")
   }
 
+  /// Reaches ScreenCaptureKit for real: `start()` discovers a display and builds
+  /// an `SCStream` before the `.afterPipeline` checkpoint this suspends on, so
+  /// the process needs Screen Recording permission.
+  ///
+  /// Gated on whether that permission actually exists rather than on an opt-in
+  /// environment variable, which nothing set and so ran nowhere. Without it
+  /// `waitForDisplay` polls for five minutes before giving up, so an ungated
+  /// run on a machine without the grant hangs rather than failing. It runs on a
+  /// developer machine, where TCC credits the terminal's grant to its children;
+  /// it skips on a hosted runner, where the seeded grant is keyed to the app
+  /// bundle and this process is a different client.
   @Test(
     "stop arriving after pipeline created leaves no zero-byte file",
-    .disabled(if: liveSCKDisabled, "live SCK gated; set BLACKBOX_RUN_LIVE_SCK=1")
-
+    .enabled(if: screenRecordingGranted)
   )
   func stopAfterPipelineCreated_noZeroByteFile() async throws {
     let saveDir = try makeTempSaveDirectory()

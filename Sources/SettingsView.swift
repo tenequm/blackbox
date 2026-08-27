@@ -8,16 +8,25 @@ import UserNotifications
 
 struct SettingsView: View {
   @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-  @AppStorage("autoRecord") private var autoRecord = true
-  @AppStorage("gracePeriod") private var gracePeriod: Double = 5
-  @AppStorage("micEnabled") private var micEnabled = true
-  @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
-  @AppStorage("namePrefixTemplate") private var namePrefixTemplate = "YYMM-DD-"
-  @AppStorage("notifyOnStart") private var notifyOnStart = true
-  @AppStorage("notifyOnSaved") private var notifyOnSaved = true
-  @AppStorage("notifyOnError") private var notifyOnError = true
-  @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
-  @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+  @AppStorage(SettingsKeys.autoRecord) private var autoRecord = true
+  @AppStorage(SettingsKeys.gracePeriod) private var gracePeriod: Double = 5
+  @AppStorage(SettingsKeys.micEnabled) private var micEnabled = true
+  @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
+    defaultSaveDirectoryPath
+  @AppStorage(SettingsKeys.namePrefixTemplate) private var namePrefixTemplate = "YYMM-DD-"
+  @AppStorage(SettingsKeys.notifyOnStart) private var notifyOnStart = true
+  @AppStorage(SettingsKeys.notifyOnSaved) private var notifyOnSaved = true
+  @AppStorage(SettingsKeys.notifyOnError) private var notifyOnError = true
+  @AppStorage(SettingsKeys.excludedBundleIDs) private var excludedBundleIDsRaw = ""
+  @Environment(TranscriptionCoordinator.self) private var transcription
+  /// Loaded in `onAppear`, not here: a `@State` default expression is evaluated
+  /// on every struct initialisation and thrown away after the first, so putting
+  /// a synchronous Keychain round-trip in it pays `SecItemCopyMatching` every
+  /// time the enclosing `TabView` body runs.
+  @State private var sonioxAPIKey = ""
+  @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
+  @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
+  @State private var keyCheck: APIKeyCheck = .untested
 
   @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -39,9 +48,22 @@ struct SettingsView: View {
       launchAtLogin = SMAppService.mainApp.status == .enabled
       refreshPermissions()
       migrateAPIKeyToKeychain()
+      // After the migration, which is what puts a legacy key in the Keychain.
+      if sonioxAPIKey.isEmpty, let stored = KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey)
+      {
+        sonioxAPIKey = stored
+      }
     }
     .onChange(of: sonioxAPIKey) { _, newValue in
-      KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
+      // The load above is a state write like any other, so it lands here too.
+      // Without this guard every appear would delete-then-re-add the stored key
+      // and throw away a "Key works" result the user had just obtained.
+      guard newValue != (KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey) ?? "") else {
+        return
+      }
+      KeychainHelper.setString(newValue, forKey: SettingsKeys.sonioxAPIKey)
+      transcription.apiKeyChanged()
+      keyCheck = .untested
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -290,8 +312,28 @@ struct SettingsView: View {
   private var transcriptionSection: some View {
     Section("Transcription") {
       SecureField("Soniox API Key", text: $sonioxAPIKey)
+      HStack(spacing: 8) {
+        Button("Verify Key") { verifyAPIKey() }
+          .disabled(sonioxAPIKey.isEmpty || keyCheck == .checking)
+        keyCheckLabel
+      }
       Text(
-        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription, and Blackbox deletes it from Soniox once the transcript comes back."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      TextField("Model", text: $sonioxModel)
+      Text(
+        "Soniox model used for transcription. Leave as \(TranscriptionService.defaultModel) unless Soniox retires it."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
+        .disabled(sonioxAPIKey.isEmpty)
+      Text(
+        "Every finished recording longer than three seconds is uploaded to Soniox as soon as it is saved, with no further prompt. Leave this off to transcribe one recording at a time from its detail view."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -346,24 +388,16 @@ struct SettingsView: View {
     let path = saveDirectoryPath
     let result: (count: Int, sizeFormatted: String)? = await Task.detached {
       let url = URL(fileURLWithPath: path)
-      guard
-        let files = try? FileManager.default.contentsOfDirectory(
-          at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
-      else { return nil }
-
       var count = 0
       var totalBytes = 0
 
-      for dir in files
-      where FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent("audio.m4a").path)
-      {
-        let audioURL = dir.appendingPathComponent("audio.m4a")
+      for dir in RecordingStore.directories(in: url) {
+        let audioURL = dir.appendingPathComponent(RecordingStore.audioName)
         if let size = try? audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           count += 1
           totalBytes += size
         }
-        let processedURL = dir.appendingPathComponent("audio-processed.m4a")
+        let processedURL = dir.appendingPathComponent(RecordingStore.processedAudioName)
         if let size = try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           totalBytes += size
         }
@@ -391,14 +425,56 @@ struct SettingsView: View {
     }
   }
 
+  // MARK: - API Key Verification
+
+  private enum APIKeyCheck: Equatable {
+    case untested
+    case checking
+    case valid
+    case invalid(String)
+  }
+
+  @ViewBuilder private var keyCheckLabel: some View {
+    switch keyCheck {
+    case .untested:
+      EmptyView()
+    case .checking:
+      ProgressView().controlSize(.small)
+    case .valid:
+      Label("Key works", systemImage: "checkmark.circle.fill")
+        .font(.caption)
+        .foregroundStyle(.green)
+    case .invalid(let message):
+      Label(message, systemImage: "exclamationmark.triangle.fill")
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .lineLimit(2)
+    }
+  }
+
+  private func verifyAPIKey() {
+    let key = sonioxAPIKey
+    keyCheck = .checking
+    Task {
+      let result = await TranscriptionService.verifyAPIKey(key)
+      guard key == sonioxAPIKey else { return }
+      keyCheck = result.isValid ? .valid : .invalid(result.message ?? "Key rejected")
+    }
+  }
+
   // MARK: - Keychain Migration
 
   private func migrateAPIKeyToKeychain() {
     let defaults = UserDefaults.standard
-    if let legacyKey = defaults.string(forKey: "sonioxAPIKey"), !legacyKey.isEmpty {
-      KeychainHelper.setString(legacyKey, forKey: "sonioxAPIKey")
-      defaults.removeObject(forKey: "sonioxAPIKey")
+    if let legacyKey = defaults.string(forKey: SettingsKeys.sonioxAPIKey), !legacyKey.isEmpty {
+      KeychainHelper.setString(legacyKey, forKey: SettingsKeys.sonioxAPIKey)
+      defaults.removeObject(forKey: SettingsKeys.sonioxAPIKey)
       sonioxAPIKey = legacyKey
+      // Invalidated here rather than through `onChange`: the Keychain is written
+      // first, so by the time the assignment above lands the guard there sees no
+      // change and returns. Without this the coordinator keeps the "no key"
+      // result it cached at launch until the next restart.
+      transcription.apiKeyChanged()
     }
   }
 }
@@ -439,3 +515,21 @@ enum KeychainHelper {
 
 let defaultSaveDirectoryPath =
   NSHomeDirectory() + "/Library/Application Support/Blackbox/Recordings"
+
+/// UserDefaults and Keychain keys shared across the app. Spelled out in one
+/// place because a typo in a key literal compiles and then reads back a
+/// default: the feature it gates stops working with nothing in the log.
+nonisolated enum SettingsKeys {
+  static let autoRecord = "autoRecord"
+  static let gracePeriod = "gracePeriod"
+  static let micEnabled = "micEnabled"
+  static let saveDirectoryPath = "saveDirectoryPath"
+  static let namePrefixTemplate = "namePrefixTemplate"
+  static let notifyOnStart = "notifyOnStart"
+  static let notifyOnSaved = "notifyOnSaved"
+  static let notifyOnError = "notifyOnError"
+  static let excludedBundleIDs = "excludedBundleIDs"
+  static let autoTranscribe = "autoTranscribe"
+  static let sonioxModel = "sonioxModel"
+  static let sonioxAPIKey = "sonioxAPIKey"
+}

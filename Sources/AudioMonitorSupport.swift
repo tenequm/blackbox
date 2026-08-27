@@ -5,6 +5,8 @@ import UserNotifications
 protocol RecorderSession: AnyObject {
   var appName: String { get }
   func start() async throws
+  /// The recording *directory* that reached disk, or nil if nothing did.
+  /// Ask `RecordingStore.audioURL(in:)` for the audio inside it.
   func stop() async -> URL?
 }
 
@@ -107,6 +109,16 @@ struct AudioMonitorDependencies {
   var findActiveCallingProcesses: @MainActor () -> [String?]
   var now: @MainActor () -> Date
   var sleep: @Sendable (Duration) async -> Void
+  /// Called with the recording *directory* for every recording that reaches
+  /// disk, including ones ended by a recorder failure or by quit. Wired to the
+  /// transcription coordinator in `BlackboxApp`; a no-op by default so the
+  /// monitor stays independent of it.
+  ///
+  /// A directory, not the audio file: that is what `RecorderSession.stop()`
+  /// returns, and a consumer that assumed otherwise and climbed a level with
+  /// `deletingLastPathComponent()` once enqueued the whole recordings folder
+  /// as a job.
+  var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
 
   static let live = AudioMonitorDependencies(
     recorderFactory: LiveRecorderSessionFactory(),
@@ -129,19 +141,20 @@ struct AudioMonitorDependencies {
       }
 
       let defaults = UserDefaults.standard
-      let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
+      let path = defaults.string(forKey: SettingsKeys.saveDirectoryPath) ?? defaultSaveDirectoryPath
       return AudioMonitorSettings(
-        autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
-        gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
-        micEnabled: defaults.object(forKey: "micEnabled") as? Bool ?? true,
+        autoRecord: defaults.object(forKey: SettingsKeys.autoRecord) as? Bool ?? true,
+        gracePeriod: defaults.double(forKey: SettingsKeys.gracePeriod).clamped(
+          to: 5...60, default: 5),
+        micEnabled: defaults.object(forKey: SettingsKeys.micEnabled) as? Bool ?? true,
         saveDirectory: URL(fileURLWithPath: path),
-        notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
-        notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
-        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
+        notifyOnStart: defaults.object(forKey: SettingsKeys.notifyOnStart) as? Bool ?? true,
+        notifyOnSaved: defaults.object(forKey: SettingsKeys.notifyOnSaved) as? Bool ?? true,
+        notifyOnError: defaults.object(forKey: SettingsKeys.notifyOnError) as? Bool ?? true,
+        namePrefixTemplate: defaults.string(forKey: SettingsKeys.namePrefixTemplate) ?? "YYMM-DD-",
         excludedBundleIDs: Set(
           AudioMonitorSettings.parseBundleIDList(
-            defaults.string(forKey: "excludedBundleIDs") ?? ""))
+            defaults.string(forKey: SettingsKeys.excludedBundleIDs) ?? ""))
       )
     },
     microphoneAuthorizationStatus: {

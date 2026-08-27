@@ -9,6 +9,7 @@ struct BlackboxApp: App {
   // Declared without an initial value: Xcode 27 reimplements @State as a macro that
   // rejects pairing a declaration initial value with assignment in an initializer.
   @State private var monitor: AudioMonitor
+  @State private var transcriptionCoordinator: TranscriptionCoordinator
   @State private var selectedTab: MainTab = .recordings
   private let updaterController = SPUStandardUpdaterController(
     startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
@@ -16,10 +17,28 @@ struct BlackboxApp: App {
   init() {
     LogFile.rotateIfNeeded()
     Log.info(Log.app, "app", "launched")
-    let monitor = AudioMonitor()
+
+    let coordinator = TranscriptionCoordinator()
+    var dependencies = AudioMonitorDependencies.live
+    // Not wired under `--ui-test-mode`. The hardware suite that `make test`
+    // runs records real audio on a developer's machine, and this hook reads the
+    // real auto-transcribe setting and the real Keychain key - so leaving it
+    // wired sends those test recordings to a third party. The suite records
+    // three of them, roughly 4s, 6s and 12s, all over the duration floor.
+    if !BlackboxTestMode.isEnabled {
+      dependencies.onRecordingSaved = { [weak coordinator] url in
+        coordinator?.recordingFinished(recordingDirectory: url)
+      }
+    }
+    let monitor = AudioMonitor(dependencies: dependencies)
+    coordinator.isRecordingActive = { [weak monitor] in monitor?.isRecording ?? false }
+
     self.monitor = monitor
-    // Set monitor reference on delegate for graceful shutdown and startup.
+    self.transcriptionCoordinator = coordinator
+
+    // Set references on delegate for graceful shutdown and startup.
     delegate.monitor = monitor
+    delegate.transcriptionCoordinator = coordinator
   }
 
   var body: some Scene {
@@ -52,6 +71,7 @@ struct BlackboxApp: App {
 
     Window("Blackbox", id: "main") {
       MainWindowView(selectedTab: $selectedTab)
+        .environment(transcriptionCoordinator)
     }
     .defaultSize(width: 700, height: 500)
     .defaultPosition(.center)
@@ -65,6 +85,7 @@ struct BlackboxApp: App {
 
   final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var monitor: AudioMonitor?
+    var transcriptionCoordinator: TranscriptionCoordinator?
     private var onboardingWindow: NSWindow?
     private var testController: BlackboxTestController?
 
@@ -94,6 +115,8 @@ struct BlackboxApp: App {
       // Start monitoring AFTER the onboarding decision so the fallback
       // permission requests don't race with the onboarding UI.
       monitor?.startMonitoring(skipPermissionRequests: willOnboard)
+      // Pick up anything a previous session left mid-flight.
+      transcriptionCoordinator?.resumePendingJobs()
 
       if willOnboard {
         showOnboarding()

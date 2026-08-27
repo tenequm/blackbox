@@ -267,6 +267,7 @@ final class MonitorHarness {
   var activeCallers: [String?] = []
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
   private(set) var permissionLostNotifications = 0
+  private(set) var savedRecordings: [URL] = []
 
   func makeMonitor() -> AudioMonitor {
     AudioMonitor(
@@ -300,6 +301,9 @@ final class MonitorHarness {
         },
         sleep: { [clock] duration in
           await clock.sleep(for: duration)
+        },
+        onRecordingSaved: { [weak self] url in
+          self?.savedRecordings.append(url)
         }
       ))
   }
@@ -359,6 +363,13 @@ final class BlackboxSmokeClient {
       runID,
       "--test-save-directory",
       saveDirectory.path,
+      // NSArgumentDomain outranks every persisted domain, so this pins the
+      // setting for the launched process without touching what the developer
+      // has stored. Transcription is the one setting the app under test still
+      // reads from the real defaults - the rest are already replaced wholesale
+      // by the test-mode branch of `AudioMonitorDependencies.live.loadSettings`.
+      "-\(SettingsKeys.autoTranscribe)",
+      "NO",
     ]
     try process.run()
     process.waitUntilExit()

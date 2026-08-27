@@ -22,8 +22,9 @@ enum AECProcessor {
   /// Process a recording directory. No-op if already processed or single-track.
   /// Fire-and-forget: errors are logged, original file is never modified.
   static func process(recordingDirectory: URL) async {
-    let inputURL = recordingDirectory.appendingPathComponent("audio.m4a")
-    let outputURL = recordingDirectory.appendingPathComponent("audio-processed.m4a")
+    let inputURL = recordingDirectory.appendingPathComponent(RecordingStore.audioName)
+    let outputURL = recordingDirectory.appendingPathComponent(
+      RecordingStore.processedAudioName)
 
     guard !FileManager.default.fileExists(atPath: outputURL.path) else { return }
 
