@@ -59,6 +59,29 @@ struct RecordingPipelineIntegrationTests {
 
   // MARK: - Core alignment & tail padding
 
+  /// Pins the shape of what `stop()` hands back, which every consumer of a
+  /// saved recording depends on. Auto-transcription read it as the audio file
+  /// and took its parent, which meant the whole save directory was enqueued as
+  /// a recording - and no fixture caught it, because the fakes returned the
+  /// shape the consumer expected rather than the one the pipeline produces.
+  @Test("stop() returns the recording directory, not the audio file")
+  func stopReturnsRecordingDirectory() async throws {
+    let (pipeline, root) = try makePipeline()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 0))
+    pipeline.appendMicSample(makeSampleBuffer(startSample: 0))
+
+    let saved = try #require(await pipeline.stop())
+
+    var isDirectory: ObjCBool = false
+    #expect(FileManager.default.fileExists(atPath: saved.path, isDirectory: &isDirectory))
+    #expect(isDirectory.boolValue, "stop() returned a file, not a directory: \(saved.path)")
+    #expect(RecordingStore.audioURL(in: saved) != nil)
+    #expect(saved.deletingLastPathComponent().path == root.path)
+  }
+
   @Test("pads the shorter mic tail to the common end time")
   func padsShorterMicTail() async throws {
     let (pipeline, root) = try makePipeline()

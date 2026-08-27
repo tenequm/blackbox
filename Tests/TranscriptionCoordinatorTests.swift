@@ -151,7 +151,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { coordinator.status(for: directory) == .completed }
     // Cleanup is deliberately fire-and-forget so cancellation cannot kill it,
     // which means it lands after `.completed` rather than before.
@@ -209,7 +209,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
 
     #expect(await harness.service.uploadCount == 0)
@@ -224,12 +224,32 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
 
     #expect(await harness.service.uploadCount == 0)
     #expect(!coordinator.hasAPIKey)
     #expect(TranscriptionJob.load(for: directory) == nil)
+  }
+
+  /// The save directory holds every recording and, on an old install, stray
+  /// loose audio next to them. Enqueueing it transcribes whichever stray file
+  /// `RecordingStore.audioURL(in:)` finds and bills the user for it, so a
+  /// directory that is not a child of the save directory is refused outright.
+  @Test("refuses a directory that is not a recording directory")
+  func refusesNonRecordingDirectory() async throws {
+    let harness = try TranscriptionHarness()
+    try harness.makeRecording("call-1")
+    let strayAudio = harness.root.appendingPathComponent("audio.m4a")
+    try Data([0]).write(to: strayAudio)
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: harness.root)
+    await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
+
+    #expect(await harness.service.uploadCount == 0)
+    #expect(coordinator.status(for: harness.root) == .idle)
+    #expect(TranscriptionJob.load(for: harness.root) == nil)
   }
 
   @Test("manual transcription ignores the auto-transcribe setting")
@@ -598,7 +618,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     #expect(coordinator.status(for: directory) == .queued)
 
     // The user changes their mind while the job waits behind the recorder.
@@ -619,7 +639,7 @@ struct TranscriptionCoordinatorTests {
     let coordinator = harness.makeCoordinator()
 
     // An automatic job gets queued and stalls behind the recorder...
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     #expect(TranscriptionJob.load(for: directory)?.isAutomatic == true)
 
     // ...then the user asks for that same recording explicitly, while it is
@@ -645,7 +665,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
 
     // The retry that would have followed the wait never runs.
@@ -665,7 +685,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
 
     #expect(await harness.service.uploadCount == 1)
@@ -850,7 +870,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
 
     #expect(await harness.service.uploadCount == 0)
@@ -866,7 +886,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
 
     #expect(await harness.service.uploadCount == 0)
@@ -897,7 +917,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.recordingFinished(audioFileURL: directory.appendingPathComponent("audio.m4a"))
+    coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(await harness.service.uploadCount == 1)

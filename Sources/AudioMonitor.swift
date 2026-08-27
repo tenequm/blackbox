@@ -310,9 +310,9 @@ final class AudioMonitor {
   /// Announces a recording that reached disk. Every `stop()` that can return a
   /// URL funnels through here so post-processing sees failure-ended and
   /// quit-time recordings too, not just the two clean stop paths.
-  private func reportRecordingSaved(_ url: URL?) {
-    guard let url else { return }
-    dependencies.onRecordingSaved(url)
+  private func reportRecordingSaved(_ recordingDirectory: URL?) {
+    guard let recordingDirectory else { return }
+    dependencies.onRecordingSaved(recordingDirectory)
   }
 
   func forceStopAutoRecording() {

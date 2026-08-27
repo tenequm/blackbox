@@ -502,11 +502,11 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
-  @Test("reports the saved file for a manually stopped recording")
+  @Test("reports the saved recording directory for a manually stopped recording")
   func reportsSavedRecordingOnManualStop() async {
     let harness = MonitorHarness()
     let saved = FileManager.default.temporaryDirectory
-      .appendingPathComponent("call-1/audio.m4a")
+      .appendingPathComponent("call-1")
     harness.recorderFactory.stopURL = saved
     let monitor = harness.makeMonitor()
 
@@ -518,11 +518,11 @@ struct AudioMonitorIntegrationTests {
     #expect(harness.savedRecordings == [saved])
   }
 
-  @Test("reports the saved file when a recording ends in a failure")
+  @Test("reports the saved recording directory when a recording ends in a failure")
   func reportsSavedRecordingOnFailure() async throws {
     let harness = MonitorHarness()
     let saved = FileManager.default.temporaryDirectory
-      .appendingPathComponent("call-1/audio.m4a")
+      .appendingPathComponent("call-1")
     harness.recorderFactory.stopURL = saved
     let monitor = harness.makeMonitor()
 

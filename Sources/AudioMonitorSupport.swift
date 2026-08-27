@@ -5,6 +5,8 @@ import UserNotifications
 protocol RecorderSession: AnyObject {
   var appName: String { get }
   func start() async throws
+  /// The recording *directory* that reached disk, or nil if nothing did.
+  /// Ask `RecordingStore.audioURL(in:)` for the audio inside it.
   func stop() async -> URL?
 }
 
@@ -107,10 +109,15 @@ struct AudioMonitorDependencies {
   var findActiveCallingProcesses: @MainActor () -> [String?]
   var now: @MainActor () -> Date
   var sleep: @Sendable (Duration) async -> Void
-  /// Called with the saved audio file for every recording that reaches disk,
-  /// including ones ended by a recorder failure or by quit. Wired to the
+  /// Called with the recording *directory* for every recording that reaches
+  /// disk, including ones ended by a recorder failure or by quit. Wired to the
   /// transcription coordinator in `BlackboxApp`; a no-op by default so the
   /// monitor stays independent of it.
+  ///
+  /// A directory, not the audio file: that is what `RecorderSession.stop()`
+  /// returns, and a consumer that assumed otherwise and climbed a level with
+  /// `deletingLastPathComponent()` once enqueued the whole recordings folder
+  /// as a job.
   var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
 
   static let live = AudioMonitorDependencies(

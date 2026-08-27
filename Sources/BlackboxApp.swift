@@ -27,7 +27,7 @@ struct BlackboxApp: App {
     // three of them, roughly 4s, 6s and 12s, all over the duration floor.
     if !BlackboxTestMode.isEnabled {
       dependencies.onRecordingSaved = { [weak coordinator] url in
-        coordinator?.recordingFinished(audioFileURL: url)
+        coordinator?.recordingFinished(recordingDirectory: url)
       }
     }
     let monitor = AudioMonitor(dependencies: dependencies)

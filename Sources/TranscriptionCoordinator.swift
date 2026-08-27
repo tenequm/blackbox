@@ -205,7 +205,13 @@ final class TranscriptionCoordinator {
 
   /// Auto-trigger for a finished recording. `audioFileURL` is what
   /// `AudioRecorder.stop()` hands back; the job is keyed by its directory.
-  func recordingFinished(audioFileURL: URL) {
+  /// `recordingDirectory` is exactly what `RecorderSession.stop()` returns.
+  /// An earlier version took the audio file and climbed to its parent, which
+  /// silently enqueued the whole recordings folder: every job then keyed on
+  /// that one path, so the list showed nothing for the actual recording, the
+  /// next recording deduped against it, and `RecordingStore.audioURL(in:)`
+  /// transcribed whatever stray audio happened to sit at the top level.
+  func recordingFinished(recordingDirectory: URL) {
     guard dependencies.isAutoEnabled() else { return }
     guard apiKey() != nil else {
       Log.info(
@@ -213,7 +219,18 @@ final class TranscriptionCoordinator {
         "auto-transcribe is on but no API key is configured; skipping")
       return
     }
-    enqueue(audioFileURL.deletingLastPathComponent(), isAutomatic: true)
+    // A recording directory always sits directly inside the save directory.
+    // Anything else means the caller handed over the wrong level, and the cost
+    // of acting on it is the user's money and a stranger's audio on Soniox.
+    let saveDirectory = dependencies.saveDirectory()
+    guard recordingDirectory.deletingLastPathComponent().path == saveDirectory.path else {
+      Log.error(
+        Log.transcription, "transcription",
+        "refusing to transcribe \(recordingDirectory.path): not a recording directory inside \(saveDirectory.path)"
+      )
+      return
+    }
+    enqueue(recordingDirectory, isAutomatic: true)
   }
 
   /// Manual trigger from the recording detail view, including retry after a
