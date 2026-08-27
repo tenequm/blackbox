@@ -9,6 +9,9 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   var fileId: String?
   var transcriptionId: String?
   var attempts: Int = 0
+  /// Whether the job came from the auto-transcribe setting rather than an
+  /// explicit user action. Resume re-checks the setting for these.
+  var isAutomatic: Bool = false
   /// Set only on terminal failure. Its presence is what stops a launch resume
   /// from silently spending another upload on a job that already failed.
   var lastError: String?
@@ -63,6 +66,15 @@ final class TranscriptionCoordinator {
     var sleep: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
   }
 
+  /// What to do about a failure that interrupted a job.
+  private enum FailurePolicy {
+    case cancelled
+    /// Not the job's fault and not worth an attempt - wait it out.
+    case wait(Duration)
+    case retry(Duration)
+    case terminal(String)
+  }
+
   /// Bumped whenever a job reaches a terminal state, so views can reload the
   /// sidecar files on disk without polling.
   private(set) var revision = 0
@@ -80,10 +92,16 @@ final class TranscriptionCoordinator {
   @ObservationIgnored var isRecordingActive: () -> Bool = { false }
 
   @ObservationIgnored private let dependencies: Dependencies
+  /// Outer nil means "not read yet". Cached because `hasAPIKey` is read from a
+  /// SwiftUI body that re-evaluates at playback tick rate, and reading the key
+  /// is a synchronous Keychain round-trip.
+  @ObservationIgnored private var cachedAPIKey: String??
 
   private static let maxAttempts = 3
   /// Backstop against an error that classifies as retryable forever.
-  private static let maxIterations = 30
+  private static let maxAttemptedPasses = 30
+  /// Offline waits do not spend an attempt, so they get their own bound.
+  private static let maxOfflineWaits = 60
   private static let offlineRetry = Duration.seconds(60)
   private static let recordingGate = Duration.seconds(30)
 
@@ -97,7 +115,20 @@ final class TranscriptionCoordinator {
     statuses[recordingDirectory.path] ?? .idle
   }
 
-  var hasAPIKey: Bool { dependencies.apiKey() != nil }
+  var hasAPIKey: Bool { apiKey() != nil }
+
+  private func apiKey() -> String? {
+    if let cachedAPIKey { return cachedAPIKey }
+    let key = dependencies.apiKey()
+    cachedAPIKey = key
+    return key
+  }
+
+  /// Settings writes the key straight to the Keychain, so the cache needs an
+  /// explicit poke when it changes.
+  func apiKeyChanged() {
+    cachedAPIKey = nil
+  }
 
   // MARK: - Triggers
 
@@ -105,24 +136,24 @@ final class TranscriptionCoordinator {
   /// `AudioRecorder.stop()` hands back; the job is keyed by its directory.
   func recordingFinished(audioFileURL: URL) {
     guard dependencies.isAutoEnabled() else { return }
-    guard dependencies.apiKey() != nil else {
+    guard apiKey() != nil else {
       Log.info(
         Log.transcription, "transcription",
         "auto-transcribe is on but no API key is configured; skipping")
       return
     }
-    enqueue(audioFileURL.deletingLastPathComponent())
+    enqueue(audioFileURL.deletingLastPathComponent(), isAutomatic: true)
   }
 
   /// Manual trigger from the recording detail view, including retry after a failure.
   func transcribe(recordingDirectory: URL) {
-    guard dependencies.apiKey() != nil else { return }
+    guard apiKey() != nil else { return }
     if var job = TranscriptionJob.load(for: recordingDirectory), job.lastError != nil {
       job.lastError = nil
       job.attempts = 0
       job.save(for: recordingDirectory)
     }
-    enqueue(recordingDirectory)
+    enqueue(recordingDirectory, isAutomatic: false)
   }
 
   func cancel(recordingDirectory: URL) {
@@ -131,39 +162,53 @@ final class TranscriptionCoordinator {
       runTask?.cancel()
       return
     }
+    if let job = TranscriptionJob.load(for: recordingDirectory) {
+      discardRemote(job: job)
+    }
     TranscriptionJob.remove(for: recordingDirectory)
     statuses[recordingDirectory.path] = .idle
   }
 
-  /// Re-enqueues jobs left behind by a quit or a crash. A job that already
-  /// failed terminally is surfaced rather than retried - spending another
-  /// upload is the user's call, not ours.
+  /// Re-enqueues jobs left behind by a quit or a crash. Two things are
+  /// deliberately not resumed: a job that already failed terminally (spending
+  /// another upload is the user's call), and an automatic job that has not
+  /// uploaded anything yet if auto-transcribe has since been switched off. A
+  /// job that *has* uploaded is finished either way - the audio is already on
+  /// Soniox, and completing it beats stranding it there.
   func resumePendingJobs() {
-    guard dependencies.apiKey() != nil else { return }
+    guard apiKey() != nil else { return }
     let directory = dependencies.saveDirectory()
     Task { [weak self] in
+      await TranscriptionService.sweepTemporaryFiles()
       let pending = await Self.findPendingJobs(in: directory)
       guard let self else { return }
-      for (recordingDirectory, lastError) in pending {
-        if let lastError {
+      for (recordingDirectory, job) in pending {
+        let name = recordingDirectory.lastPathComponent
+        if let lastError = job.lastError {
           self.statuses[recordingDirectory.path] = .error(lastError)
-        } else {
+          continue
+        }
+        if job.isAutomatic, job.fileId == nil, !self.dependencies.isAutoEnabled() {
           Log.info(
             Log.transcription, "transcription",
-            "resuming interrupted transcription for \(recordingDirectory.lastPathComponent)")
-          self.enqueue(recordingDirectory)
+            "dropping pending auto-transcription for \(name): the setting is now off")
+          TranscriptionJob.remove(for: recordingDirectory)
+          continue
         }
+        Log.info(
+          Log.transcription, "transcription", "resuming interrupted transcription for \(name)")
+        self.enqueue(recordingDirectory, isAutomatic: job.isAutomatic)
       }
     }
   }
 
   // MARK: - Queue
 
-  private func enqueue(_ recordingDirectory: URL) {
+  private func enqueue(_ recordingDirectory: URL, isAutomatic: Bool) {
     let key = recordingDirectory.path
     guard activeDirectory?.path != key, !queue.contains(where: { $0.path == key }) else { return }
     if TranscriptionJob.load(for: recordingDirectory) == nil {
-      TranscriptionJob().save(for: recordingDirectory)
+      TranscriptionJob(isAutomatic: isAutomatic).save(for: recordingDirectory)
     }
     statuses[key] = .queued
     queue.append(recordingDirectory)
@@ -202,11 +247,11 @@ final class TranscriptionCoordinator {
     let key = recordingDirectory.path
     let name = recordingDirectory.lastPathComponent
 
-    guard let apiKey = dependencies.apiKey() else {
-      statuses[key] = .error("No Soniox API key configured")
+    guard let apiKey = apiKey() else {
+      finish(key: key, status: .error("No Soniox API key configured"))
       return
     }
-    guard let audioURL = Self.audioURL(in: recordingDirectory) else {
+    guard let audioURL = RecordingStore.audioURL(in: recordingDirectory) else {
       Log.error(Log.transcription, "transcription", "no audio file in \(name), dropping job")
       TranscriptionJob.remove(for: recordingDirectory)
       statuses[key] = .idle
@@ -215,37 +260,47 @@ final class TranscriptionCoordinator {
 
     let service = dependencies.makeService(apiKey)
     var job = TranscriptionJob.load(for: recordingDirectory) ?? TranscriptionJob()
+    var attemptedPasses = 0
+    var offlineWaits = 0
 
-    for _ in 0..<Self.maxIterations {
+    while attemptedPasses < Self.maxAttemptedPasses, offlineWaits < Self.maxOfflineWaits {
       do {
+        try Task.checkCancellation()
+
         if job.fileId == nil {
           statuses[key] = .uploading
           job.fileId = try await service.upload(fileURL: audioURL)
           job.save(for: recordingDirectory)
         }
-        guard let fileId = job.fileId else { break }
-
-        if job.transcriptionId == nil {
+        if job.transcriptionId == nil, let fileId = job.fileId {
           statuses[key] = .queued
           job.transcriptionId = try await service.createTranscription(fileId: fileId)
           job.save(for: recordingDirectory)
         }
         guard let transcriptionId = job.transcriptionId else { break }
 
-        statuses[key] = .queued
-        try await service.awaitCompletion(transcriptionId: transcriptionId) { [weak self] status in
-          Task { @MainActor in self?.statuses[key] = status }
-        }
+        statuses[key] = .transcribing
+        try await service.awaitCompletion(transcriptionId: transcriptionId)
         let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+
+        // The recording can be deleted while its job runs; writing the
+        // transcript now would resurrect a file next to something that is
+        // already in the Trash.
+        guard FileManager.default.fileExists(atPath: key) else {
+          Log.info(
+            Log.transcription, "transcription",
+            "\(name) went away mid-job, discarding transcript")
+          discardRemote(job: job)
+          statuses[key] = .idle
+          return
+        }
 
         do {
           try document.save(for: recordingDirectory)
         } catch {
           // The transcript is paid for and in hand; losing it to a write error
           // is worth an explicit failure rather than a silent retry.
-          finish(key: key, status: .error(error.localizedDescription))
-          job.lastError = error.localizedDescription
-          job.save(for: recordingDirectory)
+          fail(&job, in: recordingDirectory, message: error.localizedDescription)
           Log.error(
             Log.transcription, "transcription",
             "failed to save transcript for \(name): \(error.localizedDescription)")
@@ -255,50 +310,57 @@ final class TranscriptionCoordinator {
         TranscriptionJob.remove(for: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
-        await service.deleteRemote(transcriptionIds: [transcriptionId], fileIds: [fileId])
+        await service.deleteRemote(
+          transcriptionIds: [transcriptionId], fileIds: [job.fileId].compactMap { $0 })
         return
       } catch {
-        if Task.isCancelled || error is CancellationError {
-          cancelRemote(job: job, service: service)
+        switch failurePolicy(for: error, attempts: job.attempts) {
+        case .cancelled:
+          discardRemote(job: job)
           TranscriptionJob.remove(for: recordingDirectory)
           statuses[key] = .idle
           Log.info(Log.transcription, "transcription", "cancelled \(name)")
           return
-        }
 
-        // Offline is a wait, not a failure - it must not burn an attempt.
-        if Self.isOffline(error) {
+        case .wait(let duration):
+          offlineWaits += 1
           statuses[key] = .queued
-          await dependencies.sleep(Self.offlineRetry)
-          continue
-        }
+          await dependencies.sleep(duration)
 
-        if Self.isTransient(error), job.attempts < Self.maxAttempts {
+        case .retry(let duration):
+          attemptedPasses += 1
           job.attempts += 1
           job.save(for: recordingDirectory)
           Log.error(
             Log.transcription, "transcription",
             "transient failure for \(name) (attempt \(job.attempts)/\(Self.maxAttempts)): \(error.localizedDescription)"
           )
-          await dependencies.sleep(Self.backoff(forAttempt: job.attempts))
-          continue
-        }
+          await dependencies.sleep(duration)
 
-        job.lastError = error.localizedDescription
-        job.save(for: recordingDirectory)
-        finish(key: key, status: .error(error.localizedDescription))
-        Log.error(
-          Log.transcription, "transcription",
-          "failed for \(name): \(error.localizedDescription)")
-        return
+        case .terminal(let message):
+          fail(&job, in: recordingDirectory, message: message)
+          Log.error(Log.transcription, "transcription", "failed for \(name): \(message)")
+          return
+        }
       }
     }
 
-    let message = "Transcription gave up after repeated failures"
-    job.lastError = message
-    job.save(for: recordingDirectory)
-    finish(key: key, status: .error(message))
-    Log.error(Log.transcription, "transcription", "\(message) for \(name)")
+    // Out of passes. The sidecar stays resumable rather than terminal: the last
+    // thing seen was retryable, so the next launch should get another go.
+    statuses[key] = .idle
+    Log.error(
+      Log.transcription, "transcription",
+      "gave up on \(name) for now; it will be retried on next launch")
+  }
+
+  private func failurePolicy(for error: Error, attempts: Int) -> FailurePolicy {
+    if Task.isCancelled || error is CancellationError { return .cancelled }
+    // Offline is a wait, not a failure - it must not burn an attempt.
+    if Self.isOffline(error) { return .wait(Self.offlineRetry) }
+    if Self.isTransient(error), attempts < Self.maxAttempts {
+      return .retry(Self.backoff(forAttempt: attempts + 1))
+    }
+    return .terminal(error.localizedDescription)
   }
 
   private func finish(key: String, status: TranscriptionStatus) {
@@ -306,12 +368,25 @@ final class TranscriptionCoordinator {
     revision += 1
   }
 
-  /// Drops the remote artifacts a cancelled job left behind. Detached from the
-  /// cancelled task so the DELETEs actually run.
-  private func cancelRemote(job: TranscriptionJob, service: any TranscriptionServicing) {
+  /// Terminal outcome: surface it and keep the sidecar so the detail view can
+  /// offer a retry, but drop what the job already put on Soniox. A failed job
+  /// the user never retries would otherwise leave the call audio there for good.
+  private func fail(_ job: inout TranscriptionJob, in recordingDirectory: URL, message: String) {
+    discardRemote(job: job)
+    job.fileId = nil
+    job.transcriptionId = nil
+    job.lastError = message
+    job.save(for: recordingDirectory)
+    finish(key: recordingDirectory.path, status: .error(message))
+  }
+
+  /// Deletes whatever a job put on Soniox. Detached from the caller so it still
+  /// runs when the job's own task was the thing that got cancelled.
+  private func discardRemote(job: TranscriptionJob) {
     let transcriptionIds = [job.transcriptionId].compactMap { $0 }
     let fileIds = [job.fileId].compactMap { $0 }
-    guard !transcriptionIds.isEmpty || !fileIds.isEmpty else { return }
+    guard !transcriptionIds.isEmpty || !fileIds.isEmpty, let apiKey = apiKey() else { return }
+    let service = dependencies.makeService(apiKey)
     Task {
       await service.deleteRemote(transcriptionIds: transcriptionIds, fileIds: fileIds)
     }
@@ -319,28 +394,13 @@ final class TranscriptionCoordinator {
 
   // MARK: - Helpers
 
-  /// Echo-cancelled output when the user has run AEC, otherwise the raw capture.
-  /// Resolved at run time so a resumed job picks up whatever exists now, and so
-  /// this matches what the detail view plays back.
-  nonisolated private static func audioURL(in recordingDirectory: URL) -> URL? {
-    let processed = recordingDirectory.appendingPathComponent("audio-processed.m4a")
-    if FileManager.default.fileExists(atPath: processed.path) { return processed }
-    let raw = recordingDirectory.appendingPathComponent("audio.m4a")
-    return FileManager.default.fileExists(atPath: raw.path) ? raw : nil
-  }
-
-  /// Scans by name rather than `contentsOfDirectory(at:)`, which resolves
-  /// symlinks in the base and would hand back a different spelling of the same
-  /// path than the recorder produces. Job status is keyed by path, so the two
-  /// have to agree.
   @concurrent
-  nonisolated private static func findPendingJobs(in directory: URL) async -> [(URL, String?)] {
-    guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
-    else { return [] }
-    return names.compactMap { name in
-      let entry = directory.appendingPathComponent(name, isDirectory: true)
+  nonisolated private static func findPendingJobs(in directory: URL) async
+    -> [(URL, TranscriptionJob)]
+  {
+    RecordingStore.directories(in: directory).compactMap { entry in
       guard let job = TranscriptionJob.load(for: entry) else { return nil }
-      return (entry, job.lastError)
+      return (entry, job)
     }
   }
 

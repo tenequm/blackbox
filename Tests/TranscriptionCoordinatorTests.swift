@@ -40,17 +40,13 @@ actor FakeTranscriptionService: TranscriptionServicing {
     return "transcription-\(createCount)"
   }
 
-  func awaitCompletion(
-    transcriptionId: String,
-    onStatus: @escaping @Sendable (TranscriptionStatus) -> Void
-  ) async throws {
+  func awaitCompletion(transcriptionId: String) async throws {
     completionCount += 1
     if !completionErrors.isEmpty { throw completionErrors.removeFirst() }
     if holdsCompletion {
       // Released only by cancellation, which surfaces as a thrown CancellationError.
       try await Task.sleep(for: .seconds(60))
     }
-    onStatus(.transcribing)
   }
 
   func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument {
@@ -283,6 +279,26 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.uploadCount == 1)
   }
 
+  @Test("a terminal failure after upload drops the audio it left on the server")
+  func terminalFailureDiscardsRemoteArtifacts() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setCompletionErrors([
+      TranscriptionError.transcriptionFailed("unsupported audio")
+    ])
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { await harness.service.deletedFileIds.contains("file-1") }
+
+    #expect(await harness.service.deletedTranscriptionIds == ["transcription-1"])
+    // The failure is kept for the UI, but the ids are gone: a retry starts clean.
+    let job = try #require(TranscriptionJob.load(for: directory))
+    #expect(job.lastError != nil)
+    #expect(job.fileId == nil)
+    #expect(job.transcriptionId == nil)
+  }
+
   @Test("retrying a failed job clears the recorded error")
   func retryClearsRecordedError() async throws {
     let harness = try TranscriptionHarness()
@@ -320,6 +336,32 @@ struct TranscriptionCoordinatorTests {
     #expect(coordinator.status(for: directory) == .idle)
     #expect(TranscriptionJob.load(for: directory) == nil)
     #expect(await harness.service.deletedTranscriptionIds == ["transcription-1"])
+  }
+
+  @Test("cancelling a queued job drops the audio a previous session uploaded")
+  func cancelQueuedJobDiscardsRemoteArtifacts() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setHoldsCompletion(true)
+    let running = try harness.makeRecording("call-1")
+    let queued = try harness.makeRecording("call-2")
+    var job = TranscriptionJob()
+    job.fileId = "file-from-previous-session"
+    job.transcriptionId = "transcription-from-previous-session"
+    job.save(for: queued)
+
+    let coordinator = harness.makeCoordinator()
+    coordinator.transcribe(recordingDirectory: running)
+    await harness.wait { await harness.service.completionCount == 1 }
+    coordinator.transcribe(recordingDirectory: queued)
+    #expect(coordinator.status(for: queued) == .queued)
+
+    coordinator.cancel(recordingDirectory: queued)
+    await harness.wait {
+      await harness.service.deletedFileIds.contains("file-from-previous-session")
+    }
+
+    #expect(TranscriptionJob.load(for: queued) == nil)
+    #expect(coordinator.status(for: queued) == .idle)
   }
 
   // MARK: Resume
@@ -360,6 +402,54 @@ struct TranscriptionCoordinatorTests {
 
     #expect(coordinator.status(for: directory) == .error("Upload failed: invalid key"))
     #expect(await harness.service.uploadCount == 0)
+  }
+
+  @Test("turning the setting off stops a pending auto job that never uploaded")
+  func dropsPendingAutoJobWhenSettingTurnedOff() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    // What the quit path leaves behind: enqueued, nothing uploaded yet.
+    TranscriptionJob(isAutomatic: true).save(for: directory)
+    harness.autoEnabled = false
+
+    let coordinator = harness.makeCoordinator()
+    coordinator.resumePendingJobs()
+    await harness.wait { TranscriptionJob.load(for: directory) == nil }
+
+    #expect(await harness.service.uploadCount == 0)
+    #expect(TranscriptionJob.load(for: directory) == nil)
+  }
+
+  @Test("an auto job that already uploaded still finishes with the setting off")
+  func finishesUploadedAutoJobWhenSettingTurnedOff() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    var job = TranscriptionJob(isAutomatic: true)
+    job.fileId = "file-from-previous-session"
+    job.save(for: directory)
+    harness.autoEnabled = false
+
+    let coordinator = harness.makeCoordinator()
+    coordinator.resumePendingJobs()
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    // Finishing beats stranding the audio on Soniox, so this one runs anyway.
+    #expect(await harness.service.uploadCount == 0)
+    #expect(TranscriptDocument.load(for: directory) != nil)
+  }
+
+  @Test("a manual job resumes regardless of the auto-transcribe setting")
+  func resumesManualJobWithSettingOff() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    TranscriptionJob(isAutomatic: false).save(for: directory)
+    harness.autoEnabled = false
+
+    let coordinator = harness.makeCoordinator()
+    coordinator.resumePendingJobs()
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.uploadCount == 1)
   }
 
   @Test("nothing resumes without an API key")

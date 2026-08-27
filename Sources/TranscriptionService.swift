@@ -32,6 +32,33 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   }
 }
 
+/// Where a recording's files live and how to find them. Centralised because
+/// two rules here are easy to get subtly wrong in a copy: which of the two
+/// audio files is the current one, and how to enumerate recording directories.
+nonisolated enum RecordingStore {
+  static let audioName = "audio.m4a"
+  static let processedAudioName = "audio-processed.m4a"
+
+  /// The echo-cancelled output when the user has run AEC, otherwise the raw
+  /// capture. Nil when the directory holds neither.
+  static func audioURL(in recordingDirectory: URL) -> URL? {
+    let processed = recordingDirectory.appendingPathComponent(processedAudioName)
+    if FileManager.default.fileExists(atPath: processed.path) { return processed }
+    let raw = recordingDirectory.appendingPathComponent(audioName)
+    return FileManager.default.fileExists(atPath: raw.path) ? raw : nil
+  }
+
+  /// Enumerates by name rather than with `contentsOfDirectory(at:)`, which
+  /// resolves symlinks in its base and hands back a different spelling of the
+  /// same path than the recorder produces. Transcription status is keyed by
+  /// path, so the two spellings have to agree.
+  static func directories(in saveDirectory: URL) -> [URL] {
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: saveDirectory.path)
+    else { return [] }
+    return names.map { saveDirectory.appendingPathComponent($0, isDirectory: true) }
+  }
+}
+
 nonisolated struct ExportedSegment: Codable, Sendable {
   var speaker: String
   var time: String
@@ -117,22 +144,28 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
 /// Stage-level transcription API. `TranscriptionCoordinator` drives the state
 /// machine, so a job interrupted by quit or a network failure resumes from its
 /// persisted stage instead of re-uploading.
+///
+/// Every requirement is `@concurrent`: under this target's `.defaultIsolation(MainActor.self)`,
+/// a `nonisolated` conforming type is *not* enough to get async work off the main
+/// thread - the annotation on the requirement is what moves it, for class and
+/// actor witnesses alike. Without it, transcript JSON parsing and poll responses
+/// are decoded on the main thread.
 protocol TranscriptionServicing: Sendable {
   /// Mixes multi-track audio into a single file when needed, uploads it, and
   /// returns the remote file id.
-  func upload(fileURL: URL) async throws -> String
-  func createTranscription(fileId: String) async throws -> String
-  func awaitCompletion(
-    transcriptionId: String,
-    onStatus: @escaping @Sendable (TranscriptionStatus) -> Void
-  ) async throws
-  func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
-  func deleteRemote(transcriptionIds: [String], fileIds: [String]) async
+  @concurrent func upload(fileURL: URL) async throws -> String
+  @concurrent func createTranscription(fileId: String) async throws -> String
+  @concurrent func awaitCompletion(transcriptionId: String) async throws
+  @concurrent func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
+  @concurrent func deleteRemote(transcriptionIds: [String], fileIds: [String]) async
 }
 
 nonisolated final class TranscriptionService: TranscriptionServicing {
   private let apiKey: String
   private static let baseURL = "https://api.soniox.com"
+  private static let mixPrefix = "blackbox-mixed-"
+  private static let uploadSuffix = ".multipart"
+  private static let pollCeiling = Duration.seconds(30 * 60)
 
   init(apiKey: String) {
     self.apiKey = apiKey
@@ -151,7 +184,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     Log.info(
       Log.transcription, "transcription",
       "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
-    let mixedURL = try await Self.mixTracks(from: fileURL)
+    let mixedURL = try await Self.mix(asset: asset, tracks: tracks)
     defer { try? FileManager.default.removeItem(at: mixedURL) }
     return try await uploadFile(mixedURL)
   }
@@ -164,7 +197,13 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
     guard tracks.count >= 2 else { return fileURL }
+    return try await mix(asset: asset, tracks: tracks)
+  }
 
+  /// Takes an already-loaded asset so callers that had to inspect the track
+  /// count first do not parse the container a second time.
+  @concurrent
+  static func mix(asset: AVAsset, tracks: [AVAssetTrack]) async throws -> URL {
     let composition = AVMutableComposition()
     let duration = try await asset.load(.duration)
 
@@ -186,7 +225,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
     let tempURL =
       FileManager.default.temporaryDirectory
-      .appendingPathComponent("blackbox-mixed-\(UUID().uuidString).m4a")
+      .appendingPathComponent("\(Self.mixPrefix)\(UUID().uuidString).m4a")
 
     guard
       let exporter = AVAssetExportSession(
@@ -204,6 +243,21 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
     Log.info(Log.transcription, "transcription", "mixed \(tracks.count) tracks into single file")
     return tempURL
+  }
+
+  /// Removes mix and upload scratch files stranded by a quit mid-job. Each is
+  /// the full size of a recording, and resume-after-quit makes that a routine
+  /// path rather than a crash-only one.
+  @concurrent
+  static func sweepTemporaryFiles() async {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+    guard
+      let names = try? FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path)
+    else { return }
+    for name in names
+    where name.hasPrefix(Self.mixPrefix) || name.hasSuffix(Self.uploadSuffix) {
+      try? FileManager.default.removeItem(at: temporaryDirectory.appendingPathComponent(name))
+    }
   }
 
   /// Exports a single-track M4A copy. Mixes tracks first if multi-track.
@@ -226,50 +280,12 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   @concurrent
   private func uploadFile(_ fileURL: URL) async throws -> String {
     let boundary = UUID().uuidString
-    let filename = fileURL.lastPathComponent
 
     // Build multipart body as a temp file to avoid loading entire audio into memory
     let tempURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent(UUID().uuidString + ".multipart")
-    FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+      .appendingPathComponent(UUID().uuidString + Self.uploadSuffix)
     defer { try? FileManager.default.removeItem(at: tempURL) }
-
-    guard let output = OutputStream(url: tempURL, append: false) else {
-      throw TranscriptionError.uploadFailed("failed to create temp file for upload")
-    }
-    output.open()
-
-    let header = Data(
-      "--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\nContent-Type: audio/mp4\r\n\r\n"
-        .utf8)
-    header.withUnsafeBytes { buf in
-      _ = output.write(buf.bindMemory(to: UInt8.self).baseAddress!, maxLength: header.count)
-    }
-
-    // Stream file content in 64KB chunks
-    guard let input = InputStream(url: fileURL) else {
-      output.close()
-      throw TranscriptionError.uploadFailed("failed to open audio file for reading")
-    }
-    input.open()
-    let bufferSize = 65536
-    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-    defer { buffer.deallocate() }
-    while input.hasBytesAvailable {
-      let bytesRead = input.read(buffer, maxLength: bufferSize)
-      if bytesRead > 0 {
-        _ = output.write(buffer, maxLength: bytesRead)
-      } else {
-        break
-      }
-    }
-    input.close()
-
-    let footer = Data("\r\n--\(boundary)--\r\n".utf8)
-    footer.withUnsafeBytes { buf in
-      _ = output.write(buf.bindMemory(to: UInt8.self).baseAddress!, maxLength: footer.count)
-    }
-    output.close()
+    try Self.writeMultipartBody(audio: fileURL, boundary: boundary, to: tempURL)
 
     var request = try makeRequest(.post, "/v1/files")
     request.setValue(
@@ -286,8 +302,71 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     return fileId
   }
 
+  /// Streams the audio into a multipart body on disk in 64KB chunks. Stream
+  /// errors and short writes are surfaced: swallowing them uploads a truncated
+  /// body that the transport reports as a success and Soniox rejects much later,
+  /// pointing nowhere near the real cause.
+  private static func writeMultipartBody(audio fileURL: URL, boundary: String, to tempURL: URL)
+    throws
+  {
+    FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+    guard let output = OutputStream(url: tempURL, append: false) else {
+      throw TranscriptionError.uploadFailed("failed to create temp file for upload")
+    }
+    output.open()
+    defer { output.close() }
+
+    func writeAll(_ bytes: UnsafePointer<UInt8>, count: Int) throws {
+      var offset = 0
+      while offset < count {
+        let written = output.write(bytes + offset, maxLength: count - offset)
+        guard written > 0 else {
+          throw TranscriptionError.uploadFailed(
+            "short write building upload body: "
+              + (output.streamError?.localizedDescription ?? "stream closed"))
+        }
+        offset += written
+      }
+    }
+
+    let header = Data(
+      "--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(fileURL.lastPathComponent)\"\r\nContent-Type: audio/mp4\r\n\r\n"
+        .utf8)
+    try header.withUnsafeBytes { buffer in
+      try writeAll(buffer.bindMemory(to: UInt8.self).baseAddress!, count: header.count)
+    }
+
+    guard let input = InputStream(url: fileURL) else {
+      throw TranscriptionError.uploadFailed("failed to open audio file for reading")
+    }
+    input.open()
+    defer { input.close() }
+
+    let bufferSize = 65536
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+    defer { buffer.deallocate() }
+    while input.hasBytesAvailable {
+      let bytesRead = input.read(buffer, maxLength: bufferSize)
+      if bytesRead > 0 {
+        try writeAll(buffer, count: bytesRead)
+      } else if bytesRead < 0 {
+        throw TranscriptionError.uploadFailed(
+          "failed reading audio for upload: "
+            + (input.streamError?.localizedDescription ?? "unknown error"))
+      } else {
+        break
+      }
+    }
+
+    let footer = Data("\r\n--\(boundary)--\r\n".utf8)
+    try footer.withUnsafeBytes { buffer in
+      try writeAll(buffer.bindMemory(to: UInt8.self).baseAddress!, count: footer.count)
+    }
+  }
+
   // MARK: - Create Transcription
 
+  @concurrent
   func createTranscription(fileId: String) async throws -> String {
     let config: [String: Any] = [
       "model": "stt-async-v5",
@@ -314,15 +393,15 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   // MARK: - Poll
 
-  func awaitCompletion(
-    transcriptionId: String,
-    onStatus: @escaping @Sendable (TranscriptionStatus) -> Void
-  ) async throws {
-    var didReportTranscribing = false
+  @concurrent
+  func awaitCompletion(transcriptionId: String) async throws {
+    var elapsed = Duration.zero
 
-    for _ in 0..<900 {  // 900 * 2s = 30 minutes max
+    while elapsed < Self.pollCeiling {
       try Task.checkCancellation()
-      try await Task.sleep(for: .seconds(2))
+      let interval = Self.pollInterval(after: elapsed)
+      try await Task.sleep(for: interval)
+      elapsed += interval
 
       let request = try makeRequest(.get, "/v1/transcriptions/\(transcriptionId)")
       let data: Data
@@ -334,6 +413,8 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
         where [.notConnectedToInternet, .networkConnectionLost, .timedOut].contains(
           error.code)
       {
+        // A blip during a poll that can run for half an hour is not worth
+        // spending one of the coordinator's persisted attempts on.
         Log.error(
           Log.transcription, "transcription",
           "poll network error, retrying: \(error.localizedDescription)")
@@ -341,18 +422,13 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       }
 
       let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-      let status = json?["status"] as? String
-
-      switch status {
+      switch json?["status"] as? String {
       case "completed":
         Log.info(Log.transcription, "transcription", "completed: \(transcriptionId)")
         return
       case "error":
-        let msg = json?["error_message"] as? String ?? "unknown error"
-        throw TranscriptionError.transcriptionFailed(msg)
-      case "transcribing" where !didReportTranscribing:
-        didReportTranscribing = true
-        onStatus(.transcribing)
+        throw TranscriptionError.transcriptionFailed(
+          json?["error_message"] as? String ?? "unknown error")
       default:
         break
       }
@@ -360,8 +436,19 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     throw TranscriptionError.pollTimeout
   }
 
+  /// Ramps the poll interval so a job that takes minutes does not cost hundreds
+  /// of requests, while a short one is still noticed promptly.
+  private static func pollInterval(after elapsed: Duration) -> Duration {
+    switch elapsed {
+    case ..<(.seconds(30)): .seconds(2)
+    case ..<(.seconds(300)): .seconds(5)
+    default: .seconds(15)
+    }
+  }
+
   // MARK: - Fetch Transcript
 
+  @concurrent
   func fetchTranscript(
     transcriptionId: String
   ) async throws -> TranscriptDocument {
@@ -443,17 +530,17 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   /// Best-effort removal of the remote file and transcription so the account
   /// does not accumulate artifacts. Failures are ignored by design.
+  @concurrent
   func deleteRemote(transcriptionIds: [String], fileIds: [String]) async {
-    let base = Self.baseURL
     for tId in transcriptionIds {
-      guard let url = URL(string: "\(base)/v1/transcriptions/\(tId)") else { continue }
+      guard let url = URL(string: "\(Self.baseURL)/v1/transcriptions/\(tId)") else { continue }
       var req = URLRequest(url: url)
       req.httpMethod = "DELETE"
       req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
       _ = try? await URLSession.shared.data(for: req)
     }
     for fId in fileIds {
-      guard let url = URL(string: "\(base)/v1/files/\(fId)") else { continue }
+      guard let url = URL(string: "\(Self.baseURL)/v1/files/\(fId)") else { continue }
       var req = URLRequest(url: url)
       req.httpMethod = "DELETE"
       req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")

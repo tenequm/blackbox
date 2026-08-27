@@ -17,6 +17,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
   @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
+  @Environment(TranscriptionCoordinator.self) private var transcription
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
   @AppStorage("autoTranscribe") private var autoTranscribe = false
 
@@ -43,6 +44,7 @@ struct SettingsView: View {
     }
     .onChange(of: sonioxAPIKey) { _, newValue in
       KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
+      transcription.apiKeyChanged()
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -355,24 +357,16 @@ struct SettingsView: View {
     let path = saveDirectoryPath
     let result: (count: Int, sizeFormatted: String)? = await Task.detached {
       let url = URL(fileURLWithPath: path)
-      guard
-        let files = try? FileManager.default.contentsOfDirectory(
-          at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
-      else { return nil }
-
       var count = 0
       var totalBytes = 0
 
-      for dir in files
-      where FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent("audio.m4a").path)
-      {
-        let audioURL = dir.appendingPathComponent("audio.m4a")
+      for dir in RecordingStore.directories(in: url) {
+        let audioURL = dir.appendingPathComponent(RecordingStore.audioName)
         if let size = try? audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           count += 1
           totalBytes += size
         }
-        let processedURL = dir.appendingPathComponent("audio-processed.m4a")
+        let processedURL = dir.appendingPathComponent(RecordingStore.processedAudioName)
         if let size = try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           totalBytes += size
         }

@@ -133,23 +133,13 @@ struct RecordingsView: View {
   private func loadRecordings() async {
     let dir = URL(fileURLWithPath: saveDirectoryPath)
     let loaded: [RecordingFile] = await Task.detached {
-      // By name, not `contentsOfDirectory(at:)`: that variant resolves symlinks
-      // in the base and yields a different spelling of the same path than the
-      // recorder produces, which breaks transcription status lookups keyed by path.
-      guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
-      else { return [] }
-      let files = names.map { dir.appendingPathComponent($0, isDirectory: true) }
-
       var results: [RecordingFile] = []
 
-      for url in files
-      where FileManager.default.fileExists(
-        atPath: url.appendingPathComponent("audio.m4a").path)
-      {
-        let originalURL = url.appendingPathComponent("audio.m4a")
+      for url in RecordingStore.directories(in: dir) {
+        let originalURL = url.appendingPathComponent(RecordingStore.audioName)
         guard FileManager.default.fileExists(atPath: originalURL.path) else { continue }
         // Prefer processed file for playback when available
-        let processedURL = url.appendingPathComponent("audio-processed.m4a")
+        let processedURL = url.appendingPathComponent(RecordingStore.processedAudioName)
         let hasProcessed = FileManager.default.fileExists(atPath: processedURL.path)
         let audioURL = hasProcessed ? processedURL : originalURL
         let metadata = RecordingMetadata.load(in: url)
@@ -235,9 +225,10 @@ struct RecordingsView: View {
 
   private func deleteRecordings(_ ids: Set<String>) {
     for recording in recordings where ids.contains(recording.id) {
-      // Drop any queued or in-flight transcription first, so it neither spends
-      // an upload on a recording that is going away nor writes a transcript
-      // into the Trash.
+      // Drop any queued transcription so it does not spend an upload on a
+      // recording that is going away. Cancelling an already-running job is
+      // asynchronous, so the job itself also re-checks that the directory still
+      // exists before writing its transcript.
       transcription.cancel(recordingDirectory: recording.url)
       try? FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
     }
@@ -584,9 +575,9 @@ struct RecordingDetailView: View {
 
   private var activeAudioURL: URL {
     if useProcessed, recording.hasProcessed {
-      return recording.url.appendingPathComponent("audio-processed.m4a")
+      return recording.url.appendingPathComponent(RecordingStore.processedAudioName)
     }
-    return recording.url.appendingPathComponent("audio.m4a")
+    return recording.url.appendingPathComponent(RecordingStore.audioName)
   }
 
   private func switchAudioSource() {
