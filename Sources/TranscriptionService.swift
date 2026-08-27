@@ -210,9 +210,35 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     return trimmed.isEmpty ? defaultModel : trimmed
   }
 
+  /// The one place that decides whether this process may talk to Soniox at all.
+  ///
+  /// Under `--ui-test-mode` the answer is never: the smoke suite records real
+  /// audio on a developer's machine, so a live-host client there would send
+  /// their call audio to a third party and bill them for it. Enforced here
+  /// rather than at each call site because a call site is a thing to forget -
+  /// every request in this feature is built by an instance of this type or by
+  /// `verifyAPIKey`, and both funnel through this check.
+  ///
+  /// `precondition`, not `assert`: `make bundle` builds release, which is what
+  /// the smoke suite launches, and `assert` is compiled out there. Crashing a
+  /// test run is the correct failure - loud, immediate, impossible to mistake
+  /// for a pass.
+  /// The policy, split from the assertion so it can be tested: `isEnabled` is a
+  /// launch-time constant, so a test process can never make the assertion fire.
+  nonisolated static func egressAllowed(baseURL: String, underTestMode: Bool) -> Bool {
+    !underTestMode || baseURL != defaultBaseURL
+  }
+
+  nonisolated private static func assertEgressAllowed(_ baseURL: String) {
+    precondition(
+      egressAllowed(baseURL: baseURL, underTestMode: BlackboxTestMode.isEnabled),
+      "refusing to reach the live Soniox API under --ui-test-mode")
+  }
+
   /// `baseURL` is injectable so the contract tests can point the client at a
   /// loopback stub that speaks the documented Soniox wire format.
   init(apiKey: String, model: String = defaultModel, baseURL: String = defaultBaseURL) {
+    Self.assertEgressAllowed(baseURL)
     self.apiKey = apiKey
     self.model = model
     self.baseURL = baseURL
@@ -225,6 +251,8 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   static func verifyAPIKey(_ apiKey: String, baseURL: String = defaultBaseURL) async -> (
     isValid: Bool, message: String?
   ) {
+    // Static, so it never passes through `init` - it needs its own check.
+    assertEgressAllowed(baseURL)
     guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       return (false, "No API key entered.")
     }

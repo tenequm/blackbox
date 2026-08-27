@@ -489,6 +489,23 @@ struct SonioxContractTests {
     #expect(!empty.isValid)
   }
 
+  @Test(
+    "test mode may reach a stub but never the live host",
+    arguments: [
+      (TranscriptionService.defaultBaseURL, true, false),
+      (TranscriptionService.defaultBaseURL, false, true),
+      ("http://127.0.0.1:8080", true, true),
+      ("http://127.0.0.1:8080", false, true),
+    ])
+  func egressPolicy(baseURL: String, underTestMode: Bool, allowed: Bool) {
+    // The assertion this backs cannot fire in a test process - `isEnabled` is
+    // read from the launch arguments once - so the policy is pinned here and
+    // the assertion is left as three lines of wiring.
+    #expect(
+      TranscriptionService.egressAllowed(baseURL: baseURL, underTestMode: underTestMode)
+        == allowed)
+  }
+
   @Test("cleanup deletes both the transcription and the uploaded file")
   func deleteRemoteHitsBothEndpoints() async throws {
     let server = try StubHTTPServer { _ in .json(200, [:]) }
