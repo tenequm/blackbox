@@ -145,7 +145,12 @@ commit is SILENTLY DROPPED - the release is skipped with CI green
 (googleapis/release-please#2564).
 
 git-cliff owns `CHANGELOG.md` and the release body; release-please runs with
-`skip-changelog: true` so the two never write the same file. The changelog entry
+`skip-changelog: true` so the two never write the same file. The
+`release-changelog` job is gated on *an open release PR existing*, not on
+release-please having just changed one: keyed to the action's `pr` output it got
+exactly one attempt per release, because every later push logs "PR #N remained
+the same" and emits nothing - so a failed run could never be retried, and 0.9.4
+reached a mergeable state with no changelog and an unbumped `CFBundleVersion`. The changelog entry
 is rendered from squash-commit bodies, and
 `.github/scripts/release-note-from-pr.sh` refetches the note from the PR when a
 squash landed without one. That script must stay executable - git-cliff reports a
