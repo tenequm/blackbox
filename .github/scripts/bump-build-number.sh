@@ -10,7 +10,11 @@
 # this twice on the same branch is a no-op instead of a double bump.
 set -euo pipefail
 
-current="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Info.plist)"
+# python3, not PlistBuddy or plutil: this runs on ubuntu in the
+# release-changelog job as well as on macOS from `make release`, and both of
+# those tools are macOS-only. The script already needed python3 for the tag
+# lookup below, so this adds no dependency.
+current="$(python3 -c "import plistlib;print(plistlib.load(open('Info.plist','rb'))['CFBundleVersion'])")"
 
 # Anchored to the last released tag, not to the working copy: deriving the next
 # value from `current` would advance it again on every re-run, and this script
@@ -46,5 +50,5 @@ if n != 1:
 open("Info.plist", "w").write(out)
 PY
 
-plutil -lint Info.plist >/dev/null
+python3 -c "import plistlib;plistlib.load(open('Info.plist','rb'))"
 echo "CFBundleVersion: $current -> $next"
