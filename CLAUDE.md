@@ -155,7 +155,10 @@ It also generates from **main**, not from the release branch: release-please
 rebuilds that branch only when the files it writes change, so between version
 bumps the branch keeps an older base with an older `cliff.toml`, and generating
 there would reproduce that snapshot and omit every commit landed since. The
-pending version therefore comes from the branch's manifest, not main's.
+pending version therefore comes from the branch's manifest, not main's, and
+`bump-build-number.sh` is copied out of main before the checkout for the same
+reason - run from the branch it was the branch's older copy, which still called
+a macOS-only `PlistBuddy` on an ubuntu runner.
 
 **`RELEASE_PLEASE_TOKEN` is optional but load-bearing.** Both the release-please
 action and the changelog push fall back to `GITHUB_TOKEN`, which makes the actor

@@ -225,6 +225,11 @@ jobs:
           # still names the last released one.
           version=$(git show "origin/$BRANCH:.github/.release-please-manifest.json" | jq -r '.["."]')
           git-cliff --config .github/cliff.toml --tag "v$version" -o "$RUNNER_TEMP/CHANGELOG.md"
+          # main's copy of the script, for the same reason the changelog uses
+          # main's cliff.toml: the checkout below switches to the release
+          # branch, whose base predates any fix to this script. It ran there and
+          # died on a macOS-only PlistBuddy call that main had already replaced.
+          cp .github/scripts/bump-build-number.sh "$RUNNER_TEMP/bump-build-number.sh"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Rebuilt from the branch each round, so a retry after losing a race
@@ -234,7 +239,7 @@ jobs:
           for _ in 1 2 3; do
             git checkout -q -B rp-local "origin/$BRANCH"
             cp "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
-            .github/scripts/bump-build-number.sh
+            "$RUNNER_TEMP/bump-build-number.sh"
             git diff --quiet CHANGELOG.md Info.plist && break
             git commit -q -m "chore: regenerate the changelog and bump the build number" CHANGELOG.md Info.plist
             git push -q origin "rp-local:$BRANCH" && break
