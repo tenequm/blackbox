@@ -145,7 +145,26 @@ commit is SILENTLY DROPPED - the release is skipped with CI green
 (googleapis/release-please#2564).
 
 git-cliff owns `CHANGELOG.md` and the release body; release-please runs with
-`skip-changelog: true` so the two never write the same file. The changelog entry
+`skip-changelog: true` so the two never write the same file. The
+`release-changelog` job is gated on *an open release PR existing*, not on
+release-please having just changed one: keyed to the action's `pr` output it got
+exactly one attempt per release, because every later push logs "PR #N remained
+the same" and emits nothing - so a failed run could never be retried, and 0.9.4
+reached a mergeable state with no changelog and an unbumped `CFBundleVersion`.
+It also generates from **main**, not from the release branch: release-please
+rebuilds that branch only when the files it writes change, so between version
+bumps the branch keeps an older base with an older `cliff.toml`, and generating
+there would reproduce that snapshot and omit every commit landed since. The
+pending version therefore comes from the branch's manifest, not main's.
+
+**`RELEASE_PLEASE_TOKEN` is optional but load-bearing.** Both the release-please
+action and the changelog push fall back to `GITHUB_TOKEN`, which makes the actor
+`github-actions[bot]` - and a repo whose contributor-approval policy has never
+seen a merged bot PR gates every workflow on that PR, so the release sits at "2
+workflows awaiting approval" with nothing red. The changelog job emits a
+`::warning::` when the secret is absent, so the cause is visible in the run
+rather than a mystery. The same shape is documented in `glim-sh/cuttle`, whose
+`ci.yml` this one is derived from. The changelog entry
 is rendered from squash-commit bodies, and
 `.github/scripts/release-note-from-pr.sh` refetches the note from the PR when a
 squash landed without one. That script must stay executable - git-cliff reports a
