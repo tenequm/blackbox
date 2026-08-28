@@ -1,333 +1,277 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## [0.9.4](https://github.com/tenequm/blackbox/compare/v0.9.3...v0.9.4) - 2026-08-28
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### <!-- 1 -->New Features
+- **transcription:** auto-transcribe finished recordings ([c600b60](https://github.com/tenequm/blackbox/commit/c600b606548bf3251347e1c88d5e55ca11f71a80))
+- **ui:** UI and UX fixes ([d280e5f](https://github.com/tenequm/blackbox/commit/d280e5f5810b9c8c224daeb06388f04a8b06812a))
+  Transcripts can be selected, copied and followed while playing, and replaced when they come out wrong. The library is searchable, with multi-select export and delete. Transcription runs a job per recording instead of one at a time. Echo cancellation no longer crashes the app.
 
-## [Unreleased]
+### <!-- 5 -->Documentation
+- correct AEC trigger and note the cooperative-pool constraint ([8b0c432](https://github.com/tenequm/blackbox/commit/8b0c4324bed3974a2759f16953b6fc5634557947))
 
-## [0.9.3] - 2026-08-20
+### <!-- 6 -->Chores
+- update swift-macos skill ([00d7f8a](https://github.com/tenequm/blackbox/commit/00d7f8a63ff310ece2191a80c6230518a0154d28))
+- macOS 27 readiness - Sparkle 2.9.6 + forward-compatible @State ([#22](https://github.com/tenequm/blackbox/pull/22)) ([0da2c90](https://github.com/tenequm/blackbox/commit/0da2c90da41cecca46cd187b550baad1b718fd62))
+- run the full hardware suite in CI and automate releases ([#23](https://github.com/tenequm/blackbox/pull/23)) ([81906e1](https://github.com/tenequm/blackbox/commit/81906e14f53dd9dfd12671c24f9519cfef37f928))
+  Blackbox releases are now cut by CI: merging the release PR builds,
+  signs, notarizes, staples and publishes the DMG, signs the Sparkle
+  appcast and bumps the Homebrew cask. `make test` runs the complete
+  suite, hardware smoke tests included, on both a developer machine and a
+  hosted runner.
+- verify the Homebrew tap token in the release dry run ([#24](https://github.com/tenequm/blackbox/pull/24)) ([a474f41](https://github.com/tenequm/blackbox/commit/a474f419438c015a34d5a04a19b1526dc0c16b60))
+  The release dry run now checks that the Homebrew tap token can actually
+  push before a release depends on it, so a missing or expired token is
+  caught on demand rather than at the cask step of a real release.
+- ignore the Playwright CLI cache ([10d9184](https://github.com/tenequm/blackbox/commit/10d91841c11ec673a597358fa261a9f0e35a7df2))
+- bump the build number without macOS-only tools ([bc8e1c2](https://github.com/tenequm/blackbox/commit/bc8e1c2f3b8f3303f8e98d69125d8dd43a01a8ac))
+- port the release-pipeline lessons from glim-sh/cuttle ([0703dc9](https://github.com/tenequm/blackbox/commit/0703dc9eff0f460ac7e6efe32ef323eb4f10433f))
+- run main's build-number script, not the release branch's ([7db35e9](https://github.com/tenequm/blackbox/commit/7db35e934726065e9300833717d52a923b1efa14))
 
-### Fixed
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.3...v0.9.4
 
-- Recordings ended early when the display went to sleep. System audio is captured through a display-wide stream, and macOS tears that stream down the moment the display sleeps. Auto-recorded calls lost their system audio at the first sleep with no attempt to resume; manual recordings tried to resume immediately, found no display because the screen was still off, and stopped for good. A 10 minute recording with two screen sleeps kept only the first 7 minutes. Blackbox now keeps the display awake while recording (as call apps do - this matters most for audio-only calls and manual recordings, where nothing else does), treats display loss as recoverable rather than fatal, and waits for the screen to come back before resuming. The same 10 minute test now keeps 605 of 613 seconds, with the two tracks staying in sync throughout.
-- Echo cancellation could hang after a recording, leaving the processed file unwritten. The decode loop ran on a thread pool that it then blocked, so with two recordings finishing at once on a machine with few cores, nothing could make progress. It now runs on its own thread.
+## [0.9.3](https://github.com/tenequm/blackbox/compare/v0.9.2...v0.9.3) - 2026-08-20
 
-## [0.9.2] - 2026-08-20
+### <!-- 2 -->Bug Fixes
+- **aec:** run the blocking decode loop off the cooperative pool ([#19](https://github.com/tenequm/blackbox/pull/19)) ([2c118bb](https://github.com/tenequm/blackbox/commit/2c118bb61ed12e8f04af1c7c48ead7087271652d))
+- **recorder:** survive display sleep during a recording ([#20](https://github.com/tenequm/blackbox/pull/20)) ([52caa1a](https://github.com/tenequm/blackbox/commit/52caa1a70e5ccaaa916983326bf7016fc6a131bd))
 
-### Fixed
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.2...v0.9.3
 
-- Recording burned significant CPU and forced the window server to recomposite the whole screen 60+ times a second. The system-audio capture stream requested video at the display's native refresh rate instead of throttling it, then discarded every frame, because only the audio output was ever consumed. On a 5K display this cost roughly a sixth of a CPU core between Blackbox and `replayd` for the entire duration of a call, plus compositor overhead on top. Measured over a 12 second capture: 871 discarded frames before, zero after.
-- A recording could be truncated when quitting mid-call. Stopping the capture stream was meant to be bounded by a 3 second timeout, but the timeout never actually applied: a hung stream blocked for its full duration (measured 8.5 seconds for an 8 second stall), which could exceed the shutdown budget and get the app killed before the file was finalized.
+## [0.9.2](https://github.com/tenequm/blackbox/compare/v0.9.1...v0.9.2) - 2026-08-20
 
-## [0.9.1] - 2026-07-03
+### <!-- 2 -->Bug Fixes
+- **recorder:** stop SCStream rendering video at display refresh rate ([#18](https://github.com/tenequm/blackbox/pull/18)) ([b59dff8](https://github.com/tenequm/blackbox/commit/b59dff87de5a51855c819a5710de833ecc53ec9a))
 
-### Fixed
+### <!-- 5 -->Documentation
+- rename Homebrew cask token to blackbox-recorder ([48451b2](https://github.com/tenequm/blackbox/commit/48451b2be5bf96bbf3afef035012cbb7489caf5c))
+- **readme:** reframe intro around the workflow ([1ba1faa](https://github.com/tenequm/blackbox/commit/1ba1faa26f769a415da632c6d4efa4af9db2a895))
 
-- Menu bar level meter was effectively deaf to voice: it bucketed raw linear RMS with a -26 dBFS top threshold that conversational speech (~-36 dBFS) never reached, so it only reacted to loud system audio. Now bucketed by dBFS (full above -30, mid above -45), so your own voice visibly drives the indicator while recording.
-- Inaudible mic track during FaceTime calls. When FaceTime's voice processing is active, the shared input device switches to a multichannel layout (3ch deinterleaved) where only channel 0 carries the mic and the extra channels are AEC metadata; the mono downmix averaged channel 0 with a near-silent metadata channel. Additionally, the VP raw pathway bypasses the device's automatic gain control, leaving the signal ~23 dB quieter than the normal pathway. Buffers with more than 2 channels now take channel 0 only with +20 dB makeup gain (hard-clamped), stereo still averages L/R, and a one-shot per-channel RMS diagnostic is logged when a multichannel layout appears.
+### <!-- 6 -->Chores
+- **skills:** refresh installed skills ([a3a4312](https://github.com/tenequm/blackbox/commit/a3a431238bc5ac287a10d81ecd2c8a346bf08540))
 
-## [0.9.0] - 2026-07-03
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.1...v0.9.2
 
-### Added
+## [0.9.1](https://github.com/tenequm/blackbox/compare/v0.9.0...v0.9.1) - 2026-07-03
 
-- Excluded Apps list in Settings: apps in the list never trigger automatic recording, even when they show call-like audio activity (mic + speaker active together). Excluding a parent app also covers its helper processes (e.g. Chrome helpers). Apps can be added from the running-apps menu (including menu-bar/accessory apps such as dictation tools) or via an "Other..." file picker for apps that aren't currently running. Contributed by @mugoosse (#12).
-- Configurable date prefix for recording names (Settings > General): YYYY/YY/MM/DD tokens, default `YYMM-DD-`.
+### <!-- 2 -->Bug Fixes
+- **recorder:** take channel 0 when mic input has a voice-processing layout ([db16745](https://github.com/tenequm/blackbox/commit/db16745e7e5ad9d1163866a7ae9fb2a02012b38c))
+- **recorder:** add +20 dB makeup gain for voice-processing mic buffers ([2d7bfea](https://github.com/tenequm/blackbox/commit/2d7bfea3434a80cc549e4496953c4a6652711e0a))
+- **ui:** scale menu bar level meter by dBFS so voice registers ([4775b70](https://github.com/tenequm/blackbox/commit/4775b70638d6063a83527c4ee81ecf1bf7b4961f))
 
-### Changed
+### <!-- 5 -->Documentation
+- **release:** add Homebrew tap bump, 403-agreement retry, and Gatekeeper verification to release-dmg skill ([0aac891](https://github.com/tenequm/blackbox/commit/0aac8919dfd11ce622c2edb836fe317320635d7a))
 
-- Transcription upgraded to Soniox `stt-async-v5` and no longer biases language detection toward English.
+### <!-- 7 -->Other
+- Merge pull request #14 from tenequm/fix/facetime-vp-mic-channel
 
-### Fixed
+fix(recorder): take channel 0 when mic input has a voice-processing layout ([421d6ab](https://github.com/tenequm/blackbox/commit/421d6ab71c1991a1ebf8345952240892a55ab625))
 
-- Caller resolution is now a single shared pipeline, so app exclusion applies everywhere including suppression seeding, and a ~5s window where a just-excluded app could still start a recording is closed.
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.0...v0.9.1
 
-## [0.8.1] - 2026-05-06
+## [0.9.0](https://github.com/tenequm/blackbox/compare/v0.8.1...v0.9.0) - 2026-07-03
 
-### Fixed
+### <!-- 1 -->New Features
+- **settings:** add Excluded Apps list to prevent unwanted auto-recording ([242756f](https://github.com/tenequm/blackbox/commit/242756fa40b8f380ad8c6535ab1186a7289bd11a))
+- **transcription:** upgrade to Soniox stt-async-v5, drop English language bias ([f65344b](https://github.com/tenequm/blackbox/commit/f65344b8153a79352dbb431ee6c66a669d35d4c4))
+- **settings:** configurable date prefix for recording names ([04ce436](https://github.com/tenequm/blackbox/commit/04ce436a0ed65dae0b0805b74ab216d22fb8f777))
 
-- 5h46m ghost recording / 0-byte M4A when stop arrives during `AudioRecorder.start()`. Swift actor reentrancy let `stop()` flip a single `stopped` flag while `start()` was suspended on `SCShareableContent` (~12 s); the resumed start created a live recorder no caller held, dropped every buffer, and never finalized. `AudioRecorder` is now a four-phase machine (`notStarted` -> `starting` -> `running` -> `stopped`) with a `cancelRequested` flag checked after every `await`, and a take-and-nil cleanup that's safe under reentrancy. No failure path leaves an orphan directory or zero-byte file under `~/Library/Application Support/Blackbox/Recordings/`.
-- `RecordingPipeline.start()` self-cleans on partial-init throws (metadata save, AVAssetWriter init, startWriting): the recording directory is removed before the error propagates, instead of being left behind for `pipeline.stop()` to ignore.
-- Stop arriving during startup no longer surfaces an error toast. `AudioMonitor` pattern-matches `RecorderError.cancelled` and lost-race conditions silently; permission-denied and other real errors still surface.
-- After a user-initiated stop (manual stop, force-stop on auto-recording), the same bundle no longer immediately re-triggers auto-record on the next 3 s poll. The resolved parent bundle ID is suppressed until it disappears from the active-caller set; other apps (e.g. Zoom while Chrome is suppressed) still trigger auto-record. Grace-expiry stops do not suppress, so a re-detected call still records.
+### <!-- 2 -->Bug Fixes
+- **build:** drop CLT framework search paths from test target ([aefe5b2](https://github.com/tenequm/blackbox/commit/aefe5b26a03329926541b22e6bd082bbd2289cf9))
+- **monitor:** dedupe caller resolution and close stale-exclusion race ([9d9f02d](https://github.com/tenequm/blackbox/commit/9d9f02d9d6572a791cac8a48c8a8367a0ce31014))
 
-### Added
+### <!-- 5 -->Documentation
+- add homebrew install and fix macOS requirement ([11ebb08](https://github.com/tenequm/blackbox/commit/11ebb0894d478fb44bfa8b62b7f126aea6a5a0f8))
 
-- `RecorderError.cancelled` for stop-during-start cancellation.
-- `StartCheckpoint` test seam in `AudioRecorder` and a `StartGate` actor for deterministic recorder-race tests.
-- Docs: `docs/specification.md` D4 amended with the always-live WebRTC caveat; new D13 covers the recorder lifecycle invariant, monitor cooperation, and suppression semantics.
+### <!-- 6 -->Chores
+- **skills:** vendor swift-macos + release-dmg in .agents/skills, symlink .claude/skills ([cb8a37f](https://github.com/tenequm/blackbox/commit/cb8a37fd66e5f7a1a75bc2ca97eac6bb5f3286f8))
+- **monitor:** cover excluded-apps filtering ([84205d2](https://github.com/tenequm/blackbox/commit/84205d24cfcfd8d6fa638349d08db00fb7c156bf))
 
-## [0.8.0] - 2026-04-24
+### <!-- 7 -->Other
+- Merge branch 'main' into feat/excluded-apps
 
-### Added
+# Conflicts:
+#	Sources/AudioMonitorSupport.swift ([5dd979d](https://github.com/tenequm/blackbox/commit/5dd979d21c637b22eb9128af70d00bdf22cfc380))
+- Merge pull request #12 from mugoosse/feat/excluded-apps
 
-- Layered mic recovery (D12). `AVAudioEngineConfigurationChange` (existing) is now supplemented by a CoreAudio `kAudioHardwarePropertyDefaultInputDevice` listener and a 1 Hz buffer-arrival watchdog (2 s stall threshold). All three sources funnel through `requestMicReinstall(source:)` → debounced mic-tap reinstall. Catches same-format default-input swaps that the AVAudioEngine notification silently misses.
+feat(settings): add Excluded Apps list to prevent unwanted auto-recording ([9a55af6](https://github.com/tenequm/blackbox/commit/9a55af6f1e25b14880fe52dcd3f5fd8df976a056))
 
-### Changed
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.8.1...v0.9.0
 
-- Reverted system audio capture from CoreAudio Process Tap (CATap) back to display-wide `SCStream` (ScreenCaptureKit). v0.6.0's SCStream approach had an empirical production track record with zero silent-recording reports; CATap produced three distinct silent-recording bugs in 5 days (Bluetooth HFP 24kHz pin, IO-proc stop when nothing plays, Chrome Meet routed to non-default idle output). Root cause: aggregate-device IO proc fires on a hardware output-device clock that can be idle, pinned, or stalled. SCStream's clock comes from the OS-composited mix, decoupled from any specific device.
-- System-audio track is now 2ch stereo 48 kHz 128 kbps AAC (was 1ch mono 64 kbps). Mic track remains 1ch mono 48 kHz 64 kbps. File size for a 30 min call: system track ~29 MB (was ~14 MB).
-- Gap fill (D8), leading silence, and tail padding apply to the mic track only. System track has no synthesised silence - matches v0.6.0 which shipped without system-track gap fill for weeks.
-- Onboarding now actively requests Screen Recording permission on completion via `CGRequestScreenCaptureAccess()`.
-- Settings > Permissions row relabelled "Screen & System Audio Recording"; deep-links to the Screen Recording pane; uses `CGPreflightScreenCaptureAccess()` for live TCC state instead of a "recorded once" cache.
+## [0.8.1](https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1) - 2026-05-06
 
-### Fixed
+### <!-- 2 -->Bug Fixes
+- **recorder:** prevent start/stop race, never leave 0-byte M4A, suppress auto-retry on stopped bundle ([283cb3c](https://github.com/tenequm/blackbox/commit/283cb3c5469532984e4ad89e6eb52c031b09e993))
 
-- Silent system-audio track on FaceTime (and any app routing through communication audio paths on macOS 26). SCStream delivers non-interleaved stereo Float32 CMSampleBuffers; the PCM round-trip helper inherited from the CATap era mis-copied non-interleaved payloads, producing system tracks with mean_volume near -66 dB. SCStream buffers are now appended directly to a stereo 128 kbps AAC writer input (v0.6.0 parity). Post-fix: FaceTime system track mean_volume -37.8 dB (from -66.4 dB); Chrome -27.1 dB.
-- Full-hour mic-only recordings when default output was idle while Chrome Meet routed call audio to a non-default output via its in-page device picker.
-- `AudioRecorder.stop()` now tears down the D12 default-input CoreAudio listener and watchdog timer (previously only removed in `deinit`'s defensive path). Closes a listener leak on `kAudioObjectSystemObject` that accumulated across recording sessions.
-- Onboarding gate now treats `CGPreflightScreenCaptureAccess()` as the source of truth on every launch. First-run denial and post-install permission revocation both re-surface onboarding; prior behaviour sticky-marked onboarding complete even when the TCC prompt was denied.
-- `mappedStartError` now routes SCStream `-3802`/`-3821` codes to `RecorderError.systemStopped` (new case), matching the in-flight `handleStreamStopped` routing.
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1
 
-### Removed
+## [0.8.0](https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0) - 2026-04-24
 
-- CATap tap/aggregate-device/IO-proc pipeline, output-device change listener, IO proc buffer pool, and mic recovery-after-device-change paths.
-- `AudioRecorder.pcmBuffer(from:)` (interleaved-only PCM helper - root cause of the FaceTime silence on macOS 26), `systemFormat` cache, `systemBuffersConversionFailed` counter.
+### <!-- 1 -->New Features
+- **audio:** revert system audio capture from CATap to display-wide SCStream (v0.8.0) ([eba5f16](https://github.com/tenequm/blackbox/commit/eba5f161488baf17d83d2c9514b80d76e81d5cb3))
+- **audio:** implement D12 - layered mic recovery ([c75890d](https://github.com/tenequm/blackbox/commit/c75890d9870f4b2bf0fde212258c6fbac48c2e8c))
 
-## [0.7.0] - 2026-04-17
+### <!-- 2 -->Bug Fixes
+- **settings:** point permissions UI at Screen Recording pane for SCStream ([d8d0a67](https://github.com/tenequm/blackbox/commit/d8d0a67a47807cc22e64a62767981f6ab208be19))
+- **audio:** PR review fixes - permission deep link, start/stop lifecycle, onboarding symmetry ([7521c8e](https://github.com/tenequm/blackbox/commit/7521c8ed4e117fbd87f0c616bf0d873948e3b5d2))
+- **audio:** close PR #10 review items (D12 teardown, onboarding gate, minor polish) ([9a598d0](https://github.com/tenequm/blackbox/commit/9a598d09277906136346e5091ccc0092f08c1cb1))
 
-### Added
+### <!-- 4 -->Refactor
+- **audio:** clean up trailing CATap residue and optimize SCStream hot path ([e14d307](https://github.com/tenequm/blackbox/commit/e14d3072e810c0e48d542e42a81b006f2c5a4fa2))
+- **audio:** pass SCStream CMSampleBuffers through directly, write stereo system track (v0.6.0 parity) ([9d000ce](https://github.com/tenequm/blackbox/commit/9d000ce128b762446cdc5bfceffff6f59a06cf2b))
+- **onboarding:** use live Screen Recording TCC preflight as skip trigger, drop audioRecordingGranted plumbing ([3ad1ff3](https://github.com/tenequm/blackbox/commit/3ad1ff392032b782d677360080cb79e4f5ec8178))
 
-- CoreAudio Process Tap (CATap) system audio capture, replacing SCStream
-- Hardware smoke test suite with file-based IPC test mode (`--ui-test-mode`) for automated real-audio validation
-- `RecordingPipeline` type for AVAssetWriter management, gap filling, tail padding, and audio level metering (extracted from AudioRecorder for testability)
-- `AudioMonitorDependencies` dependency injection with `TestClock` / `TestRecorderFactory` for deterministic call-detection tests
-- Silence gap filling (D8) across both pipelines with clean LPCM format descriptions
-- Device latency offset compensation (D9) for mic-system alignment
-- Drift compensation via CATap `kAudioSubTapDriftCompensationKey`
-- Output device change handling with aggregate device rebuild and silence gap filling
-- Pre-allocated `AVAudioPCMBuffer` pool for CATap IO proc callback (RT-safe per spec D5)
-- `AudioHardwareSystem` Swift wrappers (switf-macos) for typed CoreAudio access
+### <!-- 5 -->Documentation
+- align specification with v0.8.0 SCStream revert ([2ce4001](https://github.com/tenequm/blackbox/commit/2ce400119334bbeb6b7fe48990f8b2c889ffee47))
+- align CLAUDE.md architecture notes and CHANGELOG Unreleased with v0.6.0 parity ([fd5bea6](https://github.com/tenequm/blackbox/commit/fd5bea6d9f855560ee94a52ed552f5b49b032e06))
+- **spec:** align diagram, D1/D8/D9, architecture evolution with v0.6.0 parity ([818f57a](https://github.com/tenequm/blackbox/commit/818f57a73ff774df610b0fbcee050dbbc8db1152))
+- add D12 - layered mic recovery (AVAudioEngine notification + default-input listener + buffer-arrival watchdog) ([dcc27e9](https://github.com/tenequm/blackbox/commit/dcc27e9fe0f0e447d1d37c76d4c856892e824786))
+- **changelog:** collapse Unreleased into v0.8.0 for release ([7014a56](https://github.com/tenequm/blackbox/commit/7014a561e8aa28d375a84ece32371255a7b1c9f4))
 
-### Changed
+### <!-- 6 -->Chores
+- **smoke:** remove CATap-era listener assertion and update stale comments ([202e40f](https://github.com/tenequm/blackbox/commit/202e40f9874bc24b19cb8aa236f949e5b6e8cb23))
+- ignore .collab scratch dir and scheduled_tasks.lock ([d985146](https://github.com/tenequm/blackbox/commit/d98514688bb82d0eb76f9c921ca426df7469e72c))
+- **smoke:** raise output-device-round-trip mic_age ceiling to 1500 ms ([44e0716](https://github.com/tenequm/blackbox/commit/44e0716000162721af183ed9ab71521167c6ee2d))
 
-- Output is now 2-track M4A: system audio (1ch mono 48kHz) + mic (1ch mono 48kHz). Legacy 3-track recordings remain playable.
-- `AudioRecorder` converted from class to `actor` with custom `DispatchSerialQueue` executor
-- Call detection simplified to polling-only, removing ~140 lines of CoreAudio listener management
-- macOS 26.1+, Swift 6.2, warnings-as-errors
+### <!-- 7 -->Other
+- Merge pull request #10 from tenequm/feat/scstream-revert
 
-### Fixed
+feat(audio): v0.8.0 revert system audio capture from CATap back to display-wide SCStream ([6618be4](https://github.com/tenequm/blackbox/commit/6618be4ddda9c276d7df24d351e2e074df19225f))
 
-- Chrome/WebRTC silent system-audio bug (eliminated by CATap architecture)
-- Mic stall recovery after output device changes (mic is recreated if stalled post-rebuild)
-- Track alignment: session starts on `max(first_sys_pts, first_mic_pts)` so both tracks begin with real content
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0
 
-### Known Issues
+## [0.7.0](https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0) - 2026-04-17
 
-- Tail padding may report a short residual (up to several seconds) when macOS stalls output device routing mid-call. Tracked in #8.
+### <!-- 1 -->New Features
+- **recorder:** migrate system audio capture from SCStream to CATap ([535199c](https://github.com/tenequm/blackbox/commit/535199c0325307a2aa4e84cd9060d49f73780e0f))
+- **recorder:** CATap migration, track alignment fix, and hardware smoke tests ([de8b824](https://github.com/tenequm/blackbox/commit/de8b824c43a8fefcc94b3e48d8c5c86ae57f171b))
 
-## [0.6.0] - 2026-04-04
+### <!-- 2 -->Bug Fixes
+- **recorder:** fill PTS gaps with silence to prevent track desync ([127be85](https://github.com/tenequm/blackbox/commit/127be85ae8165cc00eaabafe8d992e7c79a3bd6e))
+- **recorder:** harden silence gap filling with clean ASBD and logging ([438e16b](https://github.com/tenequm/blackbox/commit/438e16bc2563308c1233cb500dff7ef12248df48))
+- **recorder:** allow mic to start recording session independently ([a2384e0](https://github.com/tenequm/blackbox/commit/a2384e0f54cef7da54ee04a7aa29b502a92cab7f))
+- **makefile:** chmod before bundle copy and xattr to fix permission denied errors ([af6e314](https://github.com/tenequm/blackbox/commit/af6e314f29f706bb32648e722a63c5bef8567ee7))
+- **recorder:** revert force-48kHz aggregate rate; follow device rate instead ([7f02fa0](https://github.com/tenequm/blackbox/commit/7f02fa048a839ff32e6d5f2830f77038e063c858))
 
-### Added
+### <!-- 4 -->Refactor
+- **audio:** adopt CoreAudio Swift wrappers + actor conversion for macOS 26.1+ ([1dca12b](https://github.com/tenequm/blackbox/commit/1dca12bc85f732e821056e7e2b1d38bc6a3b8572))
+- **recorder:** address PR #7 review fixes ([09c0ab0](https://github.com/tenequm/blackbox/commit/09c0ab06ad03724f3a09426069e21ccce514fdb5))
+- **recorder:** apply PR #7 review findings ([0020dc5](https://github.com/tenequm/blackbox/commit/0020dc5754233e63f7006c91869bf11e0e6667c7))
 
-- Dual-SCStream recording: display-wide stream (guaranteed completeness) runs alongside per-app stream (cleaner AEC reference) simultaneously
-- Per-app audio track in recordings when single caller detected (3-track M4A: display-wide + per-app + mic)
-- Display and per-app audio buffer stats logging (received, appended, dropped, peak level)
-- Track selector shows App option for 3-track recordings
+### <!-- 5 -->Documentation
+- update spec for dual-SCStream and audio gap filling ([246ea3e](https://github.com/tenequm/blackbox/commit/246ea3eb8ad3b341d392335f1786bff7536b6139))
+- **spec:** expand D8 with clock research, safety rules, and alternatives ([f7fe9c0](https://github.com/tenequm/blackbox/commit/f7fe9c01503af8f867b47645a8830900f8e9867e))
+- **spec:** update architecture for CATap migration ([0e2b568](https://github.com/tenequm/blackbox/commit/0e2b568ef6ed03e9daf41f2b425a1c4189f9bb5e))
+- **spec:** fix validation issues and add missing implementation details ([6451d4f](https://github.com/tenequm/blackbox/commit/6451d4fe221bb8c4ac78fdf79f42094342e846d0))
+- **spec:** add architecture evolution section ([b783a22](https://github.com/tenequm/blackbox/commit/b783a22f9e2b3b2ef4904edae67e6188c1ac0d41))
 
-### Changed
+### <!-- 6 -->Chores
+- add switf-macos skill dependency ([5a49611](https://github.com/tenequm/blackbox/commit/5a49611403ea1eecbdb7ba015cd5d00f3896ffe6))
+- add switf-macos skill dependency ([c73eee0](https://github.com/tenequm/blackbox/commit/c73eee00643c2fdf6f0f2b1ea77952ae7a33e461))
+- remove collab files from feature branch ([cc1f533](https://github.com/tenequm/blackbox/commit/cc1f533e8c4b922cb3f8fa77d672717e550eda99))
+- add edge case tests for pipeline and monitor ([8dafe43](https://github.com/tenequm/blackbox/commit/8dafe43da6b478ceb6ac96610d4cc642ee3ce07b))
 
-- AEC post-processing uses per-app track as reference when available (cleaner than display-wide)
-- Transcription skips display-wide track in 3-track files to avoid doubling call audio
-- Removed mid-recording restart logic (no more interrupted recordings from caller detection churn)
+### <!-- 7 -->Other
+- Merge pull request #6 from tenequm/fix/audio-track-sync
 
-### Fixed
+fix(recorder): fill PTS gaps with silence to prevent mic/system track desync (re-merge) ([620ee21](https://github.com/tenequm/blackbox/commit/620ee2129e55b526ba076f1289540641c241e017))
+- Merge branch 'main' into refactor/catap-migration ([a853420](https://github.com/tenequm/blackbox/commit/a85342021a6ca225d86a22d4691450c3cc2fa16f))
+- Merge pull request #7 from tenequm/refactor/catap-migration
 
-- Chrome/WebRTC calls producing silent system audio track (per-app SCStream of Chrome captures silence, display-wide now always present as fallback)
+refactor(audio): CoreAudio Swift wrappers + actor conversion (macOS 26.1+) ([ddaa843](https://github.com/tenequm/blackbox/commit/ddaa84394e8e183b6922e3a594f3eaf487f9164e))
 
-## [0.5.1] - 2026-03-16
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
 
-### Fixed
+## [0.6.0](https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0) - 2026-04-04
 
-- Mic audio recorded at 2x speed when device switches mid-recording (e.g. AirPods connecting during a call) - tap now resamples to 48kHz instead of passing native device rate to AVAssetWriter
+### <!-- 1 -->New Features
+- **recorder:** dual-SCStream recording architecture ([539195c](https://github.com/tenequm/blackbox/commit/539195c64e2bde7bfea3c06f1e324acddadc66a3))
 
-## [0.5.0] - 2026-03-13
+### <!-- 3 -->Performance
+- **recorder:** fuse peak tracking into publishAudioLevel, fix docs ([60f5f22](https://github.com/tenequm/blackbox/commit/60f5f22c9de5f497682725f2aabe48a471812677))
 
-### Added
+### <!-- 7 -->Other
+- Merge pull request #4 from tenequm/feat/dual-scstream
 
-- Per-app audio capture: when a single calling app is detected, captures only that app's audio via SCContentFilter. Falls back to display-wide capture for multiple callers or unresolved apps
-- Crash recovery watchdog helper (BlackboxWatchdog)
-- AEC regression test suite and golden reference validation scripts
-- App icon and screenshot in README
+feat(recorder): dual-SCStream recording architecture ([f67e795](https://github.com/tenequm/blackbox/commit/f67e79567a7dfef4334e358f26de21e4a628d6a7))
 
-### Changed
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
 
-- AEC post-processing streams chunk-by-chunk instead of loading entire tracks into memory (constant ~16KB vs ~3x recording size)
+## [0.5.0](https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0) - 2026-03-13
 
-### Fixed
+### <!-- 1 -->New Features
+- **capture:** per-app audio capture with display-wide fallback ([877372f](https://github.com/tenequm/blackbox/commit/877372fba5fe53e80206e8f5a690821d8ea236d4))
 
-- Crash when Krisp switches audio devices during recording (ObjCTryBlock broken in release builds due to NS_NOESCAPE block optimization)
-- Uncaught exception handler crash on background thread (inherited @MainActor isolation)
-- Config change observer crash on CoreAudio I/O thread (inherited @MainActor isolation)
-- Race between stop() and config change handlers causing concurrent AVAudioEngine mutation
-- Zero-format (0Hz, 0ch) from inputNode during device transitions now rejected before installTap
-- Rapid device switching causing unnecessary mic audio gaps (300ms debounce)
+### <!-- 2 -->Bug Fixes
+- **recorder:** bulletproof mic capture against Krisp/device-switch crashes ([e91a71d](https://github.com/tenequm/blackbox/commit/e91a71dba54c93e84e51e4f1999cd6b59816ecb0))
 
-## [0.4.3] - 2026-03-11
+### <!-- 4 -->Refactor
+- **aec:** stream AEC processing chunk-by-chunk instead of batch ([f3e4002](https://github.com/tenequm/blackbox/commit/f3e4002017c87341cf8873f08d4f76c2d4b9ead4))
 
-### Added
+### <!-- 5 -->Documentation
+- add app icon and screenshot to README ([3586d74](https://github.com/tenequm/blackbox/commit/3586d740f2a025e6f8a01a39b9210f6070f22ea0))
 
-- Mic diagnostic logging: input device name, permission status, and peak audio level logged per recording for debugging silent mic issues
+### <!-- 6 -->Chores
+- add .swiftpm/ to gitignore ([d1fa2a5](https://github.com/tenequm/blackbox/commit/d1fa2a599d829218d2250cfe03be6ff5f6747abb))
 
-## [0.4.2] - 2026-03-11
+### <!-- 7 -->Other
+- Merge pull request #1 from tenequm/feat/per-app-audio-capture
 
-### Fixed
+Per-app audio capture with display-wide fallback ([3f832c8](https://github.com/tenequm/blackbox/commit/3f832c8130b472a6e218d7b498cdf1b30d3c3c7d))
 
-- False positive "Previous session crashed unexpectedly" error shown on every launch (crash detection flag was read after being overwritten)
-- Mic track silent in recordings: AVAssetWriterInput was configured for 2-channel output but AVAudioEngine mic delivers 1-channel audio
-- Mic buffer diagnostics: logs received/appended/dropped counts on recording stop for easier debugging
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
 
-## [0.4.1] - 2026-03-11
+## [0.4.0](https://github.com/tenequm/blackbox/compare/v0.3.0...v0.4.0) - 2026-03-11
 
-### Fixed
+### <!-- 1 -->New Features
+- AVAudioEngine mic capture, waveform visualization, architecture simplification ([bf37850](https://github.com/tenequm/blackbox/commit/bf37850db8cedb1fa32a4b1fc85b9c7fd3e1e185))
+- **aec:** add DTLN-aec echo cancellation post-processing with UI controls ([4bbec7a](https://github.com/tenequm/blackbox/commit/4bbec7a0b61d31fa3fc23cf74a003ef2476b1909))
 
-- Crash on echo cancellation: DTLN-aec CoreML model bundle was not included in app bundle (only present in dev builds)
-- Silent crashes now detected on next launch with error shown in menu bar
-- Uncaught Objective-C exceptions now logged before process exit
+### <!-- 5 -->Documentation
+- add audio architecture specification and Azayaka acknowledgment ([502aff1](https://github.com/tenequm/blackbox/commit/502aff10a0cbf13ef8416fa6e582f51c483fccb9))
+- **spec:** add D7 - VPIO incompatible with SCStream system audio ([351886b](https://github.com/tenequm/blackbox/commit/351886b0efa6cd67eaae1a1a8c37026fa35b33ba))
 
-### Changed
+### <!-- 6 -->Chores
+- switch license from Apache 2.0 to GPL v3 ([bd9cfdf](https://github.com/tenequm/blackbox/commit/bd9cfdf63c3ca4c40206a47c299ba4f1f0354616))
 
-- Echo cancellation is now manual (button in recording detail view) instead of automatic on recording stop
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.3.0...v0.4.0
 
-## [0.4.0] - 2026-03-11
+## [0.3.0](https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0) - 2026-03-10
 
-### Added
+### <!-- 1 -->New Features
+- per-process mic detection, transcription, and recordings UI ([01d18b4](https://github.com/tenequm/blackbox/commit/01d18b48176f7a1b02226d875441a8c6ec76e201))
+- .blackbox bundle format, HUD notifications, audio metering, production hardening ([72ebfc2](https://github.com/tenequm/blackbox/commit/72ebfc2b2a5ebe70ddb964031d757dd89ca30b94))
+- dual-track capture with auto-mix, MP3 export, transcription improvements ([7e15dca](https://github.com/tenequm/blackbox/commit/7e15dcad2f04b30241ed945a97873123f020d6df))
 
-- Echo cancellation post-processing (DTLN-aec CoreML, 256-unit model) for cleaner mic recordings
-- Original/Processed audio toggle in recording detail view (defaults to processed when available)
-- Echo cancellation indicator icon in recordings list
-- Waveform visualization in recording detail view (amplitude bars via Canvas, click/drag to seek)
-- Track selector (Both/System/Mic) for playback controls
-- System notification when Screen Recording permission is revoked during recording
-- Input+output check for call detection (filters out dictation, Siri, voice memos)
+### <!-- 2 -->Bug Fixes
+- harden recording safety, mic detection, and build pipeline ([2d03326](https://github.com/tenequm/blackbox/commit/2d0332646d35a9f6e96c4db6150df28f0f33762e))
+- **export:** replace broken MP3 export with M4A single-track export ([c787927](https://github.com/tenequm/blackbox/commit/c787927542114bf2dead39640b9473627ea4d572))
 
-### Changed
+### <!-- 5 -->Documentation
+- add CHANGELOG.md following keepachangelog format ([4206b8d](https://github.com/tenequm/blackbox/commit/4206b8df81fc378491f0575974180d657cad0735))
 
-- Playback and transcription prefer echo-cancelled audio (`audio-processed.m4a`) when available
-- Processed recordings stored at 16kHz mono AAC alongside originals for size savings and debugging
-- Mic capture uses AVAudioEngine instead of SCStream `.microphone` (independent pipeline, automatic device following)
-- Call detection uses polling-only (no CoreAudio property listeners)
-- Dual-track M4A is now the final output format (no post-recording mixing)
-- Display-wide audio capture no longer excludes any apps
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0
 
-### Fixed
+## [0.2.0](https://github.com/tenequm/blackbox/releases/tag/v0.2.0) - 2026-03-09
 
-- `dispatch_assert_queue_fail` crash in disk space monitor (MainActor isolation inherited by DispatchSource handler on audioQueue)
-- Config change data race: AVAudioEngine handler now dispatches to audioQueue instead of running on arbitrary CoreAudio thread
-- Format mismatch on mic device change: preserves original tap format so AVAssetWriterInput encoder doesn't fail mid-stream
-- Inaccurate mic timestamps: uses AVAudioTime from tap callback via CMClockMakeHostTimeFromSystemUnits for proper multi-track sync
-- Idle sleep could interrupt recording: changed ProcessInfo activity to `.userInitiated` (prevents sleep)
-- Auto-recording not retried when initial start fails during active call
-- Silent file loss on finishWriting timeout: now saves partial file (playable due to movieFragmentInterval)
+### <!-- 1 -->New Features
+- initial Blackbox implementation ([31dc08b](https://github.com/tenequm/blackbox/commit/31dc08b8c34c722fb5123d25811e581e64f47bbf))
+- app icon, notifications, settings UX, Telegram support, stable signing ([a487663](https://github.com/tenequm/blackbox/commit/a487663487aa1c9070eb0db8b8bda5f9211850af))
+- add Sparkle auto-update support ([17a37d5](https://github.com/tenequm/blackbox/commit/17a37d5537641f16bffacdea3cc8180a904c8a12))
+- add structured logging with os.Logger + file sink ([4d69c19](https://github.com/tenequm/blackbox/commit/4d69c192558b6e8c7f0c3f8f5f500299295fef69))
+- UX overhaul with onboarding, recording HUD, settings redesign, and concurrency fixes ([3a7c25c](https://github.com/tenequm/blackbox/commit/3a7c25c760e6058889b3b9e987fb58cee08f0685))
+- bulletproof audio recording with auto-recovery and device following ([1feb6ac](https://github.com/tenequm/blackbox/commit/1feb6accc8f18df2bcb3b87bba3032761561e5ed))
+- mic-based detection, simplified menu, HUD improvements ([e7aca3c](https://github.com/tenequm/blackbox/commit/e7aca3c8432e05f3e67c22e62459d13f5d766311))
 
-### Removed
+### <!-- 2 -->Bug Fixes
+- onboarding flow, data races, and UX polish ([5a717a5](https://github.com/tenequm/blackbox/commit/5a717a5fd76042bd209e7867c1a6acb99fdb0b97))
+- mic device targeting, permission UX, menu state priority, and race conditions ([02d1712](https://github.com/tenequm/blackbox/commit/02d1712c97bca5c8518ee995607ca2e7c4ad563b))
+- live elapsed timer, menu layout, and settings resizability ([debe3b0](https://github.com/tenequm/blackbox/commit/debe3b03f1c698a01eee10208fef774eb05e3eb6))
 
-- Apple Voice Processing (`setVoiceProcessingEnabled`) - removed for reliability (VPIO aggregate device caused format issues)
-- Post-recording audio mixing (AVMutableComposition + AVAssetExportSession)
-- Virtual audio processor exclusion list (Krisp, SoundSource, Loopback)
-- CoreAudio device change listener for mic following
-- CoreAudio process list and per-process input listeners (~140 lines)
-- Dead code: `Log.fault`, unused `TranscriptionService` error cases, stale `.blackbox` path checks
+### <!-- 5 -->Documentation
+- add README with setup and install instructions ([d30e2f6](https://github.com/tenequm/blackbox/commit/d30e2f694e955f5d3f18d7b2114cdb6c7aea1c15))
+- update CLAUDE.md for new save path, menu label, and resilience architecture ([80449a0](https://github.com/tenequm/blackbox/commit/80449a0c159b2b3d33953c12318e02afa4233fe2))
 
-## [0.3.0] - 2026-03-10
-
-### Added
-
-- Per-process mic detection using macOS 14.2+ CoreAudio APIs (`kAudioProcessPropertyIsRunningInput`) - replaces system-wide `DeviceIsRunningSomewhere` listener
-- Microphone capture on auto-recordings - both system audio and mic are now recorded during calls
-- Call app name resolution from bundle ID (shown in HUD, notifications, and file names)
-- Transcription service with Soniox integration
-- Recordings detail view with built-in audio player and transcription UI
-- NavigationSplitView layout for recordings (sidebar + detail pane)
-- Soniox API key field in Settings
-- M4A export for recordings (single-track copy, auto-mixes if multi-track)
-- Real-time audio level metering with animated waveform icon in menu bar
-- HUD-based error notifications with configurable duration
-- Disk space pre-check (50 MB minimum) before starting a recording
-- Restart rate limiting for auto-recovery (max 3 restarts per 30-second window)
-- Virtual audio processor exclusion (Krisp, SoundSource, Loopback) to prevent voice duplication
-- "Report a Bug" menu item (opens GitHub issues)
-- Keyboard shortcuts for playback: Space (play/pause), Left/Right arrows (skip 15s)
-- Low disk space monitoring during recording (warning at 500 MB, auto-stop at 100 MB)
-- Polished DMG installer with proper icon layout via `create-dmg`
-- Swift Testing framework setup (`make test`, `make check`)
-- `/release-dmg` slash command for automated release pipeline
-
-### Changed
-
-- Recording uses dual-track capture (system audio + mic as separate AVAssetWriterInputs) with auto-mix to single-track M4A on save via AVMutableComposition
-- Recordings stored as plain directories instead of `.blackbox` macOS package bundles
-- Transcription uses Soniox `stt-async-v4` model with mix-first approach (multi-track files mixed before upload)
-- Auto-recordings now include microphone audio (previously system audio only)
-- Recordings UI redesigned from flat table to split view with playback and transcription
-- "Record Microphone" setting now applies to all recordings, not just manual ones
-- `make run` now kills the previous Blackbox process before launching
-- Notifications switched from system banners (UNUserNotification) to in-app HUD toasts
-- "Recording Saved" HUD click now opens the main window instead of Finder
-- Soniox API key stored in macOS Keychain instead of UserDefaults (with one-time migration)
-- Transcription file upload uses streaming (64 KB chunks) instead of loading entire file into memory
-- Auto-recording now degrades gracefully on mic failure (continues without mic instead of stopping)
-
-### Removed
-
-- `.blackbox` bundle format and UTI declaration
-- One-time migration from flat `.m4a` to `.blackbox` format (no longer needed)
-
-### Fixed
-
-- Voice duplication when using Krisp or other virtual audio processors
-- Soniox speaker field parsing (v4 API returns String, not Int)
-- Transcription quality - proper speaker diarization with timestamps instead of single text blob
-- `stop()` no longer returns URL for corrupt files (guards on `writer.status == .completed`)
-- AVAssetWriter failure during recording now triggers auto-recovery instead of silently truncating
-- `applicationShouldTerminate` double-reply race prevented with `hasReplied` flag
-- Menu bar audio level icons use valid SF Symbols (`speaker.wave.1`/`.2`/`.3`)
-- Removed unnecessary `.screen` output registration from SCStream (wasted GPU resources)
-- Menu bar countdown/elapsed timer font changed to `.monospacedDigit()` for stable width
-- Auto-recording now starts after manual recording stops during an active call
-- HUD click handler fires only once (was possible to double-fire on rapid clicks)
-- Dropped audio buffers are now logged for diagnostic purposes
-- Recordings list debounced on window activation (prevents redundant disk scans)
-
-## [0.2.0] - 2026-03-09
-
-### Added
-
-- Release pipeline with notarization, stapling, and Sparkle appcast
-- DMG creation with Applications symlink
-
-## [0.1.0] - 2026-03-08
-
-### Added
-
-- Auto-recording triggered by microphone activity detection
-- Manual recording via menu bar
-- Dual-track M4A output (system audio + mic)
-- Recording HUD with start/save notifications
-- Grace period for call resumption detection
-- Auto-recovery on stream failures
-- Device following (seamless mic switching)
-- Crash-safe recordings via movie fragment intervals
-- Onboarding flow with permissions walkthrough
-- Settings: launch at login, grace period, save directory, notifications
-- Structured logging with os.Logger + file sink
-- Sparkle auto-update support
-- Developer ID code signing
-
-[unreleased]: https://github.com/tenequm/blackbox/compare/v0.9.3...HEAD
-[0.9.3]: https://github.com/tenequm/blackbox/compare/v0.9.2...v0.9.3
-[0.9.2]: https://github.com/tenequm/blackbox/compare/v0.9.1...v0.9.2
-[0.8.1]: https://github.com/tenequm/blackbox/compare/v0.8.0...v0.8.1
-[0.8.0]: https://github.com/tenequm/blackbox/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/tenequm/blackbox/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/tenequm/blackbox/compare/v0.5.1...v0.6.0
-[0.5.1]: https://github.com/tenequm/blackbox/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/tenequm/blackbox/compare/v0.4.3...v0.5.0
-[0.4.3]: https://github.com/tenequm/blackbox/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/tenequm/blackbox/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/tenequm/blackbox/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/tenequm/blackbox/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/tenequm/blackbox/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/tenequm/blackbox/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/tenequm/blackbox/releases/tag/v0.1.0
+### <!-- 6 -->Chores
+- Developer ID signing, deep-sign Sparkle, simplify README ([b719650](https://github.com/tenequm/blackbox/commit/b71965061c52b86556826f5b943a69c4bc004ab4))
+- bump version to 0.2.0, add release pipeline ([6f0284c](https://github.com/tenequm/blackbox/commit/6f0284c8ccb9b71bc464997aa51a8058f3daa867))

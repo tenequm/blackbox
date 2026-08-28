@@ -13,7 +13,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
-    <string>17</string>
+    <string>18</string>
     <key>CFBundleShortVersionString</key>
     <string>0.9.4</string> <!-- x-release-please-version -->
     <key>LSMinimumSystemVersion</key>
