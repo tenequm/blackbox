@@ -886,7 +886,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     var diagnostics = TrackDiagnostics()
     diagnostics.buffersReceived = 10
-    diagnostics.signal.add(BufferSignal(seconds: 1, samples: 48_000, sumSquares: 0, peak: 0))
+    diagnostics.signal.add(.constant(peak: 0))
     let summary = SignalSummary(
       system: TrackSignalSummary(diagnostics, writerFailed: false), mic: nil)
     try RecordingMetadata(

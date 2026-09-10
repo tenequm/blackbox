@@ -505,7 +505,7 @@ final class AudioMonitor {
 
   /// Resolve helper subprocess bundle IDs to the parent app.
   /// e.g. "com.google.Chrome.helper.renderer" → "com.google.Chrome"
-  private static func resolveParentBundleID(_ bundleID: String) -> String {
+  nonisolated static func resolveParentBundleID(_ bundleID: String) -> String {
     let parts = bundleID.split(separator: ".")
     if let idx = parts.firstIndex(where: { $0 == "helper" }), idx > 1 {
       return parts[..<idx].joined(separator: ".")

@@ -127,6 +127,45 @@ nonisolated struct SignalStats: Sendable {
   var rmsDbfs: Double? { sumSquares > 0 ? 10 * log10(sumSquares / Double(samples)) : nil }
   var peakDbfs: Double? { peak > 0 ? 20 * log10(Double(peak)) : nil }
   var zeroFraction: Double { seconds > 0 ? zeroSeconds / seconds : 0 }
+  var isAllZero: Bool { buffers > 0 && zeroBuffers == buffers }
+
+  static func dbfsLabel(_ dbfs: Double?) -> String {
+    dbfs.map { String(format: "%.1f", $0) } ?? "-inf"
+  }
+}
+
+extension TrackSignalSummary {
+  /// Share of delivered audio that must be exact zeros to call a track silent.
+  /// Real silence from a microphone or a remote party is never exactly zero.
+  nonisolated static let silentFraction = 0.99
+
+  nonisolated init(_ diagnostics: TrackDiagnostics, writerFailed: Bool) {
+    let signal = diagnostics.signal
+    let status: Status
+    if writerFailed || diagnostics.buffersAppendFailed > 0 {
+      status = .writeFailures
+    } else if diagnostics.buffersReceived == 0 {
+      status = .noBuffers
+    } else if signal.buffers > 0, signal.zeroFraction >= Self.silentFraction {
+      status = .silentBuffers
+    } else {
+      status = .ok
+    }
+    func rounded(_ value: Double) -> Double { (value * 100).rounded() / 100 }
+    self.init(
+      status: status,
+      buffersReceived: diagnostics.buffersReceived,
+      appendFailures: diagnostics.buffersAppendFailed,
+      seconds: rounded(signal.seconds),
+      zeroSeconds: rounded(signal.zeroSeconds),
+      longestZeroRunSeconds: rounded(signal.longestZeroRunSeconds),
+      peakDbfs: signal.peakDbfs.map(rounded),
+      rmsDbfs: signal.rmsDbfs.map(rounded))
+  }
+
+  nonisolated var logDescription: String {
+    "\(status.rawValue) zero=\(String(format: "%.1f", zeroSeconds))/\(String(format: "%.1f", seconds))s longest_zero_run=\(String(format: "%.1f", longestZeroRunSeconds))s peak=\(SignalStats.dbfsLabel(peakDbfs))"
+  }
 }
 
 nonisolated struct RecordingDiagnostics: Sendable {
@@ -264,7 +303,7 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated var currentDiagnostics: RecordingDiagnostics { diagnostics }
 
   /// Per-track signal since the previous call; starts a new window. Called by
-  /// the recorder's 5 s drift log on `audioQueue`. Totals stay in
+  /// the recorder's drift log on `audioQueue`. Totals stay in
   /// `currentDiagnostics`.
   nonisolated func takeSignalWindow() -> (system: SignalStats, mic: SignalStats) {
     defer {
@@ -489,11 +528,11 @@ final class RecordingPipeline: @unchecked Sendable {
       saved = capturedWriter.status == .completed ? capturedDirectory : nil
     }
 
-    if let saved { recordSignalSummary(in: saved, writerFailed: writerFailed) }
+    if let saved { await recordSignalSummary(in: saved, writerFailed: writerFailed) }
     return saved
   }
 
-  nonisolated private func recordSignalSummary(in directory: URL, writerFailed: Bool) {
+  nonisolated private func recordSignalSummary(in directory: URL, writerFailed: Bool) async {
     let summary = SignalSummary(
       system: TrackSignalSummary(diagnostics.system, writerFailed: writerFailed),
       mic: micEnabled ? TrackSignalSummary(diagnostics.mic, writerFailed: writerFailed) : nil)
@@ -502,12 +541,20 @@ final class RecordingPipeline: @unchecked Sendable {
       "signal summary: system \(summary.system.logDescription)"
         + (summary.mic.map { " | mic \($0.logDescription)" } ?? ""))
 
-    guard var metadata = RecordingMetadata.load(in: directory) else { return }
-    metadata.signal = summary
-    do {
-      try metadata.save(in: directory)
-    } catch {
-      Log.error(Log.recorder, "recorder", "signal summary not saved: \(error.localizedDescription)")
+    // On the main actor, where every rename writes this file: a load-modify-save
+    // interleaved with one would put the old title back.
+    await MainActor.run {
+      guard var metadata = RecordingMetadata.load(in: directory) else {
+        Log.error(Log.recorder, "recorder", "signal summary not saved: metadata.json unreadable")
+        return
+      }
+      metadata.signal = summary
+      do {
+        try metadata.save(in: directory)
+      } catch {
+        Log.error(
+          Log.recorder, "recorder", "signal summary not saved: \(error.localizedDescription)")
+      }
     }
   }
 

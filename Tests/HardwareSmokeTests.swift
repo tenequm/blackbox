@@ -88,11 +88,13 @@ struct HardwareSmokeTests {
     // SCStream can deliver every buffer on time with every sample zero, and
     // nothing above notices. The fixture played during capture, so the system
     // track must carry signal.
+    let fixturePeakFloorDbfs = -60.0
     let signal = try #require(
       RecordingMetadata.load(in: recordingDir)?.signal, "metadata.json has no signal summary")
     #expect(
-      signal.system.status == .ok && (signal.system.peakDbfs ?? -.infinity) > -60,
-      "System track did not capture the fixture: \(signal.system.logDescription)")
+      signal.system.status == .ok && (signal.system.peakDbfs ?? -.infinity) > fixturePeakFloorDbfs,
+      "System track did not capture the fixture (peak floor \(fixturePeakFloorDbfs) dBFS): \(signal.system.logDescription)"
+    )
   }
 
   @Test(

@@ -550,7 +550,7 @@ struct SettingsView: View {
     }
   }
 
-  private static var versionString: String {
+  static var versionString: String {
     let info = Bundle.main.infoDictionary
     let short = info?["CFBundleShortVersionString"] as? String ?? "?"
     // The build number is what Sparkle compares to decide whether an update

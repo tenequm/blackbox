@@ -50,7 +50,7 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
     // Diagnostics only: a malformed block must not take the title and the
     // speaker names down with it.
-    signal = (try? container.decodeIfPresent(SignalSummary.self, forKey: .signal)) ?? nil
+    signal = try? container.decodeIfPresent(SignalSummary.self, forKey: .signal)
   }
 
   static func load(in directory: URL) -> RecordingMetadata? {
@@ -82,17 +82,12 @@ nonisolated struct SignalSummary: Codable, Sendable, Equatable {
 nonisolated struct TrackSignalSummary: Codable, Sendable, Equatable {
   enum Status: String, Codable, Sendable {
     case ok
-    /// The source never delivered a buffer.
     case noBuffers
     /// Buffers arrived, but nearly all of them were exact digital zeros.
     case silentBuffers
     /// The writer rejected samples or failed; what reached disk is partial.
     case writeFailures
   }
-
-  /// Share of delivered audio that must be exact zeros to call a track silent.
-  /// Real silence from a microphone or a remote party is never exactly zero.
-  static let silentFraction = 0.99
 
   var status: Status
   var buffersReceived: Int
@@ -103,34 +98,6 @@ nonisolated struct TrackSignalSummary: Codable, Sendable, Equatable {
   /// Nil when no non-zero sample arrived; JSON has no -inf.
   var peakDbfs: Double?
   var rmsDbfs: Double?
-
-  init(_ diagnostics: TrackDiagnostics, writerFailed: Bool) {
-    let signal = diagnostics.signal
-    if writerFailed || diagnostics.buffersAppendFailed > 0 {
-      status = .writeFailures
-    } else if diagnostics.buffersReceived == 0 {
-      status = .noBuffers
-    } else if signal.buffers > 0, signal.zeroFraction >= Self.silentFraction {
-      status = .silentBuffers
-    } else {
-      status = .ok
-    }
-    buffersReceived = diagnostics.buffersReceived
-    appendFailures = diagnostics.buffersAppendFailed
-    seconds = Self.rounded(signal.seconds)
-    zeroSeconds = Self.rounded(signal.zeroSeconds)
-    longestZeroRunSeconds = Self.rounded(signal.longestZeroRunSeconds)
-    peakDbfs = signal.peakDbfs.map(Self.rounded)
-    rmsDbfs = signal.rmsDbfs.map(Self.rounded)
-  }
-
-  var logDescription: String {
-    let peak = peakDbfs.map { String(format: "%.1fdBFS", $0) } ?? "-inf"
-    return
-      "\(status.rawValue) zero=\(String(format: "%.1f", zeroSeconds))/\(String(format: "%.1f", seconds))s longest_zero_run=\(String(format: "%.1f", longestZeroRunSeconds))s peak=\(peak)"
-  }
-
-  private static func rounded(_ value: Double) -> Double { (value * 100).rounded() / 100 }
 }
 
 /// Where a recording's files live and how to find them. Centralised because

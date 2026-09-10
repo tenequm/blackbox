@@ -876,11 +876,6 @@ struct SignalMeasurementTests {
     return buf.asSampleBuffer()!
   }
 
-  private func signal(peak: Float, seconds: Double = 1) -> BufferSignal {
-    BufferSignal(
-      seconds: seconds, samples: 48_000, sumSquares: Double(peak * peak) * 48_000, peak: peak)
-  }
-
   @Test("an all-zero buffer measures as silent with its real duration")
   func silentBuffer() throws {
     let buffer = try #require(
@@ -894,7 +889,7 @@ struct SignalMeasurementTests {
 
   /// SCStream delivers non-interleaved stereo. Signal only in the right channel
   /// catches a measurement that reads just the first plane.
-  @Test("non-interleaved stereo measures both channels", arguments: [false, true])
+  @Test("stereo measures both channels, interleaved or not", arguments: [false, true])
   func stereoMeasuresBothChannels(interleaved: Bool) throws {
     let measured = try #require(
       BufferSignal.measure(stereoBuffer(left: 0, right: 0.5, interleaved: interleaved)))
@@ -906,11 +901,11 @@ struct SignalMeasurementTests {
   @Test("zero runs, zero share and levels accumulate across buffers")
   func statsAccumulate() {
     var stats = SignalStats()
-    stats.add(signal(peak: 0.5))
-    stats.add(signal(peak: 0))
-    stats.add(signal(peak: 0))
-    stats.add(signal(peak: 0.1))
-    stats.add(signal(peak: 0))
+    stats.add(.constant(peak: 0.5))
+    stats.add(.constant(peak: 0))
+    stats.add(.constant(peak: 0))
+    stats.add(.constant(peak: 0.1))
+    stats.add(.constant(peak: 0))
 
     #expect(stats.buffers == 5)
     #expect(stats.zeroBuffers == 3)
@@ -922,7 +917,7 @@ struct SignalMeasurementTests {
   @Test("a track that never carried a sample has no finite level")
   func silentStatsHaveNoLevel() {
     var stats = SignalStats()
-    stats.add(signal(peak: 0))
+    stats.add(.constant(peak: 0))
     #expect(stats.peakDbfs == nil)
     #expect(stats.rmsDbfs == nil)
     #expect(
@@ -933,12 +928,12 @@ struct SignalMeasurementTests {
   func trackStatus() {
     var silent = TrackDiagnostics()
     silent.buffersReceived = 100
-    for _ in 0..<100 { silent.signal.add(signal(peak: 0)) }
+    for _ in 0..<100 { silent.signal.add(.constant(peak: 0)) }
     #expect(TrackSignalSummary(silent, writerFailed: false).status == .silentBuffers)
     #expect(TrackSignalSummary(silent, writerFailed: true).status == .writeFailures)
 
     var quiet = silent
-    quiet.signal.add(signal(peak: 0.2, seconds: 5))
+    quiet.signal.add(.constant(peak: 0.2, seconds: 5))
     #expect(TrackSignalSummary(quiet, writerFailed: false).status == .ok)
 
     var failing = quiet
@@ -952,7 +947,7 @@ struct SignalMeasurementTests {
   func silentSummaryEncodes() throws {
     var silent = TrackDiagnostics()
     silent.buffersReceived = 1
-    silent.signal.add(signal(peak: 0))
+    silent.signal.add(.constant(peak: 0))
     let summary = SignalSummary(system: TrackSignalSummary(silent, writerFailed: false), mic: nil)
     let data = try JSONEncoder().encode(summary)
     #expect(try JSONDecoder().decode(SignalSummary.self, from: data) == summary)
@@ -964,5 +959,70 @@ struct SignalMeasurementTests {
     #expect(AudioRecorder.transportLabel(kAudioDeviceTransportTypeBluetooth) == "bluetooth")
     #expect(AudioRecorder.transportLabel(kAudioDeviceTransportTypeAggregate) == "aggregate")
     #expect(AudioRecorder.transportLabel(0x1234) == "other(4660)")
+  }
+}
+
+@Suite("System Silence Watch")
+struct SystemSilenceWatchTests {
+  /// One drift window: `count` five-second buffers at `peak`.
+  private func window(peak: Float, count: Int = 1) -> SignalStats {
+    var stats = SignalStats()
+    for _ in 0..<count { stats.add(.constant(peak: peak, seconds: 5)) }
+    return stats
+  }
+
+  private let speech = SignalStats.speechWindow
+
+  @Test("warns once after 30 s of zeros while the call plays and the mic hears speech")
+  func warnsOnSustainedSilence() {
+    var watch = SystemSilenceWatch()
+    var events: [SystemSilenceWatch.Event?] = []
+    for _ in 0..<8 {
+      events.append(watch.observe(system: window(peak: 0), mic: speech, callOutput: true))
+    }
+    #expect(events.compactMap { $0 } == [.sustained(seconds: 30)])
+    #expect(events.firstIndex { $0 != nil } == 5)
+  }
+
+  @Test("stays quiet without call output, without mic speech, or for a manual recording")
+  func needsEveryCorroboratingSignal() {
+    for (mic, callOutput) in [(speech, false), (window(peak: 0), true), (speech, nil)]
+      as [(SignalStats, Bool?)]
+    {
+      var watch = SystemSilenceWatch()
+      for _ in 0..<10 {
+        #expect(watch.observe(system: window(peak: 0), mic: mic, callOutput: callOutput) == nil)
+      }
+    }
+  }
+
+  @Test("reports recovery, then warns again on a fresh stretch")
+  func recoversAndRearms() {
+    var watch = SystemSilenceWatch()
+    for _ in 0..<6 { _ = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    #expect(
+      watch.observe(system: window(peak: 0.3), mic: speech, callOutput: true)
+        == .recovered(seconds: 30))
+    var again: SystemSilenceWatch.Event?
+    for _ in 0..<6 { again = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    #expect(again == .sustained(seconds: 30))
+  }
+
+  @Test("a window with no system buffers neither extends nor ends a stretch")
+  func stalledWindowIsNeutral() {
+    var watch = SystemSilenceWatch()
+    for _ in 0..<5 { _ = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    #expect(watch.observe(system: SignalStats(), mic: speech, callOutput: true) == nil)
+    #expect(
+      watch.observe(system: window(peak: 0), mic: speech, callOutput: true)
+        == .sustained(seconds: 30))
+  }
+}
+
+extension SignalStats {
+  fileprivate static var speechWindow: SignalStats {
+    var stats = SignalStats()
+    stats.add(.constant(peak: 0.3, seconds: 5))
+    return stats
   }
 }
