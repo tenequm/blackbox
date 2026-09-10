@@ -11,12 +11,14 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   var perAppBundleID: String?
   var perAppName: String?
   var trackCount: Int?
+  var signal: SignalSummary?
 
   static let fileName = "metadata.json"
 
   init(
     title: String, createdAt: Date, appName: String, speakers: [String: String],
-    perAppBundleID: String? = nil, perAppName: String? = nil, trackCount: Int? = nil
+    perAppBundleID: String? = nil, perAppName: String? = nil, trackCount: Int? = nil,
+    signal: SignalSummary? = nil
   ) {
     self.title = title
     self.createdAt = createdAt
@@ -25,6 +27,7 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     self.perAppBundleID = perAppBundleID
     self.perAppName = perAppName
     self.trackCount = trackCount
+    self.signal = signal
   }
 
   /// Hand-written for the same reason `TranscriptionJob`'s is: the synthesized
@@ -45,6 +48,9 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     perAppBundleID = try container.decodeIfPresent(String.self, forKey: .perAppBundleID)
     perAppName = try container.decodeIfPresent(String.self, forKey: .perAppName)
     trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
+    // Diagnostics only: a malformed block must not take the title and the
+    // speaker names down with it.
+    signal = (try? container.decodeIfPresent(SignalSummary.self, forKey: .signal)) ?? nil
   }
 
   static func load(in directory: URL) -> RecordingMetadata? {
@@ -63,6 +69,68 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     let data = try encoder.encode(self)
     try data.write(to: url, options: .atomic)
   }
+}
+
+/// What each track actually carried, written when a recording stops. Aggregate
+/// numbers only, never content - enough to tell a capture that delivered
+/// silence from a quiet call after the fact.
+nonisolated struct SignalSummary: Codable, Sendable, Equatable {
+  var system: TrackSignalSummary
+  var mic: TrackSignalSummary?
+}
+
+nonisolated struct TrackSignalSummary: Codable, Sendable, Equatable {
+  enum Status: String, Codable, Sendable {
+    case ok
+    /// The source never delivered a buffer.
+    case noBuffers
+    /// Buffers arrived, but nearly all of them were exact digital zeros.
+    case silentBuffers
+    /// The writer rejected samples or failed; what reached disk is partial.
+    case writeFailures
+  }
+
+  /// Share of delivered audio that must be exact zeros to call a track silent.
+  /// Real silence from a microphone or a remote party is never exactly zero.
+  static let silentFraction = 0.99
+
+  var status: Status
+  var buffersReceived: Int
+  var appendFailures: Int
+  var seconds: Double
+  var zeroSeconds: Double
+  var longestZeroRunSeconds: Double
+  /// Nil when no non-zero sample arrived; JSON has no -inf.
+  var peakDbfs: Double?
+  var rmsDbfs: Double?
+
+  init(_ diagnostics: TrackDiagnostics, writerFailed: Bool) {
+    let signal = diagnostics.signal
+    if writerFailed || diagnostics.buffersAppendFailed > 0 {
+      status = .writeFailures
+    } else if diagnostics.buffersReceived == 0 {
+      status = .noBuffers
+    } else if signal.buffers > 0, signal.zeroFraction >= Self.silentFraction {
+      status = .silentBuffers
+    } else {
+      status = .ok
+    }
+    buffersReceived = diagnostics.buffersReceived
+    appendFailures = diagnostics.buffersAppendFailed
+    seconds = Self.rounded(signal.seconds)
+    zeroSeconds = Self.rounded(signal.zeroSeconds)
+    longestZeroRunSeconds = Self.rounded(signal.longestZeroRunSeconds)
+    peakDbfs = signal.peakDbfs.map(Self.rounded)
+    rmsDbfs = signal.rmsDbfs.map(Self.rounded)
+  }
+
+  var logDescription: String {
+    let peak = peakDbfs.map { String(format: "%.1fdBFS", $0) } ?? "-inf"
+    return
+      "\(status.rawValue) zero=\(String(format: "%.1f", zeroSeconds))/\(String(format: "%.1f", seconds))s longest_zero_run=\(String(format: "%.1f", longestZeroRunSeconds))s peak=\(peak)"
+  }
+
+  private static func rounded(_ value: Double) -> Double { (value * 100).rounded() / 100 }
 }
 
 /// Where a recording's files live and how to find them. Centralised because

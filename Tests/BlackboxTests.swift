@@ -851,3 +851,118 @@ struct ExportFileNameTests {
     }
   }
 }
+
+// MARK: - Signal Measurement
+
+@Suite("Signal Measurement")
+struct SignalMeasurementTests {
+  private func stereoBuffer(left: Float, right: Float, interleaved: Bool) -> CMSampleBuffer {
+    let fmt = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: interleaved)!
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 1024)!
+    buf.frameLength = 1024
+    if interleaved {
+      let data = buf.floatChannelData![0]
+      for i in 0..<1024 {
+        data[i * 2] = left
+        data[i * 2 + 1] = right
+      }
+    } else {
+      for i in 0..<1024 {
+        buf.floatChannelData![0][i] = left
+        buf.floatChannelData![1][i] = right
+      }
+    }
+    return buf.asSampleBuffer()!
+  }
+
+  private func signal(peak: Float, seconds: Double = 1) -> BufferSignal {
+    BufferSignal(
+      seconds: seconds, samples: 48_000, sumSquares: Double(peak * peak) * 48_000, peak: peak)
+  }
+
+  @Test("an all-zero buffer measures as silent with its real duration")
+  func silentBuffer() throws {
+    let buffer = try #require(
+      RecordingPipeline.makeSilentSampleBuffer(
+        channelCount: 1, sampleCount: 1024, sampleRate: 48000, presentationTimeStamp: .zero))
+    let measured = try #require(BufferSignal.measure(buffer))
+    #expect(measured.peak == 0)
+    #expect(measured.samples == 1024)
+    #expect(abs(measured.seconds - 1024.0 / 48000.0) < 1e-9)
+  }
+
+  /// SCStream delivers non-interleaved stereo. Signal only in the right channel
+  /// catches a measurement that reads just the first plane.
+  @Test("non-interleaved stereo measures both channels", arguments: [false, true])
+  func stereoMeasuresBothChannels(interleaved: Bool) throws {
+    let measured = try #require(
+      BufferSignal.measure(stereoBuffer(left: 0, right: 0.5, interleaved: interleaved)))
+    #expect(measured.samples == 2048)
+    #expect(measured.peak == 0.5)
+    #expect(abs(Double(measured.rms) - 0.125.squareRoot()) < 1e-6)
+  }
+
+  @Test("zero runs, zero share and levels accumulate across buffers")
+  func statsAccumulate() {
+    var stats = SignalStats()
+    stats.add(signal(peak: 0.5))
+    stats.add(signal(peak: 0))
+    stats.add(signal(peak: 0))
+    stats.add(signal(peak: 0.1))
+    stats.add(signal(peak: 0))
+
+    #expect(stats.buffers == 5)
+    #expect(stats.zeroBuffers == 3)
+    #expect(stats.longestZeroRunSeconds == 2)
+    #expect(abs(stats.zeroFraction - 0.6) < 1e-9)
+    #expect(abs(stats.peakDbfs! - 20 * log10(0.5)) < 1e-6)
+  }
+
+  @Test("a track that never carried a sample has no finite level")
+  func silentStatsHaveNoLevel() {
+    var stats = SignalStats()
+    stats.add(signal(peak: 0))
+    #expect(stats.peakDbfs == nil)
+    #expect(stats.rmsDbfs == nil)
+    #expect(
+      AudioRecorder.signalFields(stats, prefix: "sys") == "sys_rms=-inf sys_peak=-inf sys_zero=1/1")
+  }
+
+  @Test("track status separates missing, silent, failed and healthy capture")
+  func trackStatus() {
+    var silent = TrackDiagnostics()
+    silent.buffersReceived = 100
+    for _ in 0..<100 { silent.signal.add(signal(peak: 0)) }
+    #expect(TrackSignalSummary(silent, writerFailed: false).status == .silentBuffers)
+    #expect(TrackSignalSummary(silent, writerFailed: true).status == .writeFailures)
+
+    var quiet = silent
+    quiet.signal.add(signal(peak: 0.2, seconds: 5))
+    #expect(TrackSignalSummary(quiet, writerFailed: false).status == .ok)
+
+    var failing = quiet
+    failing.buffersAppendFailed = 1
+    #expect(TrackSignalSummary(failing, writerFailed: false).status == .writeFailures)
+
+    #expect(TrackSignalSummary(TrackDiagnostics(), writerFailed: false).status == .noBuffers)
+  }
+
+  @Test("a silent track encodes without infinite levels")
+  func silentSummaryEncodes() throws {
+    var silent = TrackDiagnostics()
+    silent.buffersReceived = 1
+    silent.signal.add(signal(peak: 0))
+    let summary = SignalSummary(system: TrackSignalSummary(silent, writerFailed: false), mic: nil)
+    let data = try JSONEncoder().encode(summary)
+    #expect(try JSONDecoder().decode(SignalSummary.self, from: data) == summary)
+  }
+
+  @Test("transport types map to readable labels")
+  func transportLabels() {
+    #expect(AudioRecorder.transportLabel(kAudioDeviceTransportTypeBuiltIn) == "builtin")
+    #expect(AudioRecorder.transportLabel(kAudioDeviceTransportTypeBluetooth) == "bluetooth")
+    #expect(AudioRecorder.transportLabel(kAudioDeviceTransportTypeAggregate) == "aggregate")
+    #expect(AudioRecorder.transportLabel(0x1234) == "other(4660)")
+  }
+}

@@ -868,6 +868,40 @@ struct TranscriptionCoordinatorTests {
     #expect(loaded.speakers.isEmpty)
   }
 
+  @Test("a malformed signal summary does not lose the title")
+  func metadataSurvivesMalformedSignal() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"title":"Standup","appName":"Zoom","signal":{"system":{"status":"loud"}}}"#
+    try Data(json.utf8).write(to: directory.appendingPathComponent(RecordingMetadata.fileName))
+
+    let loaded = try #require(RecordingMetadata.load(in: directory))
+    #expect(loaded.title == "Standup")
+    #expect(loaded.signal == nil)
+  }
+
+  @Test("the signal summary survives a load and save")
+  func metadataRoundTripsSignal() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    var diagnostics = TrackDiagnostics()
+    diagnostics.buffersReceived = 10
+    diagnostics.signal.add(BufferSignal(seconds: 1, samples: 48_000, sumSquares: 0, peak: 0))
+    let summary = SignalSummary(
+      system: TrackSignalSummary(diagnostics, writerFailed: false), mic: nil)
+    try RecordingMetadata(
+      title: "Standup", createdAt: Date(), appName: "Zoom", speakers: [:], signal: summary
+    ).save(in: directory)
+
+    var loaded = try #require(RecordingMetadata.load(in: directory))
+    loaded.title = "Renamed"
+    try loaded.save(in: directory)
+
+    let reloaded = try #require(RecordingMetadata.load(in: directory))
+    #expect(reloaded.signal == summary)
+    #expect(reloaded.signal?.system.status == .silentBuffers)
+  }
+
   @Test("a transcript written before a field existed still decodes")
   func transcriptDecodesWithMissingKeys() throws {
     let harness = try TranscriptionHarness()

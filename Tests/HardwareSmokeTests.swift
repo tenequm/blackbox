@@ -84,6 +84,15 @@ struct HardwareSmokeTests {
     let minDuration = try #require(trackDurations.min())
     let maxDuration = try #require(trackDurations.max())
     #expect(maxDuration - minDuration < 0.02, "Track durations diverged: \(trackDurations)")
+
+    // SCStream can deliver every buffer on time with every sample zero, and
+    // nothing above notices. The fixture played during capture, so the system
+    // track must carry signal.
+    let signal = try #require(
+      RecordingMetadata.load(in: recordingDir)?.signal, "metadata.json has no signal summary")
+    #expect(
+      signal.system.status == .ok && (signal.system.peakDbfs ?? -.infinity) > -60,
+      "System track did not capture the fixture: \(signal.system.logDescription)")
   }
 
   @Test(
@@ -202,9 +211,12 @@ struct HardwareSmokeTests {
       "Track durations diverged across output round-trip: \(trackDurations) (original=\(originalName), alternate=\(alternateName), hfp=\(hfpInvolved))"
     )
 
-    // SCStream handles default-output changes transparently; there is no
-    // explicit listener/log line to assert on. Track-duration divergence
-    // (above) and the sys_age floor (below) are what matter.
+    // SCStream handles default-output changes transparently, so the recorder
+    // only logs them. Confirm the route listener saw the round-trip.
+    #expect(
+      BlackboxLogProbe.containsAfter("output route (changed)", since: logMarker),
+      "Expected 'output route (changed)' log line after \(logMarker) - output listener may not have fired"
+    )
 
     if let maxSysAge = BlackboxLogProbe.maxSystemAgeAfter(since: logMarker) {
       #expect(
