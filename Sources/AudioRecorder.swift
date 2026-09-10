@@ -1139,7 +1139,7 @@ actor AudioRecorder {
       case .sustained(let seconds):
         Log.warning(
           Log.recorder, "recorder",
-          "system audio has been digital silence for \(String(format: "%.0f", seconds))s while \(appName) plays audio and the mic hears speech - the system track is likely missing the call"
+          "system audio has been digital silence for \(String(format: "%.0f", seconds))s while \(appName) holds audio output open and the mic hears speech - if the other side was talking, the system track is not capturing it"
         )
       case .recovered(let seconds):
         Log.info(
@@ -1216,9 +1216,9 @@ actor AudioRecorder {
 // MARK: - SystemSilenceWatch
 
 /// Decides, one drift window at a time, when a system track of exact zeros is
-/// worth a warning. Exact zeros separate a capture that is missing the call
-/// from a quiet remote party; also requiring call output and mic speech keeps a
-/// muted or on-hold call from tripping it.
+/// worth a warning. ScreenCaptureKit delivers exact zeros whenever nothing is
+/// playing, including while the remote party is muted, so this narrows the
+/// signal with call output and mic speech rather than proving a capture fault.
 nonisolated struct SystemSilenceWatch {
   enum Event: Equatable {
     case sustained(seconds: Double)

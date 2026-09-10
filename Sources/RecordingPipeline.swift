@@ -135,8 +135,9 @@ nonisolated struct SignalStats: Sendable {
 }
 
 extension TrackSignalSummary {
-  /// Share of delivered audio that must be exact zeros to call a track silent.
-  /// Real silence from a microphone or a remote party is never exactly zero.
+  /// Share of delivered audio that must be exact zeros to call a track silent. A
+  /// live microphone never reads exactly zero, but the system track does whenever
+  /// nothing is playing - so for it this means nothing reached the capture.
   nonisolated static let silentFraction = 0.99
 
   nonisolated init(_ diagnostics: TrackDiagnostics, writerFailed: Bool) {
