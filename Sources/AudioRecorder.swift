@@ -43,14 +43,13 @@ actor AudioRecorder {
   private var audioEngine: AVAudioEngine?
   private var configChangeObserver: (any NSObjectProtocol)?
 
-  // D12: supplemental mic-recovery signals.
-  // `defaultInputListenerBlock` is stored because AudioObjectRemovePropertyListenerBlock
-  // requires the same block reference that was passed to Add. Typed as an
-  // explicit `@Sendable` closure (rather than the non-Sendable
-  // `AudioObjectPropertyListenerBlock` typealias) so `deinit` can read it.
-  // `micWatchdogTimer` ticks on audioQueue and trips when buffers stop flowing.
+  // Explicitly `@Sendable`, unlike CoreAudio's `AudioObjectPropertyListenerBlock`,
+  // so `deinit` can read a stored block to remove it.
   private typealias SystemListenerBlock =
     @Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void
+
+  // D12: supplemental mic-recovery signals. `micWatchdogTimer` ticks on
+  // audioQueue and trips when buffers stop flowing.
   private var defaultInputListenerBlock: SystemListenerBlock?
   private var micWatchdogTimer: DispatchSourceTimer?
   private static let micStallThresholdSeconds: Double = 2.0
@@ -470,7 +469,7 @@ actor AudioRecorder {
     )
     guard let bundleID else { return }
     let matches = content.applications.filter {
-      AudioMonitor.resolveParentBundleID($0.bundleIdentifier) == bundleID
+      resolveParentBundleID($0.bundleIdentifier) == bundleID
     }
     if matches.isEmpty {
       Log.info(
@@ -939,6 +938,8 @@ actor AudioRecorder {
     return block
   }
 
+  /// Static, with the queue passed in: `deinit` calls it, and an actor's deinit
+  /// cannot touch stored properties after calling an instance method.
   nonisolated private static func removeSystemListener(
     _ selector: AudioObjectPropertySelector, _ block: @escaping SystemListenerBlock,
     queue: DispatchSerialQueue
@@ -1170,7 +1171,7 @@ actor AudioRecorder {
     }
     let matching = processes.filter {
       guard let id = try? $0.bundleID else { return false }
-      return AudioMonitor.resolveParentBundleID(id) == bundleID
+      return resolveParentBundleID(id) == bundleID
     }
     guard !matching.isEmpty else { return nil }
     return matching.contains { (try? $0.isRunningOutput) == true }
@@ -1225,8 +1226,8 @@ nonisolated struct SystemSilenceWatch {
     case recovered(seconds: Double)
   }
 
-  static let warningSeconds = 30.0
-  static let micSpeechFloorDbfs = -50.0
+  private static let warningSeconds = 30.0
+  private static let micSpeechFloorDbfs = -50.0
 
   private var silentSeconds = 0.0
   private var micHeard = false

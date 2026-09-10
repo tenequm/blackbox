@@ -545,18 +545,9 @@ struct SettingsView: View {
       }
 
       LabeledContent("Version") {
-        Text(Self.versionString).foregroundStyle(.secondary)
+        Text(LogFile.appVersion).foregroundStyle(.secondary)
       }
     }
-  }
-
-  static var versionString: String {
-    let info = Bundle.main.infoDictionary
-    let short = info?["CFBundleShortVersionString"] as? String ?? "?"
-    // The build number is what Sparkle compares to decide whether an update
-    // exists, so it is the number to quote in a bug report.
-    let build = info?["CFBundleVersion"] as? String ?? "?"
-    return "\(short) (\(build))"
   }
 
   // MARK: - Permissions Refresh

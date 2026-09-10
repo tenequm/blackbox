@@ -45,6 +45,15 @@ nonisolated enum LogFile {
   private nonisolated static let prevPath: URL =
     directory.appendingPathComponent("blackbox.prev.log")
 
+  /// "0.9.4 (18)". The build number is what Sparkle compares to decide whether
+  /// an update exists, so it is the number to quote in a bug report.
+  nonisolated static var appVersion: String {
+    let info = Bundle.main.infoDictionary
+    let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    return "\(short) (\(build))"
+  }
+
   /// Call once at launch to rotate if the log is too large.
   nonisolated static func rotateIfNeeded() {
     queue.sync {
@@ -93,10 +102,7 @@ nonisolated enum LogFile {
       "macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\n"
     output += "App uptime: \(Int(ProcessInfo.processInfo.systemUptime))s\n"
 
-    if let bundle = Bundle.main.infoDictionary {
-      output += "Version: \(bundle["CFBundleShortVersionString"] ?? "?") "
-      output += "(\(bundle["CFBundleVersion"] ?? "?"))\n"
-    }
+    output += "Version: \(appVersion)\n"
 
     // OSLogStore: last hour of entries
     output += "\n=== Recent OS Log (last 1h) ===\n"

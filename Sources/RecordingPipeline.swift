@@ -542,8 +542,8 @@ final class RecordingPipeline: @unchecked Sendable {
       "signal summary: system \(summary.system.logDescription)"
         + (summary.mic.map { " | mic \($0.logDescription)" } ?? ""))
 
-    // On the main actor, where every rename writes this file: a load-modify-save
-    // interleaved with one would put the old title back.
+    // On the main actor, where every other writer of this file runs: a
+    // load-modify-save interleaved with a rename would put the old title back.
     await MainActor.run {
       guard var metadata = RecordingMetadata.load(in: directory) else {
         Log.error(Log.recorder, "recorder", "signal summary not saved: metadata.json unreadable")

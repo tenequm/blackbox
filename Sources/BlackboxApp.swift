@@ -22,7 +22,7 @@ struct BlackboxApp: App {
     LogFile.rotateIfNeeded()
     Log.info(
       Log.app, "app",
-      "launched \(SettingsView.versionString) on macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+      "launched \(LogFile.appVersion) on macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
     )
 
     let coordinator = TranscriptionCoordinator()

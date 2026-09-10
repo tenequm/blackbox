@@ -964,21 +964,21 @@ struct SignalMeasurementTests {
 
 @Suite("System Silence Watch")
 struct SystemSilenceWatchTests {
-  /// One drift window: `count` five-second buffers at `peak`.
-  private func window(peak: Float, count: Int = 1) -> SignalStats {
+  /// One drift window: a single five-second buffer at `peak`.
+  private static func window(peak: Float) -> SignalStats {
     var stats = SignalStats()
-    for _ in 0..<count { stats.add(.constant(peak: peak, seconds: 5)) }
+    stats.add(.constant(peak: peak, seconds: 5))
     return stats
   }
 
-  private let speech = SignalStats.speechWindow
+  private let speech = Self.window(peak: 0.3)
 
   @Test("warns once after 30 s of zeros while the call plays and the mic hears speech")
   func warnsOnSustainedSilence() {
     var watch = SystemSilenceWatch()
     var events: [SystemSilenceWatch.Event?] = []
     for _ in 0..<8 {
-      events.append(watch.observe(system: window(peak: 0), mic: speech, callOutput: true))
+      events.append(watch.observe(system: Self.window(peak: 0), mic: speech, callOutput: true))
     }
     #expect(events.compactMap { $0 } == [.sustained(seconds: 30)])
     #expect(events.firstIndex { $0 != nil } == 5)
@@ -986,12 +986,13 @@ struct SystemSilenceWatchTests {
 
   @Test("stays quiet without call output, without mic speech, or for a manual recording")
   func needsEveryCorroboratingSignal() {
-    for (mic, callOutput) in [(speech, false), (window(peak: 0), true), (speech, nil)]
+    for (mic, callOutput) in [(speech, false), (Self.window(peak: 0), true), (speech, nil)]
       as [(SignalStats, Bool?)]
     {
       var watch = SystemSilenceWatch()
       for _ in 0..<10 {
-        #expect(watch.observe(system: window(peak: 0), mic: mic, callOutput: callOutput) == nil)
+        #expect(
+          watch.observe(system: Self.window(peak: 0), mic: mic, callOutput: callOutput) == nil)
       }
     }
   }
@@ -999,30 +1000,28 @@ struct SystemSilenceWatchTests {
   @Test("reports recovery, then warns again on a fresh stretch")
   func recoversAndRearms() {
     var watch = SystemSilenceWatch()
-    for _ in 0..<6 { _ = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    for _ in 0..<6 {
+      _ = watch.observe(system: Self.window(peak: 0), mic: speech, callOutput: true)
+    }
     #expect(
-      watch.observe(system: window(peak: 0.3), mic: speech, callOutput: true)
+      watch.observe(system: Self.window(peak: 0.3), mic: speech, callOutput: true)
         == .recovered(seconds: 30))
     var again: SystemSilenceWatch.Event?
-    for _ in 0..<6 { again = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    for _ in 0..<6 {
+      again = watch.observe(system: Self.window(peak: 0), mic: speech, callOutput: true)
+    }
     #expect(again == .sustained(seconds: 30))
   }
 
   @Test("a window with no system buffers neither extends nor ends a stretch")
   func stalledWindowIsNeutral() {
     var watch = SystemSilenceWatch()
-    for _ in 0..<5 { _ = watch.observe(system: window(peak: 0), mic: speech, callOutput: true) }
+    for _ in 0..<5 {
+      _ = watch.observe(system: Self.window(peak: 0), mic: speech, callOutput: true)
+    }
     #expect(watch.observe(system: SignalStats(), mic: speech, callOutput: true) == nil)
     #expect(
-      watch.observe(system: window(peak: 0), mic: speech, callOutput: true)
+      watch.observe(system: Self.window(peak: 0), mic: speech, callOutput: true)
         == .sustained(seconds: 30))
-  }
-}
-
-extension SignalStats {
-  fileprivate static var speechWindow: SignalStats {
-    var stats = SignalStats()
-    stats.add(.constant(peak: 0.3, seconds: 5))
-    return stats
   }
 }
