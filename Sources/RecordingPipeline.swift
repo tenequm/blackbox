@@ -40,6 +40,133 @@ nonisolated struct TrackDiagnostics: Sendable {
   var leadingSilenceSeconds = 0.0
   var tailPaddingBuffers = 0
   var tailPaddingSeconds = 0.0
+  var signal = SignalStats()
+}
+
+/// Level of one delivered buffer, measured before it is written.
+nonisolated struct BufferSignal: Sendable {
+  var seconds: Double
+  var samples: Int
+  var sumSquares: Double
+  var peak: Float
+
+  var rms: Float { samples > 0 ? Float((sumSquares / Double(samples)).squareRoot()) : 0 }
+
+  /// Nil for anything but Float32 PCM, which is all either track delivers.
+  /// Goes through the buffer list rather than the raw block pointer: SCStream
+  /// delivers non-interleaved stereo, and a block buffer is not guaranteed to
+  /// be contiguous past its first segment.
+  static func measure(_ sampleBuffer: CMSampleBuffer) -> BufferSignal? {
+    guard let asbd = sampleBuffer.formatDescription?.audioStreamBasicDescription,
+      asbd.mFormatID == kAudioFormatLinearPCM,
+      asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+      asbd.mBitsPerChannel == 32,
+      asbd.mSampleRate > 0,
+      sampleBuffer.numSamples > 0
+    else { return nil }
+
+    var sumSquares = 0.0
+    var peak: Float = 0
+    var samples = 0
+    do {
+      try sampleBuffer.withAudioBufferList { bufferList, _ in
+        for buffer in bufferList {
+          let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+          guard let data = buffer.mData, count > 0 else { continue }
+          let floats = data.assumingMemoryBound(to: Float.self)
+          var squares: Float = 0
+          var magnitude: Float = 0
+          vDSP_svesq(floats, 1, &squares, vDSP_Length(count))
+          vDSP_maxmgv(floats, 1, &magnitude, vDSP_Length(count))
+          sumSquares += Double(squares)
+          peak = max(peak, magnitude)
+          samples += count
+        }
+      }
+    } catch {
+      return nil
+    }
+    guard samples > 0 else { return nil }
+    return BufferSignal(
+      seconds: Double(sampleBuffer.numSamples) / asbd.mSampleRate,
+      samples: samples, sumSquares: sumSquares, peak: peak)
+  }
+}
+
+/// Signal accounting for one track. `TrackDiagnostics` counts buffers, and a
+/// source delivering buffers of exact zeros counts exactly like a healthy one -
+/// which is how a whole call's system audio went missing behind a clean log.
+nonisolated struct SignalStats: Sendable {
+  var buffers = 0
+  var zeroBuffers = 0
+  var seconds = 0.0
+  var zeroSeconds = 0.0
+  var longestZeroRunSeconds = 0.0
+  var samples = 0
+  var sumSquares = 0.0
+  var peak: Float = 0
+  private var zeroRunSeconds = 0.0
+
+  mutating func add(_ buffer: BufferSignal) {
+    buffers += 1
+    seconds += buffer.seconds
+    samples += buffer.samples
+    sumSquares += buffer.sumSquares
+    peak = max(peak, buffer.peak)
+    if buffer.peak == 0 {
+      zeroBuffers += 1
+      zeroSeconds += buffer.seconds
+      zeroRunSeconds += buffer.seconds
+      longestZeroRunSeconds = max(longestZeroRunSeconds, zeroRunSeconds)
+    } else {
+      zeroRunSeconds = 0
+    }
+  }
+
+  /// Nil when nothing non-zero arrived: there is no finite level to report.
+  var rmsDbfs: Double? { sumSquares > 0 ? 10 * log10(sumSquares / Double(samples)) : nil }
+  var peakDbfs: Double? { peak > 0 ? 20 * log10(Double(peak)) : nil }
+  var zeroFraction: Double { seconds > 0 ? zeroSeconds / seconds : 0 }
+  var isAllZero: Bool { buffers > 0 && zeroBuffers == buffers }
+
+  static func dbfsLabel(_ dbfs: Double?) -> String {
+    dbfs.map { String(format: "%.1f", $0) } ?? "-inf"
+  }
+}
+
+extension TrackSignalSummary {
+  /// Share of delivered audio that must be exact zeros to call a track silent. A
+  /// live microphone never reads exactly zero, but the system track does whenever
+  /// nothing is playing - so for it this means nothing reached the capture.
+  nonisolated static let silentFraction = 0.99
+
+  nonisolated init(_ diagnostics: TrackDiagnostics, writerFailed: Bool) {
+    let signal = diagnostics.signal
+    let status: Status
+    if writerFailed || diagnostics.buffersAppendFailed > 0 {
+      status = .writeFailures
+    } else if diagnostics.buffersReceived == 0 {
+      status = .noBuffers
+    } else if signal.buffers > 0, signal.zeroFraction >= Self.silentFraction {
+      status = .silentBuffers
+    } else {
+      status = .ok
+    }
+    func rounded(_ value: Double) -> Double { (value * 100).rounded() / 100 }
+    self.init(
+      status: status,
+      buffersReceived: diagnostics.buffersReceived,
+      appendFailures: diagnostics.buffersAppendFailed,
+      seconds: rounded(signal.seconds),
+      zeroSeconds: rounded(signal.zeroSeconds),
+      longestZeroRunSeconds: rounded(signal.longestZeroRunSeconds),
+      peakDbfs: signal.peakDbfs.map(rounded),
+      rmsDbfs: signal.rmsDbfs.map(rounded))
+  }
+
+  nonisolated var logDescription: String {
+    "\(status.rawValue) zero=\(String(format: "%.1f", zeroSeconds))/\(String(format: "%.1f", seconds))s longest_zero_run=\(String(format: "%.1f", longestZeroRunSeconds))s peak=\(SignalStats.dbfsLabel(peakDbfs))"
+  }
 }
 
 nonisolated struct RecordingDiagnostics: Sendable {
@@ -132,6 +259,8 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated(unsafe) private var pendingMaxLevel: Float = 0
   nonisolated(unsafe) private var writerFailureReported = false
   nonisolated(unsafe) private var diagnostics = RecordingDiagnostics()
+  nonisolated(unsafe) private var systemSignalWindow = SignalStats()
+  nonisolated(unsafe) private var micSignalWindow = SignalStats()
 
   nonisolated private subscript(track: RecordingTrackKind) -> TrackState {
     get {
@@ -173,6 +302,17 @@ final class RecordingPipeline: @unchecked Sendable {
   nonisolated var isSessionStarted: Bool { sessionStarted }
 
   nonisolated var currentDiagnostics: RecordingDiagnostics { diagnostics }
+
+  /// Per-track signal since the previous call; starts a new window. Called by
+  /// the recorder's drift log on `audioQueue`. Totals stay in
+  /// `currentDiagnostics`.
+  nonisolated func takeSignalWindow() -> (system: SignalStats, mic: SignalStats) {
+    defer {
+      systemSignalWindow = SignalStats()
+      micSignalWindow = SignalStats()
+    }
+    return (systemSignalWindow, micSignalWindow)
+  }
 
   nonisolated func start() throws {
     try FileManager.default.createDirectory(at: saveDirectory, withIntermediateDirectories: true)
@@ -265,6 +405,8 @@ final class RecordingPipeline: @unchecked Sendable {
       stopped = false
       writerFailureReported = false
       diagnostics = RecordingDiagnostics()
+      systemSignalWindow = SignalStats()
+      micSignalWindow = SignalStats()
     } catch {
       try? FileManager.default.removeItem(at: dirURL)
       throw error
@@ -272,14 +414,28 @@ final class RecordingPipeline: @unchecked Sendable {
   }
 
   nonisolated func appendSystemSample(_ sampleBuffer: CMSampleBuffer) {
+    recordSignal(sampleBuffer, on: .system)
     appendSample(sampleBuffer, to: .system)
-    publishAudioLevel(sampleBuffer)
   }
 
   nonisolated func appendMicSample(_ sampleBuffer: CMSampleBuffer) {
     guard micEnabled else { return }
+    recordSignal(sampleBuffer, on: .mic)
     appendSample(sampleBuffer, to: .mic)
-    publishAudioLevel(sampleBuffer)
+  }
+
+  /// Measures what the source delivered, before any session gating: a buffer
+  /// dropped ahead of session start still says whether the capture is live.
+  nonisolated private func recordSignal(
+    _ sampleBuffer: CMSampleBuffer, on track: RecordingTrackKind
+  ) {
+    guard !stopped, let signal = BufferSignal.measure(sampleBuffer) else { return }
+    diagnostics[track].signal.add(signal)
+    switch track {
+    case .system: systemSignalWindow.add(signal)
+    case .mic: micSignalWindow.add(signal)
+    }
+    publishAudioLevel(rms: signal.rms)
   }
 
   /// Finalizes the writer and returns the output URL.
@@ -355,7 +511,9 @@ final class RecordingPipeline: @unchecked Sendable {
       )
     }
 
-    if capturedWriter.status == .failed {
+    let saved: URL?
+    let writerFailed = capturedWriter.status == .failed
+    if writerFailed {
       Log.error(
         Log.recorder, "recorder",
         "writer failed: \(capturedWriter.error?.localizedDescription ?? "unknown")")
@@ -363,12 +521,42 @@ final class RecordingPipeline: @unchecked Sendable {
       // headers make a partial file playable, and handing the user a short
       // recording beats telling them a call they just had does not exist.
       if let capturedDirectory, RecordingStore.audioURL(in: capturedDirectory) != nil {
-        return capturedDirectory
+        saved = capturedDirectory
+      } else {
+        saved = nil
       }
-      return nil
+    } else {
+      saved = capturedWriter.status == .completed ? capturedDirectory : nil
     }
 
-    return capturedWriter.status == .completed ? capturedDirectory : nil
+    if let saved { await recordSignalSummary(in: saved, writerFailed: writerFailed) }
+    return saved
+  }
+
+  nonisolated private func recordSignalSummary(in directory: URL, writerFailed: Bool) async {
+    let summary = SignalSummary(
+      system: TrackSignalSummary(diagnostics.system, writerFailed: writerFailed),
+      mic: micEnabled ? TrackSignalSummary(diagnostics.mic, writerFailed: writerFailed) : nil)
+    Log.info(
+      Log.recorder, "recorder",
+      "signal summary: system \(summary.system.logDescription)"
+        + (summary.mic.map { " | mic \($0.logDescription)" } ?? ""))
+
+    // On the main actor, where every other writer of this file runs: a
+    // load-modify-save interleaved with a rename would put the old title back.
+    await MainActor.run {
+      guard var metadata = RecordingMetadata.load(in: directory) else {
+        Log.error(Log.recorder, "recorder", "signal summary not saved: metadata.json unreadable")
+        return
+      }
+      metadata.signal = summary
+      do {
+        try metadata.save(in: directory)
+      } catch {
+        Log.error(
+          Log.recorder, "recorder", "signal summary not saved: \(error.localizedDescription)")
+      }
+    }
   }
 
   nonisolated private func startSessionIfNeeded(at pts: CMTime, track: RecordingTrackKind) {
@@ -634,31 +822,8 @@ final class RecordingPipeline: @unchecked Sendable {
     onFailure?(.other(description))
   }
 
-  nonisolated private func publishAudioLevel(_ sampleBuffer: CMSampleBuffer) {
+  nonisolated private func publishAudioLevel(rms: Float) {
     guard onAudioLevel != nil else { return }
-    guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-
-    var length = 0
-    var dataPointer: UnsafeMutablePointer<Int8>?
-    guard
-      CMBlockBufferGetDataPointer(
-        blockBuffer,
-        atOffset: 0,
-        lengthAtOffsetOut: nil,
-        totalLengthOut: &length,
-        dataPointerOut: &dataPointer
-      ) == noErr,
-      let dataPointer,
-      length > 0
-    else { return }
-
-    let floatCount = length / MemoryLayout<Float>.size
-    guard floatCount > 0 else { return }
-
-    let samplePtr = UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self)
-    var meanSquare: Float = 0
-    vDSP_measqv(samplePtr, 1, &meanSquare, vDSP_Length(floatCount))
-    let rms = meanSquare.squareRoot()
     if rms > pendingMaxLevel { pendingMaxLevel = rms }
 
     let now = DispatchTime.now().uptimeNanoseconds

@@ -490,3 +490,13 @@ final class BlackboxSmokeClient {
     }
   }
 }
+
+extension BufferSignal {
+  /// Constant-level audio at 48 kHz; `peak: 0` is exact digital silence.
+  static func constant(peak: Float, seconds: Double = 1) -> BufferSignal {
+    let samples = Int(seconds * 48_000)
+    return BufferSignal(
+      seconds: seconds, samples: samples, sumSquares: Double(peak * peak) * Double(samples),
+      peak: peak)
+  }
+}

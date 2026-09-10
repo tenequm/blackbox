@@ -491,7 +491,7 @@ final class AudioMonitor {
   private func resolvedActiveCallers() -> [String] {
     dependencies.findActiveCallingProcesses()
       .compactMap { $0 }
-      .map(Self.resolveParentBundleID)
+      .map(resolveParentBundleID)
       .filter { !excludedBundleIDs.contains($0) }
   }
 
@@ -501,16 +501,6 @@ final class AudioMonitor {
   /// auto stop).
   private func firstActiveResolvedCaller() -> String? {
     resolvedActiveCallers().first
-  }
-
-  /// Resolve helper subprocess bundle IDs to the parent app.
-  /// e.g. "com.google.Chrome.helper.renderer" → "com.google.Chrome"
-  private static func resolveParentBundleID(_ bundleID: String) -> String {
-    let parts = bundleID.split(separator: ".")
-    if let idx = parts.firstIndex(where: { $0 == "helper" }), idx > 1 {
-      return parts[..<idx].joined(separator: ".")
-    }
-    return bundleID
   }
 
   /// Resolve a bundle ID to a human-readable app name.
@@ -554,7 +544,7 @@ final class AudioMonitor {
     // Screen Recording permission is checked when AudioRecorder.start() creates
     // the SCStream. If denied, the failure callback sets permissionNeeded = true.
 
-    autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
+    autoRecordingBundleID = appBundleID.map { resolveParentBundleID($0) }
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
     loadSettings()
     // Re-check against the freshly loaded set: the poll that got us here may

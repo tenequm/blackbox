@@ -43,17 +43,23 @@ actor AudioRecorder {
   private var audioEngine: AVAudioEngine?
   private var configChangeObserver: (any NSObjectProtocol)?
 
-  // D12: supplemental mic-recovery signals.
-  // `defaultInputListenerBlock` is stored because AudioObjectRemovePropertyListenerBlock
-  // requires the same block reference that was passed to Add. Typed as an
-  // explicit `@Sendable` closure (rather than the non-Sendable
-  // `AudioObjectPropertyListenerBlock` typealias) so `deinit` can read it.
-  // `micWatchdogTimer` ticks on audioQueue and trips when buffers stop flowing.
-  private var defaultInputListenerBlock:
-    (@Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void)?
+  // Explicitly `@Sendable`, unlike CoreAudio's `AudioObjectPropertyListenerBlock`,
+  // so `deinit` can read a stored block to remove it.
+  private typealias SystemListenerBlock =
+    @Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void
+
+  // D12: supplemental mic-recovery signals. `micWatchdogTimer` ticks on
+  // audioQueue and trips when buffers stop flowing.
+  private var defaultInputListenerBlock: SystemListenerBlock?
   private var micWatchdogTimer: DispatchSourceTimer?
   private static let micStallThresholdSeconds: Double = 2.0
   private static let micWatchdogTickSeconds: Double = 1.0
+
+  // Logs every default-output change, independent of the mic: the route
+  // (Bluetooth HFP vs built-in) is context for any system-track problem.
+  private var defaultOutputListenerBlock: SystemListenerBlock?
+
+  private var systemSilenceWatch = SystemSilenceWatch()
 
   // Writer state
   private var pipeline: RecordingPipeline?
@@ -136,12 +142,10 @@ actor AudioRecorder {
     // reference, which is lost once this deinit returns.
     micWatchdogTimer?.cancel()
     if let block = defaultInputListenerBlock {
-      var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultInputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
-      AudioObjectRemovePropertyListenerBlock(
-        AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
+      Self.removeSystemListener(kAudioHardwarePropertyDefaultInputDevice, block, queue: audioQueue)
+    }
+    if let block = defaultOutputListenerBlock {
+      Self.removeSystemListener(kAudioHardwarePropertyDefaultOutputDevice, block, queue: audioQueue)
     }
     if let activity { ProcessInfo.processInfo.endActivity(activity) }
     if displaySleepAssertion != IOPMAssertionID(kIOPMNullAssertionID) {
@@ -176,7 +180,7 @@ actor AudioRecorder {
       // 1. Discover a display to drive the system-audio SCStream. With the
       // display asleep (a restart after -3815 lands here) SCK reports none;
       // wait for it to come back rather than failing the whole recording.
-      let display = try await waitForDisplay()
+      let (display, content) = try await waitForDisplay()
 
       // Display-wide audio capture (no window/app exclusions). SCStream's display
       // mix is driven by the OS-composited output path, not a specific hardware
@@ -184,6 +188,7 @@ actor AudioRecorder {
       let filter = SCContentFilter(
         display: display, excludingApplications: [], exceptingWindows: [])
       let config = makeStreamConfig()
+      logCaptureContext(display: display, content: content, config: config)
 
       let pipeline = RecordingPipeline(
         bundleID: bundleID,
@@ -253,7 +258,8 @@ actor AudioRecorder {
       try checkAlive()
 
       startDiskSpaceMonitor()
-      if micEnabled { startDriftMonitor() }
+      startDriftMonitor()
+      installDefaultOutputListener()
 
       // Start mic capture independently - failure does not stop system audio.
       if micEnabled {
@@ -281,6 +287,7 @@ actor AudioRecorder {
   /// `configChangeObserver` directly would leak the registered listeners.
   private func cleanupPartialStart() async {
     stopMicCapture()
+    removeDefaultOutputListener()
 
     let stream = displayStream
     let pipe = pipeline
@@ -351,6 +358,7 @@ actor AudioRecorder {
     // `phase = .stopped` already set above, any in-flight mic tap callback
     // arriving during the teardown short-circuits inside handleMicBuffer.
     stopMicCapture()
+    removeDefaultOutputListener()
 
     let diagnostics = pipeline?.currentDiagnostics
     let systemStats = diagnostics?.system ?? TrackDiagnostics()
@@ -372,6 +380,7 @@ actor AudioRecorder {
     lastMicHostTime = 0
     lastSystemHostTime = 0
     driftStartHost = 0
+    systemSilenceWatch = SystemSilenceWatch()
     lowDiskSpaceWarned = false
     micLatencyOffset = 0
     micLatencyOffsetTicks = 0
@@ -426,7 +435,7 @@ actor AudioRecorder {
   static let displayWaitTimeout: Duration = .seconds(300)
   static let displayPollInterval: Duration = .seconds(2)
 
-  private func waitForDisplay() async throws -> SCDisplay {
+  private func waitForDisplay() async throws -> (SCDisplay, SCShareableContent) {
     let deadline = ContinuousClock.now + Self.displayWaitTimeout
     var announced = false
     while true {
@@ -435,7 +444,7 @@ actor AudioRecorder {
       try checkAlive()
       if let display = content.displays.first {
         if announced { Log.info(Log.recorder, "recorder", "display is back for \(appName)") }
-        return display
+        return (display, content)
       }
       if !announced {
         announced = true
@@ -446,6 +455,30 @@ actor AudioRecorder {
       guard ContinuousClock.now < deadline else { throw RecorderError.noDisplay }
       try await Task.sleep(for: Self.displayPollInterval)
       try checkAlive()
+    }
+  }
+
+  /// ScreenCaptureKit filters audio per application, so a call process it does not
+  /// list (`avconferenced`, for FaceTime and iPhone calls) records as all zeros.
+  private func logCaptureContext(
+    display: SCDisplay, content: SCShareableContent, config: SCStreamConfiguration
+  ) {
+    Log.info(
+      Log.recorder, "recorder",
+      "capture: backend=SCStream filter=display(id=\(display.displayID)) excludesSelf=\(config.excludesCurrentProcessAudio) rate=\(config.sampleRate)Hz ch=\(config.channelCount)"
+    )
+    guard let bundleID else { return }
+    let matches = content.applications.filter {
+      resolveParentBundleID($0.bundleIdentifier) == bundleID
+    }
+    if matches.isEmpty {
+      Log.info(
+        Log.recorder, "recorder",
+        "shareable content: \(bundleID) NOT in applications (n=\(content.applications.count))")
+    } else {
+      Log.info(
+        Log.recorder, "recorder",
+        "shareable content: \(bundleID) in applications (pids=\(matches.map(\.processID)))")
     }
   }
 
@@ -755,7 +788,7 @@ actor AudioRecorder {
     guard micDiagFrames >= 96_000 else { return }
     let dbfs = micDiagSumSq.map { sumSq -> String in
       let rms = (sumSq / Double(micDiagFrames)).squareRoot()
-      return rms > 0 ? String(format: "%.1f", 20 * log10(rms)) : "-inf"
+      return SignalStats.dbfsLabel(rms > 0 ? 20 * log10(rms) : nil)
     }
     Log.info(
       Log.recorder, "recorder",
@@ -867,38 +900,106 @@ actor AudioRecorder {
   /// Catches same-format default-input switches that AVAudioEngine's own
   /// notification silently misses.
   private func installDefaultInputListener() {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
-    let block: @Sendable (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void = {
-      [weak self] _, _ in
-      guard let self else { return }
-      self.assumeIsolated { iso in
-        guard iso.phase != .stopped else { return }
-        iso.requestMicReinstall(source: "default_input_listener")
-      }
-    }
-    defaultInputListenerBlock = block
-    let status = AudioObjectAddPropertyListenerBlock(
-      AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
-    if status != noErr {
-      Log.error(
-        Log.recorder, "recorder",
-        "failed to install default-input listener: OSStatus=\(status)")
-      defaultInputListenerBlock = nil
+    defaultInputListenerBlock = addSystemListener(
+      kAudioHardwarePropertyDefaultInputDevice, name: "default-input"
+    ) { iso in
+      iso.requestMicReinstall(source: "default_input_listener")
     }
   }
 
   private func removeDefaultInputListener() {
     guard let block = defaultInputListenerBlock else { return }
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
+    Self.removeSystemListener(kAudioHardwarePropertyDefaultInputDevice, block, queue: audioQueue)
+    defaultInputListenerBlock = nil
+  }
+
+  /// Registers `onChange` for a system-object property, delivered on `audioQueue`
+  /// and skipped once stopped. Returns the block - removal needs the same
+  /// reference - or nil if registration failed.
+  private func addSystemListener(
+    _ selector: AudioObjectPropertySelector, name: String,
+    onChange: @escaping @Sendable (isolated AudioRecorder) -> Void
+  ) -> SystemListenerBlock? {
+    var address = Self.systemPropertyAddress(selector)
+    let block: SystemListenerBlock = { [weak self] _, _ in
+      guard let self else { return }
+      self.assumeIsolated { iso in
+        guard iso.phase != .stopped else { return }
+        onChange(iso)
+      }
+    }
+    let status = AudioObjectAddPropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
+    guard status == noErr else {
+      Log.error(
+        Log.recorder, "recorder", "failed to install \(name) listener: OSStatus=\(status)")
+      return nil
+    }
+    return block
+  }
+
+  /// Static, with the queue passed in: `deinit` calls it, and an actor's deinit
+  /// cannot touch stored properties after calling an instance method.
+  nonisolated private static func removeSystemListener(
+    _ selector: AudioObjectPropertySelector, _ block: @escaping SystemListenerBlock,
+    queue: DispatchSerialQueue
+  ) {
+    var address = systemPropertyAddress(selector)
+    AudioObjectRemovePropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+  }
+
+  nonisolated private static func systemPropertyAddress(
+    _ selector: AudioObjectPropertySelector
+  ) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(
+      mSelector: selector,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain))
-    AudioObjectRemovePropertyListenerBlock(
-      AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
-    defaultInputListenerBlock = nil
+  }
+
+  // MARK: - Output Route
+
+  private func installDefaultOutputListener() {
+    logOutputRoute(event: "start")
+    defaultOutputListenerBlock = addSystemListener(
+      kAudioHardwarePropertyDefaultOutputDevice, name: "default-output"
+    ) { iso in
+      iso.logOutputRoute(event: "changed")
+    }
+  }
+
+  private func removeDefaultOutputListener() {
+    guard let block = defaultOutputListenerBlock else { return }
+    Self.removeSystemListener(kAudioHardwarePropertyDefaultOutputDevice, block, queue: audioQueue)
+    defaultOutputListenerBlock = nil
+  }
+
+  private func logOutputRoute(event: String) {
+    guard let device = try? AudioHardwareSystem.shared.defaultOutputDevice else {
+      Log.info(Log.recorder, "recorder", "output route (\(event)): no default output device")
+      return
+    }
+    let name = (try? device.name) ?? "unknown"
+    let transport = (try? device.transportType).map(Self.transportLabel) ?? "unknown"
+    let rate = (try? device.nominalSampleRate) ?? 0
+    Log.info(
+      Log.recorder, "recorder",
+      "output route (\(event)): \"\(name)\" transport=\(transport) rate=\(Int(rate))Hz")
+  }
+
+  nonisolated static func transportLabel(_ transportType: UInt32) -> String {
+    switch transportType {
+    case kAudioDeviceTransportTypeBuiltIn: "builtin"
+    case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: "bluetooth"
+    case kAudioDeviceTransportTypeUSB: "usb"
+    case kAudioDeviceTransportTypeAirPlay: "airplay"
+    case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort: "display"
+    case kAudioDeviceTransportTypeVirtual: "virtual"
+    case kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAutoAggregate: "aggregate"
+    case kAudioDeviceTransportTypeUnknown: "unknown"
+    default: "other(\(transportType))"
+    }
   }
 
   /// Buffer-arrival watchdog: trips when no mic buffers have arrived for
@@ -972,8 +1073,9 @@ actor AudioRecorder {
 
   // MARK: - Drift Monitoring
 
-  /// Logs the raw mic-vs-system `hostTime` delta every 5s. Only starts when mic
-  /// is enabled - without a mic track there is nothing to compare against.
+  /// Logs every 5s: the raw mic-vs-system `hostTime` delta when the mic is on,
+  /// and per-track signal levels always. Runs without a mic too - the system
+  /// track's signal is what exposes a capture delivering nothing but zeros.
   private func startDriftMonitor() {
     driftStartHost = mach_absolute_time()
     lastMicHostTime = 0
@@ -995,27 +1097,84 @@ actor AudioRecorder {
     guard phase != .stopped else { return }
     let now = mach_absolute_time()
     let elapsedMs = Double(AudioConvertHostTimeToNanos(now - driftStartHost)) / 1_000_000
+    let nowNs = AudioConvertHostTimeToNanos(now)
+    func milliseconds(_ ns: Int64) -> String { String(format: "%.1f", Double(ns) / 1_000_000) }
 
-    guard lastMicHostTime != 0, lastSystemHostTime != 0 else {
-      Log.info(
-        Log.recorder, "recorder",
-        "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s waiting (mic=\(lastMicHostTime != 0 ? "1" : "0") sys=\(lastSystemHostTime != 0 ? "1" : "0"))"
-      )
-      return
+    // Each timing field keeps its `<name>=<n>ms` shape (the hardware smoke tests
+    // parse `sys_age` and `mic_age`) and is logged as soon as its own track has
+    // delivered, so a mic that never starts cannot hide the system track's age.
+    var timing: [String] = []
+    let sysNs =
+      lastSystemHostTime != 0 ? Int64(AudioConvertHostTimeToNanos(lastSystemHostTime)) : nil
+    if let sysNs {
+      timing.append("sys_age=\(milliseconds(Int64(nowNs) - sysNs))ms")
+    } else {
+      timing.append("sys=waiting")
+    }
+    if !micEnabled {
+      timing.append("mic=off")
+    } else if lastMicHostTime != 0 {
+      let micNs = Int64(AudioConvertHostTimeToNanos(lastMicHostTime))
+      timing.append("mic_age=\(milliseconds(Int64(nowNs) - micNs))ms")
+      if let sysNs {
+        let deltaMs = Double(micNs - sysNs) / 1_000_000
+        timing.append("mic-sys=\(String(format: "%+.1f", deltaMs))ms")
+      }
+      timing.append("d9=\(String(format: "%.1f", micLatencyOffset * 1000))ms")
+    } else {
+      timing.append("mic=waiting")
     }
 
-    let nowNs = AudioConvertHostTimeToNanos(now)
-    let micNs = AudioConvertHostTimeToNanos(lastMicHostTime)
-    let sysNs = AudioConvertHostTimeToNanos(lastSystemHostTime)
-    let micAgeMs = Double(Int64(nowNs) - Int64(micNs)) / 1_000_000
-    let sysAgeMs = Double(Int64(nowNs) - Int64(sysNs)) / 1_000_000
-    let deltaMs = Double(Int64(micNs) - Int64(sysNs)) / 1_000_000
-    let d9Ms = micLatencyOffset * 1000
+    var signal = ""
+    if let window = pipeline?.takeSignalWindow() {
+      signal = " " + Self.signalFields(window.system, prefix: "sys")
+      if micEnabled { signal += " " + Self.signalFields(window.mic, prefix: "mic") }
+      // Queried only when the system track is silent, so a healthy call pays nothing.
+      let callOutput = window.system.isAllZero ? callProcessIsOutputting() : nil
+      if window.system.isAllZero {
+        signal += " call_out=\(callOutput.map { $0 ? "1" : "0" } ?? "?")"
+      }
+      switch systemSilenceWatch.observe(
+        system: window.system, mic: window.mic, callOutput: callOutput)
+      {
+      case .sustained(let seconds):
+        Log.warning(
+          Log.recorder, "recorder",
+          "system audio has been digital silence for \(String(format: "%.0f", seconds))s while \(appName) holds audio output open and the mic hears speech - if the other side was talking, the system track is not capturing it"
+        )
+      case .recovered(let seconds):
+        Log.info(
+          Log.recorder, "recorder",
+          "system audio signal returned after \(String(format: "%.0f", seconds))s of digital silence"
+        )
+      case nil:
+        break
+      }
+    }
 
     Log.info(
       Log.recorder, "recorder",
-      "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s sys_age=\(String(format: "%.1f", sysAgeMs))ms mic_age=\(String(format: "%.1f", micAgeMs))ms mic-sys=\(String(format: "%+.1f", deltaMs))ms d9=\(String(format: "%.1f", d9Ms))ms"
+      "drift: t=\(String(format: "%.1f", elapsedMs / 1000))s \(timing.joined(separator: " "))\(signal)"
     )
+  }
+
+  nonisolated static func signalFields(_ stats: SignalStats, prefix: String) -> String {
+    "\(prefix)_rms=\(SignalStats.dbfsLabel(stats.rmsDbfs)) \(prefix)_peak=\(SignalStats.dbfsLabel(stats.peakDbfs)) \(prefix)_zero=\(stats.zeroBuffers)/\(stats.buffers)"
+  }
+
+  /// Whether the process that triggered this recording is playing audio. Nil
+  /// for a manual recording (no bundle ID) or when Core Audio has no matching
+  /// process. Helper processes count as their app, by the monitor's own rule.
+  private func callProcessIsOutputting() -> Bool? {
+    guard let bundleID, let processes = try? AudioHardwareSystem.shared.processes else {
+      return nil
+    }
+    let matching = processes.filter {
+      guard let id = try? $0.bundleID else { return false }
+      return resolveParentBundleID(id) == bundleID
+    }
+    guard !matching.isEmpty else { return nil }
+    return matching.contains { (try? $0.isRunningOutput) == true }
   }
 
   // MARK: - Disk Space Monitoring
@@ -1052,6 +1211,43 @@ actor AudioRecorder {
   /// Resolve CoreAudio device ID to its human-readable name.
   nonisolated private static func audioDeviceName(for deviceID: AudioDeviceID) -> String? {
     try? AudioHardwareDevice(id: deviceID).name
+  }
+}
+
+// MARK: - SystemSilenceWatch
+
+/// Decides, one drift window at a time, when a system track of exact zeros is
+/// worth a warning. ScreenCaptureKit delivers exact zeros whenever nothing is
+/// playing, including while the remote party is muted, so this narrows the
+/// signal with call output and mic speech rather than proving a capture fault.
+nonisolated struct SystemSilenceWatch {
+  enum Event: Equatable {
+    case sustained(seconds: Double)
+    case recovered(seconds: Double)
+  }
+
+  private static let warningSeconds = 30.0
+  private static let micSpeechFloorDbfs = -50.0
+
+  private var silentSeconds = 0.0
+  private var micHeard = false
+  private var warned = false
+
+  mutating func observe(system: SignalStats, mic: SignalStats, callOutput: Bool?) -> Event? {
+    // No system buffers at all is a stalled stream, which `sys_age` reports; it
+    // neither extends nor ends a silent stretch.
+    guard system.buffers > 0 else { return nil }
+    guard system.isAllZero else {
+      defer { self = SystemSilenceWatch() }
+      return warned ? .recovered(seconds: silentSeconds) : nil
+    }
+    silentSeconds += system.seconds
+    if let peak = mic.peakDbfs, peak >= Self.micSpeechFloorDbfs { micHeard = true }
+    guard !warned, silentSeconds >= Self.warningSeconds, micHeard, callOutput == true else {
+      return nil
+    }
+    warned = true
+    return .sustained(seconds: silentSeconds)
   }
 }
 

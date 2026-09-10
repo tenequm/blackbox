@@ -1243,8 +1243,11 @@ struct RecordingDetailView: View {
   /// `RecordingFile` - so a reconstruction loses it, which is why the write
   /// failing silently was worth surfacing.
   private func writeMetadata(_ mutate: (inout RecordingMetadata) -> Void) {
+    // Disk first: the recorder writes the signal summary at stop, after a
+    // detail view opened mid-recording has already cached its copy.
     var meta =
-      metadata
+      RecordingMetadata.load(in: recording.url)
+      ?? metadata
       ?? RecordingMetadata(
         title: recording.title,
         createdAt: recording.date,
