@@ -197,11 +197,6 @@ jobs:
         if: steps.rp.outputs.branch != ''
         with:
           fetch-depth: 0
-          # The PAT, when there is one, because this token is what the later
-          # `git push` authenticates with. Pushed as github-actions[bot] the
-          # release PR's own checks are gated by the repo's contributor-approval
-          # policy and sit unapproved until someone clicks.
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
       - uses: taiki-e/install-action@v2
         if: steps.rp.outputs.branch != ''
         with:
@@ -209,7 +204,11 @@ jobs:
       - name: Write the changelog and bump the build number
         if: steps.rp.outputs.branch != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The PAT, when there is one, because it authors the signed commit
+          # below. Written as github-actions[bot] the release PR's own checks are
+          # gated by the repo's contributor-approval policy and sit unapproved
+          # until someone clicks.
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           BRANCH: ${{ steps.rp.outputs.branch }}
           RP_TOKEN_SET: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
         run: |
@@ -218,34 +217,32 @@ jobs:
           # PR whose checks sit unapproved, with nothing red - reads as a
           # mystery. Say so here, so a missing PAT explains itself in the run.
           if [ "$RP_TOKEN_SET" != "true" ]; then
-            echo "::warning::RELEASE_PLEASE_TOKEN is unset, so this pushes as github-actions[bot] and the release PR's checks may need manual approval"
+            echo "::warning::RELEASE_PLEASE_TOKEN is unset, so this commits as github-actions[bot] and the release PR's checks may need manual approval"
           fi
           git fetch -q origin "$BRANCH"
           # The pending version lives on the release branch; main's manifest
           # still names the last released one.
           version=$(git show "origin/$BRANCH:.github/.release-please-manifest.json" | jq -r '.["."]')
           git-cliff --config .github/cliff.toml --tag "v$version" -o "$RUNNER_TEMP/CHANGELOG.md"
-          # main's copy of the script, for the same reason the changelog uses
+          # main's copies of the scripts, for the same reason the changelog uses
           # main's cliff.toml: the checkout below switches to the release
-          # branch, whose base predates any fix to this script. It ran there and
-          # died on a macOS-only PlistBuddy call that main had already replaced.
-          cp .github/scripts/bump-build-number.sh "$RUNNER_TEMP/bump-build-number.sh"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # branch, whose base predates any fix to them. bump-build-number ran
+          # there once and died on a macOS-only PlistBuddy call that main had
+          # already replaced.
+          cp .github/scripts/bump-build-number.sh .github/scripts/sign-release-branch.sh "$RUNNER_TEMP/"
           # Rebuilt from the branch each round, so a retry after losing a race
           # with release-please's force-push recomputes rather than compounding -
           # the build number in particular must not double-bump. It is derived
           # from the last released tag, so it is a pure function of the branch.
-          for _ in 1 2 3; do
-            git checkout -q -B rp-local "origin/$BRANCH"
+          # Not a git push: main requires signed commits, which the release PR's
+          # commits must be too - see sign-release-branch.sh.
+          for i in 1 2 3; do
+            git fetch -q origin main "$BRANCH"
+            git checkout -q -f -B rp-local "origin/$BRANCH"
             cp "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
             "$RUNNER_TEMP/bump-build-number.sh"
-            git diff --quiet CHANGELOG.md Info.plist && break
-            git commit -q -m "chore: regenerate the changelog and bump the build number" CHANGELOG.md Info.plist
-            git push -q origin "rp-local:$BRANCH" && break
-            git fetch -q origin "$BRANCH"
+            "$RUNNER_TEMP/sign-release-branch.sh" "$BRANCH" && exit 0
+            sleep "$i"
           done
-          if ! git diff --quiet CHANGELOG.md Info.plist; then
-            echo "could not push the changelog after 3 attempts" >&2
-            exit 1
-          fi
+          echo "could not write the signed release commit after 3 attempts" >&2
+          exit 1
