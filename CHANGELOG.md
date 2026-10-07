@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.9.5](https://github.com/tenequm/blackbox/compare/v0.9.4...v0.9.5) - 2026-10-07
+
+### <!-- 2 -->Bug Fixes
+- **build:** build and test on the Swift 6.4 toolchain ([#38](https://github.com/tenequm/blackbox/pull/38)) ([8f95378](https://github.com/tenequm/blackbox/commit/8f953784963387d42445f9323e4469a7a2dd7fe7))
+  Internal: the app builds and its tests compile on the Swift 6.4
+  toolchain.
+- **menubar:** make the recording icon react to sound again ([#37](https://github.com/tenequm/blackbox/pull/37)) ([decae78](https://github.com/tenequm/blackbox/commit/decae78fae83c08a78c78c3252026a74b233aeb4))
+  The menu bar icon reacts to sound again while recording, so you can see
+  that a call's audio is being captured.
+- **app:** quit cleanly on SIGTERM ([#40](https://github.com/tenequm/blackbox/pull/40)) ([ee76189](https://github.com/tenequm/blackbox/commit/ee7618926f483d4bae45a5a2319e72f41343776e))
+  Quitting Blackbox with `killall` or a system shutdown now saves the
+  recording in progress, the same as choosing Quit, and no longer reports
+  a crash on the next launch.
+
+### <!-- 5 -->Documentation
+- rename CLAUDE.md to AGENTS.md, read natively by Claude Code ([#36](https://github.com/tenequm/blackbox/pull/36)) ([a0cd5e9](https://github.com/tenequm/blackbox/commit/a0cd5e94f2798a887cd5ca1e0ac2862ce3a3b471))
+
+### <!-- 6 -->Chores
+- **skills:** update swift-macos to 0.8.3 ([caa5fb5](https://github.com/tenequm/blackbox/commit/caa5fb5c3808c0e0febffbe092acd2a1695ef37f))
+- **release:** write the release PR as one GitHub-signed commit ([#35](https://github.com/tenequm/blackbox/pull/35)) ([bcee0c3](https://github.com/tenequm/blackbox/commit/bcee0c34ee8b2cebb1feb77e22974cac64b7f21c))
+
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.4...v0.9.5
+
 ## [0.9.4](https://github.com/tenequm/blackbox/compare/v0.9.3...v0.9.4) - 2026-08-28
 
 ### <!-- 1 -->New Features
