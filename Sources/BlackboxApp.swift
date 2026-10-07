@@ -205,9 +205,11 @@ struct BlackboxApp: App {
     private var onboardingWindow: NSWindow?
     private var testController: BlackboxTestController?
     private var openWindowObserver: (any NSObjectProtocol)?
+    private var terminationSignalSource: (any DispatchSourceSignal)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
       installCrashHandler()
+      routeTerminationSignal()
       observeToastClicks()
       if !BlackboxTestMode.isEnabled {
         launchWatchdog()
@@ -344,6 +346,25 @@ struct BlackboxApp: App {
       process.executableURL = watchdogURL
       process.arguments = [String(ProcessInfo.processInfo.processIdentifier)]
       try? process.run()
+    }
+
+    /// SIGTERM's default action exits on the spot - `killall`, `make run`, a
+    /// launchd shutdown - so a recording is never finalized and `processRunning`
+    /// stays set, which the next launch reports as a crash. Routed through
+    /// `terminate` it gets the same cleanup as Quit, without needing the
+    /// Automation grant an AppleScript `quit` does.
+    private func routeTerminationSignal() {
+      signal(SIGTERM, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+      // Terminating from inside this main-queue block would starve the queue
+      // the `.terminateLater` replies run on; see `OnboardingView.relaunch()`.
+      source.setEventHandler {
+        RunLoop.main.perform {
+          MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
+        }
+      }
+      source.resume()
+      terminationSignalSource = source
     }
 
     private func installCrashHandler() {

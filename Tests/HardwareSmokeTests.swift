@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import CoreAudio
 import Foundation
 import Testing
@@ -84,6 +85,57 @@ struct HardwareSmokeTests {
     let minDuration = try #require(trackDurations.min())
     let maxDuration = try #require(trackDurations.max())
     #expect(maxDuration - minDuration < 0.02, "Track durations diverged: \(trackDurations)")
+  }
+
+  @Test(
+    "SIGTERM mid-recording finalizes the file and exits",
+    .tags(.hardware),
+    .enabled(if: ProcessInfo.processInfo.environment["BLACKBOX_RUN_HARDWARE_SMOKE"] == "1"),
+    .timeLimit(.minutes(1))
+  )
+  func sigtermFinalizesRecordingAndExits() async throws {
+    let client = try BlackboxSmokeClient()
+    defer {
+      client.terminate()
+      try? FileManager.default.removeItem(at: client.saveDirectory)
+    }
+
+    try client.launch()
+    _ = try await client.waitUntil(description: "app test channel ready") { snapshot in
+      !snapshot.isRecording && !snapshot.isSaving
+    }
+    client.post(.startManualRecording)
+    _ = try await client.waitUntil(description: "manual recording started") { snapshot in
+      snapshot.isRecording && snapshot.isManualRecording
+    }
+    try client.playSystemAudioFixture()
+    try? await Task.sleep(for: .seconds(3))
+
+    // Matched by path: an installed copy can still be finalizing its own
+    // recording after `launch()` asked it to quit.
+    let app = try #require(
+      NSRunningApplication.runningApplications(withBundleIdentifier: "com.tenequm.Blackbox")
+        .first { $0.bundleURL?.standardizedFileURL == client.appURL.standardizedFileURL },
+      "Expected the launched app to be running")
+    let pid = app.processIdentifier
+    kill(pid, SIGTERM)
+
+    // 12s covers the 8s termination budget. A handler that calls `terminate`
+    // from inside a main-queue block never replies and fails here, as does the
+    // default action, which exits before the writer finishes.
+    let deadline = Date().addingTimeInterval(12)
+    while kill(pid, 0) == 0, Date() < deadline {
+      try? await Task.sleep(for: .milliseconds(250))
+    }
+    try #require(kill(pid, 0) != 0, "App still running 12s after SIGTERM")
+
+    // Fragments flush every 10s, so after 3s only a finalized file holds the samples.
+    let audioURL = try client.newestRecordingDirectory().appending(path: "audio.m4a")
+    let asset = AVURLAsset(url: audioURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    #expect(tracks.count == 2, "Expected 2 audio tracks, found \(tracks.count)")
+    let duration = try await asset.load(.duration).seconds
+    #expect(duration > 2, "Expected the recording up to SIGTERM, got \(duration)s")
   }
 
   @Test(
