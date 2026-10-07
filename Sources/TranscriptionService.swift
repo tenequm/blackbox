@@ -360,7 +360,7 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
 /// thread - the annotation on the requirement is what moves it, for class and
 /// actor witnesses alike. Without it, transcript JSON parsing and poll responses
 /// are decoded on the main thread.
-protocol TranscriptionServicing: Sendable {
+nonisolated protocol TranscriptionServicing: Sendable {
   /// Mixes multi-track audio into a single file when needed, uploads it, and
   /// returns the remote file id.
   @concurrent func upload(

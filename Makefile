@@ -25,8 +25,11 @@ bundle: build
 	install_name_tool -add_rpath @executable_path/../Frameworks "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Assets/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
-	@for bundle in .build/arm64-apple-macosx/release/*.bundle; do \
-		[ -d "$$bundle" ] && cp -R "$$bundle" "$(APP_BUNDLE)/Contents/Resources/" && echo "Bundled: $$(basename $$bundle)"; \
+	@# .build/release, not .build/<triple>/release: the Swift Build backend (Swift 6.4) writes to
+	@# .build/out/Products/Release, and the symlink resolves under both backends.
+	@for bundle in .build/release/*.bundle; do \
+		case "$$bundle" in *Tests.bundle) continue ;; esac; \
+		if [ -d "$$bundle" ]; then cp -R "$$bundle" "$(APP_BUNDLE)/Contents/Resources/" && echo "Bundled: $$(basename $$bundle)"; fi; \
 	done
 	cp -R "$(SPARKLE_PATH)" "$(APP_BUNDLE)/Contents/Frameworks/"
 	@if [ -n "$(SIGN_ID)" ]; then \
