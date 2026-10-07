@@ -1,6 +1,6 @@
 # Blackbox Audio Architecture Specification
 
-This document records architectural decisions and their reasoning. Implementation details live in the code and CLAUDE.md. When in doubt, reliability wins over features.
+This document records architectural decisions and their reasoning. Implementation details live in the code and AGENTS.md. When in doubt, reliability wins over features.
 
 ## Design Principles
 
