@@ -36,6 +36,20 @@ struct RecordingPipelineIntegrationTests {
     )!
   }
 
+  /// A buffer of constant non-zero samples on the writer's timeline.
+  /// `asSampleBuffer` would stamp host time, which does not line up with
+  /// `makeSampleBuffer`'s sample-count PTS.
+  private func makeToneBuffer(startSample: Int64, amplitude: Float = 0.25) -> CMSampleBuffer {
+    let buffer = makeSampleBuffer(startSample: startSample)
+    let block = CMSampleBufferGetDataBuffer(buffer)!
+    let samples = [Float](repeating: amplitude, count: buffer.numSamples)
+    samples.withUnsafeBytes { raw in
+      _ = CMBlockBufferReplaceDataBytes(
+        with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: raw.count)
+    }
+    return buffer
+  }
+
   /// Creates a mic sample buffer with PTS shifted backward by `offsetSamples` from
   /// the system-aligned position, simulating D9 latency compensation.
   private func makeMicBuffer(
@@ -421,6 +435,65 @@ struct RecordingPipelineIntegrationTests {
     #expect(diagnostics.sessionStartTrack == .system)
     #expect(diagnostics.system.buffersAppended == 2)
     #expect(diagnostics.mic.buffersAppended == 0)
+  }
+
+  // MARK: - Signal summary
+
+  /// The failure this exists for: a system source that delivers every buffer on
+  /// time, each one exact zeros, while the mic carries the call.
+  @Test("metadata records a silent system track next to a live mic")
+  func signalSummaryFlagsSilentSystemTrack() async throws {
+    let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    for i in 0..<10 {
+      let start = Int64(i * 1024)
+      pipeline.appendSystemSample(makeSampleBuffer(startSample: start))
+      pipeline.appendMicSample(makeToneBuffer(startSample: start))
+    }
+
+    let outputDir = try #require(await pipeline.stop())
+    let signal = try #require(RecordingMetadata.load(in: outputDir)?.signal)
+    #expect(signal.system.status == .silentBuffers)
+    #expect(signal.system.buffersReceived == 10)
+    #expect(signal.system.peakDbfs == nil)
+    #expect(signal.mic?.status == .ok)
+    #expect(signal.mic?.peakDbfs != nil)
+  }
+
+  @Test("metadata records a track that never delivered a buffer")
+  func signalSummaryFlagsMissingTrack() async throws {
+    let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeToneBuffer(startSample: 0))
+    pipeline.appendSystemSample(makeToneBuffer(startSample: 1024))
+
+    let outputDir = try #require(await pipeline.stop())
+    let metadata = try #require(RecordingMetadata.load(in: outputDir))
+    #expect(metadata.title == "Pipeline Test")
+    #expect(metadata.signal?.system.status == .ok)
+    #expect(metadata.signal?.mic?.status == .noBuffers)
+  }
+
+  @Test("the signal window resets on read; the totals do not")
+  func signalWindowResetsOnRead() async throws {
+    let (pipeline, root) = try makePipeline(alignmentMode: .preserveAllContent)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try pipeline.start()
+    pipeline.appendSystemSample(makeToneBuffer(startSample: 0))
+    pipeline.appendSystemSample(makeSampleBuffer(startSample: 1024))
+
+    let first = pipeline.takeSignalWindow()
+    #expect(first.system.buffers == 2)
+    #expect(first.system.zeroBuffers == 1)
+    #expect(first.mic.buffers == 0)
+    #expect(pipeline.takeSignalWindow().system.buffers == 0)
+    #expect(pipeline.currentDiagnostics.system.signal.buffers == 2)
+    _ = await pipeline.stop()
   }
 
   // MARK: - Edge cases
