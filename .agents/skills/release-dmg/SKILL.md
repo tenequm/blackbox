@@ -9,7 +9,7 @@ disable-model-invocation: true
 
 **Releases are automated.** Merging the release PR that release-please keeps open
 builds, signs, notarizes, staples, publishes and bumps the Homebrew cask by
-itself. See "Release Process" in CLAUDE.md.
+itself. See "Release Process" in AGENTS.md.
 
 Use this file only when CI cannot do it - a runner outage, an expired secret, or
 a release that must go out while the pipeline is broken. Everything below runs on
