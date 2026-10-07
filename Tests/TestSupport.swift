@@ -180,15 +180,18 @@ final class TestRecorderSession: RecorderSession {
   private var startSuspension: CheckedContinuation<Void, Never>?
 
   private let onFailure: (@Sendable (RecorderFailure) -> Void)?
+  private let onAudioLevel: (@Sendable (Float) -> Void)?
   private let onContinuity: (@Sendable () -> Void)?
 
   init(
     configuration: RecorderSessionConfiguration,
     onFailure: (@Sendable (RecorderFailure) -> Void)?,
+    onAudioLevel: (@Sendable (Float) -> Void)?,
     onContinuity: (@Sendable () -> Void)?
   ) {
     self.configuration = configuration
     self.onFailure = onFailure
+    self.onAudioLevel = onAudioLevel
     self.onContinuity = onContinuity
   }
 
@@ -219,6 +222,10 @@ final class TestRecorderSession: RecorderSession {
     onFailure?(failure)
   }
 
+  func emitAudioLevel(_ level: Float) {
+    onAudioLevel?(level)
+  }
+
   func emitContinuityEvent() {
     onContinuity?()
   }
@@ -244,6 +251,7 @@ final class TestRecorderFactory: RecorderSessionFactory {
     let session = TestRecorderSession(
       configuration: configuration,
       onFailure: onFailure,
+      onAudioLevel: onAudioLevel,
       onContinuity: onContinuity
     )
     session.startError = nextStartError

@@ -919,19 +919,6 @@ final class AudioMonitor {
   }
 }
 
-/// Buckets by dBFS, not linear RMS: conversational mic speech sits around
-/// -36 dBFS RMS, which a linear 0.05 threshold (-26 dBFS) never registers.
-nonisolated func recordingWaveformIcon(level: Float) -> String {
-  let dbfs = level > 0 ? 20 * log10(level) : -Float.infinity
-  if dbfs > -30 {
-    return "waveform"
-  } else if dbfs > -45 {
-    return "waveform.mid"
-  } else {
-    return "waveform.low"
-  }
-}
-
 extension Double {
   func clamped(to range: ClosedRange<Double>, default defaultValue: Double) -> Double {
     self == 0 ? defaultValue : min(max(self, range.lowerBound), range.upperBound)
