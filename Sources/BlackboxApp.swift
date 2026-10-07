@@ -44,19 +44,10 @@ struct BlackboxApp: App {
     delegate.transcriptionCoordinator = coordinator
   }
 
-  /// The icon reacts to sound again, but every branch still draws at the same
-  /// fixed width - and that part is load-bearing.
-  ///
-  /// The original picked between `waveform`, `waveform.mid` and `waveform.low`
-  /// from `audioLevel`, published four times a second. Three glyphs of
-  /// *different intrinsic widths* meant the status item re-laid-out at 4 Hz for
-  /// the whole recording, which is the documented shape of an intermittent
-  /// `_postWindowNeedsUpdateConstraints` crash - and under `LSUIElement` that
-  /// crash is invisible: the icon simply disappears while the user believes the
-  /// call is still being captured.
-  ///
-  /// So the level drives `scale` and opacity on ONE glyph inside a fixed frame.
-  /// Same liveness, nothing re-measures.
+  /// While recording, the glyph steps between `waveform.low`, `waveform.mid`
+  /// and `waveform` with the level, so the user can see sound being captured.
+  /// The glyphs differ in width, so the icon sits in a fixed frame, and
+  /// `levelSymbol` only changes on a bucket transition rather than at 4 Hz.
   @ViewBuilder private var menuBarLabel: some View {
     let iconWidth: CGFloat = 16
     if monitor.isRecording {
@@ -67,18 +58,8 @@ struct BlackboxApp: App {
         // seconds while capture continued perfectly well, which reads as "my
         // recording just died".
         Image(
-          systemName: monitor.errorMessage != nil ? "waveform.badge.exclamationmark" : "waveform"
-        )
-        .symbolEffect(
-          .variableColor,
-          isActive: monitor.errorMessage == nil
-            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        )
-        .opacity(Self.levelOpacity(monitor.audioLevel))
-        .animation(
-          NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            ? nil : .easeOut(duration: 0.15),
-          value: monitor.audioLevel
+          systemName: monitor.errorMessage != nil
+            ? "waveform.badge.exclamationmark" : monitor.levelSymbol
         )
         .frame(width: iconWidth)
         if let grace = monitor.graceCountdown {
@@ -132,17 +113,6 @@ struct BlackboxApp: App {
     }
     if let error = monitor.errorMessage { return "Blackbox - \(error)" }
     return "Blackbox - idle"
-  }
-
-  /// Maps the published RMS level onto an opacity the eye reads as "sound is
-  /// happening". Never reaches zero: a silent moment in a call must still look
-  /// like a running recording, not like a stopped one.
-  ///
-  /// The curve is deliberately steep at the bottom, because speech at a normal
-  /// level sits near 0.02-0.05 RMS and a linear map would barely move.
-  nonisolated static func levelOpacity(_ level: Float) -> Double {
-    let normalized = min(1, max(0, Double(level) / 0.08))
-    return 0.55 + 0.45 * sqrt(normalized)
   }
 
   /// Rolls over correctly at the top of the range. The old
