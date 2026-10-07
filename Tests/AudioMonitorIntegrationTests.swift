@@ -185,6 +185,33 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("audio levels drive the menu bar glyph and stopping resets it")
+  func audioLevelsDriveLevelSymbol() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    monitor.startManualRecording()
+    await settle()
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+
+    session.emitAudioLevel(0.015)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.mid")
+    session.emitAudioLevel(0.02)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.mid")
+    session.emitAudioLevel(0.04)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform")
+
+    monitor.stopManualRecording()
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.low")
+    await monitor.stopMonitoring()
+  }
+
   @Test("multiple simultaneous callers records with nil bundleID")
   func multipleSimultaneousCallersRecordsWithNilBundleID() async throws {
     let harness = MonitorHarness()

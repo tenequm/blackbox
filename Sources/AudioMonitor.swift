@@ -13,7 +13,10 @@ final class AudioMonitor {
   private(set) var graceCountdown: TimeInterval?
   private(set) var isSaving = false
   private(set) var formattedElapsed: String?
-  private(set) var audioLevel: Float = 0
+  /// Stored rather than derived from the raw level: `@Observable` notifies on
+  /// every assignment, so publishing the 4 Hz level directly would invalidate
+  /// the menu bar label on every tick instead of only on a bucket change.
+  private(set) var levelSymbol = recordingWaveformIcon(level: 0)
   private(set) var lastSavedRecordingURL: URL?
   private var savingCount = 0
 
@@ -781,7 +784,7 @@ final class AudioMonitor {
       isRecording = false
       currentAppName = nil
       recordingStartTime = nil
-      audioLevel = 0
+      levelSymbol = recordingWaveformIcon(level: 0)
       stopElapsedTimer()
     }
   }
@@ -835,8 +838,10 @@ final class AudioMonitor {
 
   private func makeAudioLevelHandler() -> @Sendable (Float) -> Void {
     { [weak self] level in
+      let symbol = recordingWaveformIcon(level: level)
       Task { @MainActor [weak self] in
-        self?.audioLevel = level
+        guard let self, self.levelSymbol != symbol else { return }
+        self.levelSymbol = symbol
       }
     }
   }
