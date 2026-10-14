@@ -254,6 +254,15 @@ precisely the case where capture succeeds, buffers flow, RMS stays at `-inf`,
 and no error is ever posted. `startDriftMonitor` is also gated on `micEnabled`,
 so `sys_age` is not logged for mic-less recordings.
 
+**Partly fixed** on `feat/signal-diagnostics`, after a Continuity call
+(`avconferenced`) recorded 65 s of exact zeros on track 0 behind a clean log.
+Each track's signal is now measured per buffer: the drift line (which now runs
+without a mic) carries per-track RMS, peak and all-zero buffer counts, a
+sustained all-zero stretch while the call process is playing audio logs a
+warning, and `metadata.json` records a per-track `ok` / `noBuffers` /
+`silentBuffers` / `writeFailures` status. Still open: the meter still merges
+both tracks, and nothing surfaces the warning in the UI.
+
 ## S4. Half the SCStream error codes fall through to `.other`, which never restarts
 
 `AudioRecorder.swift:514-527`, `:532-540`; `AudioMonitor.swift:689-706`

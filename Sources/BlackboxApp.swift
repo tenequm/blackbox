@@ -20,7 +20,10 @@ struct BlackboxApp: App {
 
   init() {
     LogFile.rotateIfNeeded()
-    Log.info(Log.app, "app", "launched")
+    Log.info(
+      Log.app, "app",
+      "launched \(LogFile.appVersion) on macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+    )
 
     let coordinator = TranscriptionCoordinator()
     var dependencies = AudioMonitorDependencies.live
