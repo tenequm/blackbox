@@ -293,7 +293,7 @@ struct SonioxContractTests {
       .json(201, ["id": "transcription-1", "status": "queued"])
     }
     let service = TranscriptionService(
-      apiKey: "k", model: "stt-async-v5", baseURL: server.baseURL)
+      apiKey: "k", model: "stt-async-v6", baseURL: server.baseURL)
 
     let id = try await service.createTranscription(fileId: "file-1", reference: "2026-03-11-call")
     #expect(id == "transcription-1")
@@ -302,7 +302,7 @@ struct SonioxContractTests {
     let body = try #require(
       try JSONSerialization.jsonObject(with: request.body) as? [String: Any])
     #expect(request.method == "POST")
-    #expect(body["model"] as? String == "stt-async-v5")
+    #expect(body["model"] as? String == "stt-async-v6")
     #expect(body["file_id"] as? String == "file-1")
     #expect(body["enable_speaker_diarization"] as? Bool == true)
     #expect(body["enable_language_identification"] as? Bool == true)
@@ -353,7 +353,7 @@ struct SonioxContractTests {
   func decodesTranscriptIntoSegments() async throws {
     let server = try StubHTTPServer { _ in .json(200, transcriptPayload()) }
     let service = TranscriptionService(
-      apiKey: "k", model: "stt-async-v5", baseURL: server.baseURL)
+      apiKey: "k", model: "stt-async-v6", baseURL: server.baseURL)
 
     let document = try await service.fetchTranscript(transcriptionId: "t-1")
 
@@ -366,7 +366,7 @@ struct SonioxContractTests {
     #expect(document.language == "en")
     // Provenance is stamped at the source so a transcript can be attributed later.
     #expect(document.provider == "soniox")
-    #expect(document.model == "stt-async-v5")
+    #expect(document.model == "stt-async-v6")
   }
 
   @Test("409 on the transcript endpoint is a not-ready signal, not a failure")
@@ -433,10 +433,12 @@ struct SonioxContractTests {
     }
   }
 
-  @Test("a transcription that ends in error surfaces the server's reason")
-  func transcriptionErrorStatusSurfacesMessage() async throws {
+  @Test(
+    "a transcription that ends in error surfaces the server's reason",
+    arguments: ["error", "failed"])
+  func transcriptionErrorStatusSurfacesMessage(status: String) async throws {
     let server = try StubHTTPServer { _ in
-      .json(200, ["id": "t-1", "status": "error", "error_message": "unsupported audio format"])
+      .json(200, ["id": "t-1", "status": status, "error_message": "unsupported audio format"])
     }
     let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL)
 

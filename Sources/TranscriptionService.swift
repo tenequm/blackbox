@@ -378,7 +378,7 @@ nonisolated protocol TranscriptionServicing: Sendable {
 }
 
 nonisolated final class TranscriptionService: TranscriptionServicing {
-  static let defaultModel = "stt-async-v5"
+  static let defaultModel = "stt-async-v6"
   /// Offered in Settings. A free-text field meant a typo became a terminal
   /// failure per recording, discovered one recording at a time and only after
   /// an upload had already been paid for - while "Verify Key" happily reported
@@ -391,7 +391,9 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// A model this list does not know still works if it is already in defaults:
   /// the picker surfaces the stored value, so a retirement does not need a
   /// release. See `docs/specification.md` D14.
-  static let knownModels = [defaultModel]
+  /// v5 stays listed so a stored v5 still shows in the picker rather than as an
+  /// unknown id; Soniox removes it on 2026-12-15 and routes it to v6 after that.
+  static let knownModels = [defaultModel, "stt-async-v5"]
   static let defaultBaseURL = "https://api.soniox.com"
   static let providerName = "soniox"
 
@@ -775,7 +777,9 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       case "completed":
         Log.info(Log.transcription, "transcription", "completed: \(transcriptionId)")
         return
-      case "error":
+      // The OpenAPI enum says `error`; the errors page documents `failed`.
+      // Either one is terminal, and missing it would poll to the 30-minute ceiling.
+      case "error", "failed":
         throw TranscriptionError.transcriptionFailed(
           json?["error_message"] as? String ?? "unknown error")
       default:
