@@ -469,3 +469,9 @@ The gate's one demonstrated value was deferring work at quit, and
 `suspendNewJobs()` now does that precisely - see **Quit**.
 
 **Consent:** Audio leaves the machine on every recording over the duration floor once this is on, so the setting is opt-in, defaults off, is disabled without an API key, and says plainly what it does - including that the audio is deleted from Soniox once the transcript is back.
+
+**Mic attribution ("You" labels) is enrichment after the paid save, never part of the job.** Behind the off-by-default `micAttribution` setting.
+- **Storage.** The job saves `transcript.json` exactly as before, then the provider's tokens to `transcript-tokens.json`. The tokens are kept apart because the recordings list decodes every transcript on each scan. They are matched to the transcript by `transcriptCreatedAt`, so stale tokens never pair with a re-transcription.
+- **Reconciling.** `reconcileAttribution` runs after a job finishes and whenever the detail view loads a transcript. It derives segments from the tokens with or without the local indices, so it both attributes and reverts. It never touches the job record, the remote artifacts or the status, and nothing waits for it at quit.
+- **Eligibility.** Only transcripts made from the raw `audio.m4a` (`sourceAudio`, recorded on the job at upload) with the current stereo + mono layout are attributed. Echo cancellation rebuilds its tracks from sample zero, so its clock is not the mic track's.
+- **The rule.** In `MicAttribution`, with its constants and rationale in `docs/plans/2611-03-mic-gated-you-attribution.md`. A token is local when the mic is active and the system track is quiet over at least 60% of its padded span. Bump `MicAttribution.version` whenever a constant changes, so stored results are re-derived.

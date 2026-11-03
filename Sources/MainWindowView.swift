@@ -1456,6 +1456,12 @@ struct RecordingDetailView: View {
 
   private func loadTranscript() {
     transcript = TranscriptDocument.load(for: recording.url)
+    // A transcript whose labels disagree with the mic-attribution setting is
+    // brought in line in the background; the result reloads through
+    // `finishCount`, and a transcript that already agrees makes this a no-op.
+    if transcript != nil {
+      transcription.reconcileAttribution(recordingDirectory: recording.url)
+    }
   }
 
   /// Covers the first transcription, Retry, and Transcribe Again - they were

@@ -27,6 +27,7 @@ struct SettingsView: View {
   /// time this view's body runs.
   @State private var sonioxAPIKey = ""
   @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
+  @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
   @State private var keyCheck: APIKeyCheck = .untested
   @State private var revealAPIKey = false
@@ -482,6 +483,15 @@ struct SettingsView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
       }
+
+      // Not gated on the API key: it relabels transcripts already on disk and
+      // never contacts Soniox.
+      Toggle("Label my voice as You", isOn: $micAttribution)
+      Text(
+        "Finds your own speech from your microphone track and labels it You. Experimental: most reliable with headphones. Names you gave a speaker stay on that speaker number, which may now be someone else."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
@@ -815,6 +825,7 @@ nonisolated enum SettingsKeys {
   static let notifyOnError = "notifyOnError"
   static let excludedBundleIDs = "excludedBundleIDs"
   static let autoTranscribe = "autoTranscribe"
+  static let micAttribution = "micAttribution"
   static let sonioxModel = "sonioxModel"
   static let sonioxAPIKey = "sonioxAPIKey"
   static let playbackRate = "playbackRate"
