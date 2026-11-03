@@ -56,8 +56,40 @@ struct MicAttributionTests {
     var tracks = energies(seconds: 6, mic: [1...4], system: [])
     for frame in 50..<100 { tracks.system[frame] = .nan }
     let outcome = MicAttribution.attribute(
-      tokens: [token(at: 1.5), token(at: 3)], energies: tracks)
+      tokens: [token(at: 1.5, speaker: 1), token(at: 3, speaker: 2)], energies: tracks)
     #expect(try #require(localIndices(outcome)) == [1])
+  }
+
+  @Test("a speaker that is only the user becomes You whole, pauses included")
+  func promotesEntirelyLocalSpeaker() throws {
+    let tracks = energies(seconds: 10, mic: [1...2, 4...5], system: [7...9])
+    // Speaker 1 talks in both mic bursts and once in the silence between them;
+    // speaker 2 is the remote voice.
+    let tokens = [
+      token(at: 1.5, speaker: 1), token(at: 3, speaker: 1), token(at: 4.5, speaker: 1),
+      token(at: 8, speaker: 2),
+    ]
+    let outcome = MicAttribution.attribute(tokens: tokens, energies: tracks)
+    #expect(try #require(localIndices(outcome)) == [0, 1, 2])
+  }
+
+  @Test("a speaker merged with a remote voice is gated word by word, not promoted")
+  func doesNotPromoteMergedSpeaker() throws {
+    let tracks = energies(seconds: 10, mic: [1...2], system: [4...8])
+    let tokens = [
+      token(at: 1.5), token(at: 1.8), token(at: 3), token(at: 5), token(at: 6), token(at: 7),
+    ]
+    let outcome = MicAttribution.attribute(tokens: tokens, energies: tracks)
+    #expect(try #require(localIndices(outcome)) == [0, 1])
+  }
+
+  @Test("a promoted speaker's clearly remote tokens keep their label")
+  func promotedSpeakerKeepsRemoteTokens() throws {
+    let tracks = energies(seconds: 30, mic: [1...20], system: [25...26])
+    var tokens = (0..<19).map { token(at: 1.5 + Double($0), speaker: 1) }
+    tokens.append(token(at: 25.5, speaker: 1))
+    let outcome = MicAttribution.attribute(tokens: tokens, energies: tracks)
+    #expect(try #require(localIndices(outcome)) == Set(0..<19))
   }
 
   @Test("digital silence on the system track keeps the gate finite")

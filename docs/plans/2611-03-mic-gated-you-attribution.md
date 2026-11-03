@@ -334,3 +334,48 @@ rate on remote speech. Turn counts are not the measure.
 - `Sources/MainWindowView.swift`: lazy re-run on open; otherwise unchanged.
 - `Tests/`: as above.
 - `docs/specification.md`: a D14 note on enrichment and the token sidecar.
+
+## Spike on five calls: the speaker-level rule
+
+The word-level gate alone, as first implemented, split the local user into two
+speakers on two-person calls. When "You" appeared it was right 89-98% of the
+time, but about 30% of the user's speech time kept the provider's label: pauses
+inside turns and double-talk.
+
+**Method.**
+- Calls: five real calls, with ground truth from the per-turn chat logs in
+  `db-work/docs/chat-logs` and, for 2026-11-02, the Meet transcript.
+- Scoring: a 0.25 s grid, with the best one-to-one mapping of labels to people.
+- Bias: the chat logs were built on Blackbox's own Soniox segments, so they
+  flatter Soniox's boundaries.
+
+**Per-speaker evidence.** "Remote" means the mic is silent while the system
+track is active.
+
+| Provider speaker | Remote share |
+|---|---|
+| Only the local user (4 calls) | 2-13% |
+| Local user merged with a remote voice (2026-11-02, v5 and v6) | 27-39% |
+| Everyone else | 59-96% |
+
+**Rule.** A speaker with at least 30% local and at most 20% remote tokens
+becomes "You" whole, except its remote tokens.
+
+**Results.** "Accuracy" is the share of grid points labelled with the right
+person.
+
+| Call | Word gate only | Speaker-level rule |
+|---|---|---|
+| 10-28, 2 people | accuracy 0.77, You recall 0.64 | accuracy 0.90, recall 0.88, precision 0.92 |
+| 10-23, 2 people | accuracy 0.80, You recall 0.68 | accuracy 0.93, recall 0.93, precision 0.95 |
+| 10-26, 7 people | accuracy 0.84 | accuracy 0.88, recall 0.95, precision 0.86 |
+| 10-29, 6 people | accuracy 0.74 | accuracy 0.75, recall 0.85, precision 0.82 |
+| 11-02, 7 people (merged speaker) | no change: falls back to the word gate, as intended | |
+
+**FluidAudio, scored on the same calls, was not a consistent win.**
+- Speaker count: right on 3 of 5 calls.
+- One remote person was split into two on 10-23.
+- 10-26 was under-counted, 4 speakers found for 6.
+- Accuracy against the word gate ranged from -0.04 to +0.15.
+
+It is parked.

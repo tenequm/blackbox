@@ -37,6 +37,47 @@ nonisolated enum MicAttribution {
   static let minRunFrames = 10
   static let tokenPaddingMs = 40.0
   static let minLocalCoverage = 0.6
+  /// A provider speaker is the user throughout - so every token of it becomes
+  /// "You", not only the mic-gated ones - when enough of it is the mic alone and
+  /// little of it is someone remote with the mic silent. Gating word by word
+  /// left the user's pauses and double-talk under the provider's label, so on a
+  /// two-person call the user showed up as two speakers. Measured on five calls:
+  /// a speaker that is only the user has 2-13% remote evidence, one the
+  /// provider merged with a remote person 27-39%, everyone else 59-96%.
+  static let entirelyLocalMinLocalShare = 0.3
+  static let entirelyLocalMaxRemoteShare = 0.2
+
+  struct SpeakerEvidence: Equatable, Sendable {
+    var tokens = 0
+    var local = 0
+    var remote = 0
+
+    mutating func add(local isLocal: Bool, remote isRemote: Bool) {
+      tokens += 1
+      if isLocal { local += 1 }
+      if isRemote { remote += 1 }
+    }
+
+    var localShare: Double { tokens == 0 ? 0 : Double(local) / Double(tokens) }
+    var remoteShare: Double { tokens == 0 ? 0 : Double(remote) / Double(tokens) }
+    var isEntirelyLocal: Bool {
+      localShare >= MicAttribution.entirelyLocalMinLocalShare
+        && remoteShare <= MicAttribution.entirelyLocalMaxRemoteShare
+    }
+  }
+
+  /// The word-level decisions before any speaker is promoted whole.
+  struct Classification: Sendable {
+    var localIndices: Set<Int>
+    /// Tokens heard while the mic was silent and the system track was not.
+    var remoteIndices: Set<Int>
+    /// Tokens with malformed timing, which keep their label even in a speaker
+    /// promoted whole.
+    var unclassifiedIndices: Set<Int>
+    var evidence: [Int: SpeakerEvidence]
+    var micThresholdDb: Double
+    var systemQuietBelowDb: Double
+  }
 
   /// `copyNextSampleBuffer` blocks its thread for the whole file, so the decode
   /// runs here rather than on the cooperative pool, where it can starve the
@@ -49,11 +90,27 @@ nonisolated enum MicAttribution {
   /// mono and legacy ones have three tracks; track identity is never guessed.
   @concurrent
   static func analyze(audioURL: URL, tokens: [TranscriptToken]) async throws -> Outcome {
+    switch try await loadEnergies(audioURL: audioURL) {
+    case .failure(let reason): return .ineligible(reason.description)
+    case .success(let energies): return attribute(tokens: tokens, energies: energies)
+    }
+  }
+
+  struct Ineligible: Error, CustomStringConvertible {
+    var description: String
+  }
+
+  @concurrent
+  static func loadEnergies(audioURL: URL) async throws -> Result<TrackEnergies, Ineligible> {
     let asset = AVURLAsset(url: audioURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
-    guard tracks.count == 2 else { return .ineligible("\(tracks.count) audio tracks") }
+    guard tracks.count == 2 else {
+      return .failure(Ineligible(description: "\(tracks.count) audio tracks"))
+    }
     let layout = [try await channelCount(of: tracks[0]), try await channelCount(of: tracks[1])]
-    guard layout == [2, 1] else { return .ineligible("track channel layout \(layout)") }
+    guard layout == [2, 1] else {
+      return .failure(Ineligible(description: "track channel layout \(layout)"))
+    }
 
     let flag = CancellationFlag()
     let energies = try await withTaskCancellationHandler {
@@ -66,16 +123,42 @@ nonisolated enum MicAttribution {
     } onCancel: {
       flag.cancel()
     }
-    return attribute(tokens: tokens, energies: energies)
+    return .success(energies)
   }
 
   // MARK: - Rule
 
   static func attribute(tokens: [TranscriptToken], energies: TrackEnergies) -> Outcome {
+    let result: Classification
+    switch classify(tokens: tokens, energies: energies) {
+    case .failure(let reason): return .ineligible(reason.description)
+    case .success(let classification): result = classification
+    }
+    var localIndices = result.localIndices
+    // A promoted speaker's tokens with clear remote evidence keep their label:
+    // they are the provider's occasional misattribution of someone else.
+    for (index, token) in tokens.enumerated()
+    where result.evidence[token.speaker]?.isEntirelyLocal == true
+      && !result.remoteIndices.contains(index) && !result.unclassifiedIndices.contains(index)
+    {
+      localIndices.insert(index)
+    }
+    return .attributed(
+      localIndices: localIndices, micThresholdDb: result.micThresholdDb,
+      systemQuietBelowDb: result.systemQuietBelowDb)
+  }
+
+  static func classify(
+    tokens: [TranscriptToken], energies: TrackEnergies
+  ) -> Result<Classification, Ineligible> {
     let micKnown = energies.mic.filter { !$0.isNaN }
     let systemKnown = energies.system.filter { !$0.isNaN }
-    guard !micKnown.isEmpty else { return .ineligible("mic track has no audio") }
-    guard !systemKnown.isEmpty else { return .ineligible("system track has no audio") }
+    guard !micKnown.isEmpty else {
+      return .failure(Ineligible(description: "mic track has no audio"))
+    }
+    guard !systemKnown.isEmpty else {
+      return .failure(Ineligible(description: "system track has no audio"))
+    }
 
     let micThreshold = max(percentile(micKnown, 0.10) + micFloorMarginDb, micMinimumDb)
     let systemQuietBelow = percentile(systemKnown, 0.10) + systemQuietMarginDb
@@ -83,33 +166,52 @@ nonisolated enum MicAttribution {
     var micActive = energies.mic.map { !$0.isNaN && $0 > micThreshold }
     fillGaps(&micActive, upTo: maxGapFrames)
     dropRuns(&micActive, shorterThan: minRunFrames)
-    // An unknown system frame fails the gate: missing reference audio is not
-    // evidence that nobody remote was speaking.
-    let local = micActive.indices.map { index in
-      micActive[index] && index < energies.system.count
-        && !energies.system[index].isNaN && energies.system[index] < systemQuietBelow
+    // An unknown system frame fails both: missing reference audio is evidence of
+    // neither the user alone nor someone remote.
+    func system(_ index: Int, quiet: Bool) -> Bool {
+      guard index < energies.system.count, !energies.system[index].isNaN else { return false }
+      return quiet == (energies.system[index] < systemQuietBelow)
     }
+    let local = micActive.indices.map { micActive[$0] && system($0, quiet: true) }
+    let remote = micActive.indices.map { !micActive[$0] && system($0, quiet: false) }
 
     var localIndices = Set<Int>()
-    for (index, token) in tokens.enumerated()
-    where token.startMs.isFinite && token.endMs.isFinite && token.startMs >= 0
-      && token.endMs >= token.startMs
-    {
-      let low = token.startMs - tokenPaddingMs
-      let high = token.endMs + tokenPaddingMs
-      let firstFrame = max(0, Int((low / frameMs).rounded(.down)))
-      let lastFrame = min(local.count - 1, Int((high / frameMs).rounded(.down)))
-      guard firstFrame <= lastFrame else { continue }
-      var covered = 0.0
-      for frame in firstFrame...lastFrame where local[frame] {
-        let frameStart = Double(frame) * frameMs
-        covered += max(0, min(high, frameStart + frameMs) - max(low, frameStart))
+    var remoteIndices = Set<Int>()
+    var unclassifiedIndices = Set<Int>()
+    var evidence: [Int: SpeakerEvidence] = [:]
+    for (index, token) in tokens.enumerated() {
+      guard let isLocal = covers(token, local), let isRemote = covers(token, remote) else {
+        unclassifiedIndices.insert(index)
+        continue
       }
-      if covered / (high - low) >= minLocalCoverage { localIndices.insert(index) }
+      if isLocal { localIndices.insert(index) }
+      if isRemote { remoteIndices.insert(index) }
+      evidence[token.speaker, default: SpeakerEvidence()].add(local: isLocal, remote: isRemote)
     }
-    return .attributed(
-      localIndices: localIndices, micThresholdDb: micThreshold,
-      systemQuietBelowDb: systemQuietBelow)
+    return .success(
+      Classification(
+        localIndices: localIndices, remoteIndices: remoteIndices,
+        unclassifiedIndices: unclassifiedIndices, evidence: evidence,
+        micThresholdDb: micThreshold,
+        systemQuietBelowDb: systemQuietBelow))
+  }
+
+  /// Nil for a token whose timing is malformed, which keeps its label.
+  static func covers(_ token: TranscriptToken, _ mask: [Bool]) -> Bool? {
+    guard token.startMs.isFinite, token.endMs.isFinite, token.startMs >= 0,
+      token.endMs >= token.startMs
+    else { return nil }
+    let low = token.startMs - tokenPaddingMs
+    let high = token.endMs + tokenPaddingMs
+    let firstFrame = max(0, Int((low / frameMs).rounded(.down)))
+    let lastFrame = min(mask.count - 1, Int((high / frameMs).rounded(.down)))
+    guard firstFrame <= lastFrame else { return false }
+    var covered = 0.0
+    for frame in firstFrame...lastFrame where mask[frame] {
+      let frameStart = Double(frame) * frameMs
+      covered += max(0, min(high, frameStart + frameMs) - max(low, frameStart))
+    }
+    return covered / (high - low) >= minLocalCoverage
   }
 
   static func percentile(_ values: [Double], _ fraction: Double) -> Double {
