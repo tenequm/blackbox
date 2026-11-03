@@ -20,6 +20,9 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// artifacts could not be deleted yet. Resume retries the delete and never
   /// re-runs the job.
   var awaitingRemoteDelete: Bool = false
+  /// The audio file name `upload` was given, so the transcript can say which
+  /// clock its timestamps belong to - the raw capture or the echo-cancelled copy.
+  var sourceAudio: String?
 
   static let fileName = "transcription-job.json"
 
@@ -50,6 +53,7 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
     lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
     awaitingRemoteDelete =
       try container.decodeIfPresent(Bool.self, forKey: .awaitingRemoteDelete) ?? false
+    sourceAudio = try container.decodeIfPresent(String.self, forKey: .sourceAudio)
   }
 
   static func url(for recordingDirectory: URL) -> URL {
@@ -135,6 +139,13 @@ final class TranscriptionCoordinator {
     /// scratch at four recording-sized files while still overlapping one job's
     /// network transmit with another's encode.
     var uploadConcurrency: Int = 2
+    var isMicAttributionEnabled: () -> Bool = {
+      UserDefaults.standard.bool(forKey: SettingsKeys.micAttribution)
+    }
+    var attributeLocalSpeech:
+      @Sendable (URL, [TranscriptToken]) async throws -> MicAttribution.Outcome = {
+        try await MicAttribution.analyze(audioURL: $0, tokens: $1)
+      }
   }
 
   // MARK: - Upload Gate
@@ -257,6 +268,15 @@ final class TranscriptionCoordinator {
   /// `@ObservationIgnored` because nothing observes it, and a dictionary of
   /// tasks would otherwise fire a SwiftUI invalidation per job start.
   @ObservationIgnored private var jobs: [String: Task<Void, Never>] = [:]
+
+  /// Mic attribution runs, keyed like `jobs`. Kept apart from them because an
+  /// attribution is optional enrichment of a transcript already saved: it never
+  /// touches the job record, the remote artifacts or the status.
+  @ObservationIgnored private var attributionTasks: [String: Task<Void, Never>] = [:]
+  /// Recordings found ineligible, keyed by path and transcript date, so
+  /// reopening one does not decode it again. In memory only: a relaunch retrying
+  /// once is cheap.
+  @ObservationIgnored private var attributionSkipped: Set<String> = []
 
   /// Set when the app is terminating. New work still writes its sidecar and
   /// shows as queued, so `resumePendingJobs()` picks it up next launch - but
@@ -426,6 +446,8 @@ final class TranscriptionCoordinator {
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
+    attributionTasks[recordingDirectory.path]?.cancel()
+    attributionTasks[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
     guard let job else { return }
     _ = discardRemote(job: job)
@@ -646,6 +668,7 @@ final class TranscriptionCoordinator {
             return
           }
           statuses[key] = .mixing(fraction: 0)
+          job.sourceAudio = audioURL.lastPathComponent
           job.fileId = try await service.upload(fileURL: audioURL) { [weak self] phase in
             Task { @MainActor [weak self] in
               self?.recordUploadProgress(phase, for: key)
@@ -676,7 +699,8 @@ final class TranscriptionCoordinator {
 
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
-        let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        var document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        document.sourceAudio = job.sourceAudio
 
         // The recording can be deleted while its job runs; writing the
         // transcript now would resurrect a file next to something that is
@@ -700,6 +724,18 @@ final class TranscriptionCoordinator {
             "failed to save transcript for \(name): \(error.localizedDescription)")
           return
         }
+        // Optional: without it the transcript is complete, it just cannot be
+        // mic-attributed. So a failure is logged, never failed.
+        if let tokens = document.tokens {
+          do {
+            try TranscriptTokens(transcriptCreatedAt: document.createdAt, tokens: tokens)
+              .save(for: recordingDirectory)
+          } catch {
+            Log.warning(
+              Log.transcription, "transcription",
+              "could not save transcript tokens for \(name): \(error.localizedDescription)")
+          }
+        }
 
         // Deleted through `discardRemote` rather than awaited here: this task is
         // cancellable, and a cancel landing between the sidecar removal and the
@@ -711,6 +747,7 @@ final class TranscriptionCoordinator {
         releaseRemoteRecord(job, in: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
+        reconcileAttribution(recordingDirectory: recordingDirectory, finishingJob: true)
         return
       } catch {
         switch failurePolicy(for: error, attempts: job.attempts) {
@@ -878,6 +915,127 @@ final class TranscriptionCoordinator {
       onDeleted()
     }
     return true
+  }
+
+  // MARK: - Mic Attribution
+
+  /// Brings a saved transcript's speaker labels in line with the mic-attribution
+  /// setting: attributes when it is on and the transcript has no current
+  /// attribution, reverts when it is off and one exists, otherwise does nothing.
+  /// Called after a job finishes and whenever the detail view loads a
+  /// transcript, so a reconciled transcript makes it a no-op.
+  ///
+  /// Never part of the paid job: the transcript is already saved, nothing here
+  /// touches the job record or the status, and nothing waits for it at quit -
+  /// an interrupted run loses nothing and runs again on the next open.
+  func reconcileAttribution(recordingDirectory: URL, finishingJob: Bool = false) {
+    let key = recordingDirectory.path
+    // `finishingJob`: the caller is that job's last turn, and `run` clears its
+    // own entry only on return.
+    guard !isSuspended, attributionTasks[key] == nil, finishingJob || jobs[key] == nil,
+      let document = TranscriptDocument.load(for: recordingDirectory)
+    else { return }
+    let enabled = dependencies.isMicAttributionEnabled()
+    let current = document.attribution?.version == MicAttribution.version
+    if enabled ? current : document.attribution == nil { return }
+    let skipKey = "\(key)|\(document.createdAt.timeIntervalSince1970)"
+    if attributionSkipped.contains(skipKey) { return }
+
+    attributionTasks[key] = Task { [weak self] in
+      await self?.runAttribution(
+        recordingDirectory, document: document, enabled: enabled, skipKey: skipKey)
+    }
+  }
+
+  private func runAttribution(
+    _ recordingDirectory: URL, document: TranscriptDocument, enabled: Bool, skipKey: String
+  ) async {
+    let key = recordingDirectory.path
+    let name = recordingDirectory.lastPathComponent
+    defer { attributionTasks[key] = nil }
+
+    let skip = { [self] (reason: String) in
+      attributionSkipped.insert(skipKey)
+      Log.info(Log.transcription, "attribution", "not attributing \(name): \(reason)")
+    }
+    guard let stored = await Self.loadTokens(for: recordingDirectory),
+      stored.transcriptCreatedAt == document.createdAt
+    else {
+      if enabled {
+        skip("no tokens saved with this transcript")
+      } else {
+        attributionSkipped.insert(skipKey)
+        Log.error(
+          Log.transcription, "attribution",
+          "cannot revert \(name): its tokens are missing, keeping the attributed labels")
+      }
+      return
+    }
+
+    var localIndices = Set<Int>()
+    var attribution: SpeakerAttribution?
+    if enabled {
+      // The tokens' timestamps belong to the file that was uploaded. Only the
+      // raw capture is attributed: echo cancellation rebuilds its tracks from
+      // sample zero, so its clock is not the raw mic track's.
+      guard document.sourceAudio == RecordingStore.audioName else {
+        skip("transcribed from \(document.sourceAudio ?? "an unrecorded source")")
+        return
+      }
+      let audioURL = recordingDirectory.appendingPathComponent(RecordingStore.audioName)
+      do {
+        switch try await dependencies.attributeLocalSpeech(audioURL, stored.tokens) {
+        case .ineligible(let reason):
+          skip(reason)
+          return
+        case .attributed(let indices, let micThreshold, let systemQuietBelow):
+          localIndices = indices
+          attribution = SpeakerAttribution(
+            version: MicAttribution.version, appliedAt: Date(), localTokenCount: indices.count,
+            micThresholdDb: micThreshold, systemQuietBelowDb: systemQuietBelow)
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        Log.warning(
+          Log.transcription, "attribution",
+          "mic attribution failed for \(name): \(error.localizedDescription)")
+        return
+      }
+    }
+
+    // Re-read after the await: the recording can be deleted, re-transcribed or
+    // the setting flipped while the analysis ran, and each makes this result
+    // wrong to write.
+    guard !Task.isCancelled, FileManager.default.fileExists(atPath: key), jobs[key] == nil,
+      dependencies.isMicAttributionEnabled() == enabled,
+      var latest = TranscriptDocument.load(for: recordingDirectory),
+      latest.createdAt == document.createdAt
+    else { return }
+    latest.segments = TranscriptDocument.segments(from: stored.tokens, localIndices: localIndices)
+    latest.attribution = attribution
+    do {
+      try latest.save(for: recordingDirectory)
+    } catch {
+      Log.warning(
+        Log.transcription, "attribution",
+        "could not save attributed transcript for \(name): \(error.localizedDescription)")
+      return
+    }
+    Log.info(
+      Log.transcription, "attribution",
+      enabled
+        ? "labelled \(localIndices.count) of \(stored.tokens.count) tokens as You in \(name)"
+        : "reverted mic attribution in \(name)")
+    // Reloads an open detail view. Not `finish`: no job reached a terminal state.
+    finishCounts[key, default: 0] += 1
+  }
+
+  @concurrent
+  nonisolated private static func loadTokens(for recordingDirectory: URL) async
+    -> TranscriptTokens?
+  {
+    TranscriptTokens.load(for: recordingDirectory)
   }
 
   // MARK: - Helpers

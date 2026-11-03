@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import Blackbox
 
@@ -20,11 +21,18 @@ actor FakeTranscriptionService: TranscriptionServicing {
   /// Consumed one per `awaitCompletion` call, so a test can fail then succeed.
   private var completionErrors: [Error] = []
   private var holdsCompletion = false
-  private let document = TranscriptDocument(
+  private var document = TranscriptDocument(
     segments: [TranscriptSegment(speaker: 1, time: 0, text: "hello")],
     language: "en",
     createdAt: Date(timeIntervalSince1970: 1_700_000_000)
   )
+
+  /// Makes `fetchTranscript` return a document carrying these tokens, as the
+  /// real client does.
+  func setTokens(_ tokens: [TranscriptToken]) {
+    document.tokens = tokens
+    document.segments = TranscriptDocument.segments(from: tokens)
+  }
 
   /// Runs just before `upload` returns, so a test can model the user changing
   /// something during the longest await in the job.
@@ -132,6 +140,12 @@ final class TranscriptionHarness {
   /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
   /// before building the coordinator.
   var uploadConcurrency = 2
+  var micAttributionEnabled = false
+  /// Stands in for the mic-track analysis. Captured by value in
+  /// `makeCoordinator`, like `sleepHandler`.
+  var attributionHandler:
+    @Sendable (URL, [TranscriptToken]) async throws -> MicAttribution.Outcome =
+      { _, _ in .ineligible("no handler") }
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -163,7 +177,9 @@ final class TranscriptionHarness {
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
         durationSeconds: { [weak self] _ in await self?.duration },
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
-        uploadConcurrency: uploadConcurrency
+        uploadConcurrency: uploadConcurrency,
+        isMicAttributionEnabled: { [weak self] in self?.micAttributionEnabled ?? false },
+        attributeLocalSpeech: attributionHandler
       ))
     return coordinator
   }
@@ -1290,5 +1306,145 @@ struct TranscriptionCoordinatorTests {
 
     #expect(TranscriptionJob.load(for: directory)?.awaitingRemoteDelete == true)
     #expect(TranscriptionJob.load(for: directory)?.fileId == "file-1")
+  }
+
+  // MARK: Mic attribution
+
+  nonisolated private static let attributionTokens = [
+    TranscriptToken(text: "Hi", startMs: 0, endMs: 100, speaker: 1),
+    TranscriptToken(text: " mine", startMs: 1000, endMs: 1100, speaker: 2),
+    TranscriptToken(text: " theirs", startMs: 2000, endMs: 2100, speaker: 2),
+  ]
+
+  nonisolated private static func attributed(_ indices: Set<Int>) -> MicAttribution.Outcome {
+    .attributed(localIndices: indices, micThresholdDb: -50, systemQuietBelowDb: -105)
+  }
+
+  @Test("with the setting on, a finished job's transcript gains You labels after it is saved")
+  func attributesAfterSave() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micAttributionEnabled = true
+    harness.attributionHandler = { url, tokens in
+      #expect(url.lastPathComponent == "audio.m4a")
+      #expect(tokens == Self.attributionTokens)
+      return Self.attributed([1])
+    }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { TranscriptDocument.load(for: directory)?.attribution != nil }
+
+    let document = try #require(TranscriptDocument.load(for: directory))
+    #expect(document.segments.map(\.speaker) == [1, -1, 2])
+    #expect(document.attribution?.localTokenCount == 1)
+    #expect(document.sourceAudio == "audio.m4a")
+    #expect(coordinator.status(for: directory) == .completed)
+    #expect(TranscriptTokens.load(for: directory)?.tokens == Self.attributionTokens)
+    #expect(coordinator.finishCount(for: directory) == 2)
+  }
+
+  @Test("with the setting off, the analysis never runs")
+  func settingOffSkipsAttribution() async throws {
+    let harness = try TranscriptionHarness()
+    let called = OSAllocatedUnfairLock(initialState: false)
+    harness.attributionHandler = { _, _ in
+      called.withLock { $0 = true }
+      return Self.attributed([1])
+    }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    coordinator.reconcileAttribution(recordingDirectory: directory)
+    try await Task.sleep(for: .milliseconds(100))
+
+    #expect(!called.withLock { $0 })
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.speaker) == [1, 2])
+  }
+
+  @Test("switching the setting off reverts an attributed transcript to the provider's labels")
+  func revertsWhenSwitchedOff() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micAttributionEnabled = true
+    harness.attributionHandler = { _, _ in Self.attributed([1]) }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { TranscriptDocument.load(for: directory)?.attribution != nil }
+
+    harness.micAttributionEnabled = false
+    coordinator.reconcileAttribution(recordingDirectory: directory)
+    await harness.wait { TranscriptDocument.load(for: directory)?.attribution == nil }
+
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.speaker) == [1, 2])
+  }
+
+  @Test("a transcript made from the echo-cancelled file is not attributed")
+  func processedSourceSkipped() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micAttributionEnabled = true
+    let called = OSAllocatedUnfairLock(initialState: false)
+    harness.attributionHandler = { _, _ in
+      called.withLock { $0 = true }
+      return Self.attributed([1])
+    }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    try Data([0]).write(to: directory.appendingPathComponent(RecordingStore.processedAudioName))
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    try await Task.sleep(for: .milliseconds(100))
+
+    #expect(!called.withLock { $0 })
+    #expect(TranscriptDocument.load(for: directory)?.sourceAudio == "audio-processed.m4a")
+    #expect(TranscriptDocument.load(for: directory)?.attribution == nil)
+  }
+
+  @Test("deleting a recording mid-analysis cancels it and writes nothing")
+  func deletionCancelsAttribution() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micAttributionEnabled = true
+    let started = OSAllocatedUnfairLock(initialState: false)
+    harness.attributionHandler = { _, _ in
+      started.withLock { $0 = true }
+      try await Task.sleep(for: .seconds(60))
+      return Self.attributed([1])
+    }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { started.withLock { $0 } }
+    let transcript = try #require(TranscriptDocument.load(for: directory))
+
+    coordinator.forgetDeletedRecording(recordingDirectory: directory, job: nil)
+    try await Task.sleep(for: .milliseconds(100))
+
+    #expect(TranscriptDocument.load(for: directory)?.attribution == nil)
+    #expect(TranscriptDocument.load(for: directory)?.createdAt == transcript.createdAt)
+  }
+
+  @Test("an analysis failure leaves the saved transcript as it was")
+  func attributionFailureKeepsTranscript() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micAttributionEnabled = true
+    harness.attributionHandler = { _, _ in throw MicAttributionError.readFailed("corrupt") }
+    await harness.service.setTokens(Self.attributionTokens)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    try await Task.sleep(for: .milliseconds(100))
+
+    #expect(coordinator.status(for: directory) == .completed)
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.speaker) == [1, 2])
   }
 }

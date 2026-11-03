@@ -15,6 +15,7 @@ Sources/
   AECProcessor.swift                       - DTLN-aec CoreML post-processing: echo cancellation on mic track
   TranscriptionService.swift               - Soniox stage-level client (upload/create/poll/fetch), TranscriptDocument sidecar
   TranscriptionCoordinator.swift           - App-level transcription: auto-trigger, one independent job per recording, resumable job sidecar
+  MicAttribution.swift                     - Mic-track energy gate that labels the local user's tokens "You" (opt-in, local only)
   BlackboxTestMode.swift                   - Test mode flags (--ui-test-mode), IPC types for smoke tests
   BlackboxTestController.swift             - File-based IPC controller for smoke test automation
   MainWindowView.swift                     - Main window: Recordings tab (NavigationSplitView list + detail) and Settings tab
@@ -38,6 +39,7 @@ Tests/
   AudioRecorderRaceTests.swift             - Start/stop race tests (one reaches live SCK, gated on the permission being granted)
   TranscriptionCoordinatorTests.swift      - Trigger decision, queueing, retry/failure, cancel, launch resume (fake Soniox client)
   SonioxContractTests.swift                - Real client against a loopback HTTP stub speaking Soniox's documented wire format
+  MicAttributionTests.swift                - Mic attribution rule, decode on synthetic 2-track files, transcript projection
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
   Fixtures/Recordings/                     - Reference recordings for AEC regression tests

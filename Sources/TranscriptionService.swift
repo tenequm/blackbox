@@ -140,6 +140,20 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   /// something to label them with.
   var provider: String?
   var model: String?
+  /// The audio file name that was uploaded, and so the clock the provider's
+  /// timestamps belong to. Nil for transcripts written before it was recorded.
+  var sourceAudio: String?
+  /// Present when `segments` carry mic-based "You" labels rather than the
+  /// provider's own.
+  var attribution: SpeakerAttribution?
+  /// The provider's tokens, carried in memory from fetch to save and persisted
+  /// in their own sidecar (`TranscriptTokens`), never in this file: the
+  /// recordings list decodes every transcript on each scan.
+  var tokens: [TranscriptToken]?
+
+  enum CodingKeys: String, CodingKey {
+    case segments, language, createdAt, provider, model, sourceAudio, attribution
+  }
 
   init(
     segments: [TranscriptSegment], language: String? = nil, createdAt: Date,
@@ -163,6 +177,42 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     provider = try container.decodeIfPresent(String.self, forKey: .provider)
     model = try container.decodeIfPresent(String.self, forKey: .model)
+    // `try?`: a malformed optional field must cost only itself, not the paid
+    // segments above.
+    sourceAudio = try? container.decodeIfPresent(String.self, forKey: .sourceAudio)
+    attribution = try? container.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution)
+  }
+
+  /// The one grouping rule: consecutive tokens with the same speaker form a
+  /// segment that starts at its first token. Tokens at `localIndices` count as
+  /// the local user (-1), which is how attribution is applied and reverted.
+  static func segments(
+    from tokens: [TranscriptToken], localIndices: Set<Int> = []
+  ) -> [TranscriptSegment] {
+    var segments: [TranscriptSegment] = []
+    var currentSpeaker: Int?
+    var currentText = ""
+    var currentTime: Double = 0
+
+    func flush() {
+      guard let speaker = currentSpeaker else { return }
+      let text = currentText.trimmingCharacters(in: .whitespaces)
+      guard !text.isEmpty else { return }
+      segments.append(TranscriptSegment(speaker: speaker, time: currentTime, text: text))
+    }
+
+    for (index, token) in tokens.enumerated() {
+      let speaker = localIndices.contains(index) ? -1 : token.speaker
+      if speaker != currentSpeaker {
+        flush()
+        currentSpeaker = speaker
+        currentText = ""
+        currentTime = token.startMs / 1000.0
+      }
+      currentText += token.text
+    }
+    flush()
+    return segments
   }
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
@@ -236,6 +286,55 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
     guard value.isFinite else { return 0 }
     return min(max(0, value), 24 * 60 * 60)
   }
+}
+
+/// One provider token as returned, translation tokens excluded. Never rewritten:
+/// attribution is a projection over these, so it can be reverted and re-run.
+nonisolated struct TranscriptToken: Codable, Equatable, Sendable {
+  var text: String
+  var startMs: Double
+  var endMs: Double
+  var speaker: Int
+}
+
+/// `transcript-tokens.json`: the tokens behind one `transcript.json`, kept apart
+/// from it so the recordings list does not decode them on every scan.
+nonisolated struct TranscriptTokens: Codable, Sendable {
+  /// The `createdAt` of the transcript these belong to. A tokens file that does
+  /// not match is stale - left by an earlier transcription - and is never used.
+  var transcriptCreatedAt: Date
+  var tokens: [TranscriptToken]
+
+  static let fileName = "transcript-tokens.json"
+
+  static func url(for recordingDirectory: URL) -> URL {
+    recordingDirectory.appendingPathComponent(fileName)
+  }
+
+  static func load(for recordingDirectory: URL) -> TranscriptTokens? {
+    guard let data = try? Data(contentsOf: url(for: recordingDirectory)) else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(TranscriptTokens.self, from: data)
+  }
+
+  /// Encoded with the transcript's own date strategy, so `transcriptCreatedAt`
+  /// round-trips to exactly the value the transcript decodes to.
+  func save(for recordingDirectory: URL) throws {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    try encoder.encode(self).write(to: Self.url(for: recordingDirectory), options: .atomic)
+  }
+}
+
+/// How a transcript's "You" labels were derived, so a later version can tell an
+/// outdated result from a current one.
+nonisolated struct SpeakerAttribution: Codable, Equatable, Sendable {
+  var version: Int
+  var appliedAt: Date
+  var localTokenCount: Int
+  var micThresholdDb: Double
+  var systemQuietBelowDb: Double
 }
 
 /// Which half of `upload` is running. The two are reported separately because
@@ -830,54 +929,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   }
 
   private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
-    var segments: [TranscriptSegment] = []
-    var currentSpeaker: Int?
-    var currentText = ""
-    var currentTime: Double = 0
-
-    for token in tokens {
-      // Skip translation tokens
-      if token["translation_status"] as? String == "translation" { continue }
-
-      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
-      let speaker: Int
-      if let s = token["speaker"] as? Int {
-        speaker = s
-      } else if let s = token["speaker"] as? String, let i = Int(s) {
-        speaker = i
-      } else {
-        speaker = 0
-      }
-      let text = token["text"] as? String ?? ""
-
-      if speaker != currentSpeaker {
-        if let s = currentSpeaker,
-          !currentText.trimmingCharacters(in: .whitespaces)
-            .isEmpty
-        {
-          segments.append(
-            TranscriptSegment(
-              speaker: s,
-              time: currentTime,
-              text: currentText.trimmingCharacters(in: .whitespaces)))
-        }
-        currentSpeaker = speaker
-        currentText = ""
-        currentTime = (token["start_ms"] as? Double ?? 0) / 1000.0
-      }
-      currentText += text
-    }
-
-    // Last segment
-    if let s = currentSpeaker,
-      !currentText.trimmingCharacters(in: .whitespaces).isEmpty
-    {
-      segments.append(
-        TranscriptSegment(
-          speaker: s,
-          time: currentTime,
-          text: currentText.trimmingCharacters(in: .whitespaces)))
-    }
+    let parsed = tokens.compactMap(Self.parseToken)
 
     let language =
       tokens.first(where: {
@@ -885,8 +937,30 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
           && $0["translation_status"] as? String != "translation"
       })?["language"] as? String
 
-    return TranscriptDocument(
-      segments: segments, language: language, createdAt: Date())
+    var document = TranscriptDocument(
+      segments: TranscriptDocument.segments(from: parsed), language: language, createdAt: Date())
+    document.tokens = parsed
+    return document
+  }
+
+  /// Nil for translation tokens, which are not part of the transcript.
+  private static func parseToken(_ token: [String: Any]) -> TranscriptToken? {
+    if token["translation_status"] as? String == "translation" { return nil }
+    // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
+    let speaker: Int
+    if let s = token["speaker"] as? Int {
+      speaker = s
+    } else if let s = token["speaker"] as? String, let i = Int(s) {
+      speaker = i
+    } else {
+      speaker = 0
+    }
+    let startMs = token["start_ms"] as? Double ?? 0
+    return TranscriptToken(
+      text: token["text"] as? String ?? "",
+      startMs: startMs,
+      endMs: token["end_ms"] as? Double ?? startMs,
+      speaker: speaker)
   }
 
   // MARK: - Cleanup

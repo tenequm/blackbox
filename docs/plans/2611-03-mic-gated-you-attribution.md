@@ -2,7 +2,7 @@
 
 Plan for labelling the local user's speech "You" in transcripts by using the
 recording's own mic track. Written 2026-11-03 against `main` at `859bc42`. This
-is the second draft: the first was reviewed adversarially by Codex
+is the second draft, implemented on `feat/mic-attribution`: the first was reviewed adversarially by Codex
 (gpt-6-astra), which returned "rework". Every change from that draft is a
 finding of that review, and the measurements below are from it.
 
@@ -39,6 +39,64 @@ Out of scope:
 - the first-token `language` bug (`TranscriptionService.swift:882` takes the
   first language-bearing token, so one misheard opening second labels a whole
   English call `zh`).
+
+## Resolved before implementation
+
+These decisions supersede anything in the sections below that disagrees.
+
+1. **Tokens get their own sidecar, `transcript-tokens.json`.**
+   - Why not inline: the recordings list decodes every `transcript.json` when it
+     scans (`MainWindowView.swift:334`). Inlining about 7,000 tokens per
+     31-minute call would make that scan decode megabytes of JSON.
+   - Format: `TranscriptTokens { transcriptCreatedAt, tokens }`, written compact.
+   - Matching: a tokens file is used only when its `transcriptCreatedAt` equals
+     the document's `createdAt`. A later re-transcription, or one by an older
+     app version, therefore never pairs with stale tokens.
+   - In memory, `TranscriptDocument` carries the tokens as a transient field that
+     is not encoded.
+2. **`SpeakerAttribution` stores the constants, not the indices.**
+   - Fields: `version`, `appliedAt`, `localTokenCount`, `micThresholdDb` and
+     `systemQuietBelowDb`.
+   - Re-running is deterministic from the tokens plus the audio.
+   - Reverting needs only the tokens: they are regrouped with no local indices.
+3. **One entry point: `TranscriptionCoordinator.reconcileAttribution(recordingDirectory:)`.**
+   - What it does: brings a saved transcript in line with the setting. With the
+     setting on, it attributes when the document has no current-version
+     attribution. With it off, it reverts when one exists. Otherwise it does
+     nothing.
+   - When it is called:
+     - after a job finishes;
+     - from the detail view's `loadTranscript()`, on appear and on every
+       `finishCount` change. A reconciled document makes it a no-op, so there
+       is no loop.
+   - It skips a recording while a transcription job is running for it.
+   - It remembers ineligible recordings (path plus `createdAt`) in memory, so
+     reopening one does not re-decode it.
+4. **Jobs with no recorded `sourceAudio` are skipped.**
+   - That covers jobs that were in flight before this ships, and transcripts
+     written before it.
+   - `sourceAudio` is set on the job just before `upload` and persisted with
+     `fileId`. The coordinator copies it onto the document when it saves.
+5. **The fixtures are a synthetic 2-track M4A written by the test.**
+   - It is written with `AVAssetWriter`: a stereo 48 kHz AAC system input and a
+     mono 48 kHz AAC mic input, filled with tone bursts at known times.
+   - No checked-in fixture.
+6. **Settings.**
+   - The toggle "Label my voice as You" goes in the Transcription section,
+     directly after "Transcribe recordings automatically".
+   - It is not disabled when there is no API key, because it works on
+     transcripts that already exist.
+   - Caption: "Finds your own speech from your microphone track and labels it
+     You. Experimental: most reliable with headphones."
+7. **Track eligibility is read with async loads before the work hops queues.**
+   - The `formatDescriptions` channel count and the track count are read with
+     the async `load` API.
+   - The decode then reopens the asset on the work queue, using AECProcessor's
+     blocking `loadTracks` pattern.
+8. **Frames are placed by absolute sample index.**
+   - The index comes from each buffer's PTS, at 16 kHz with 320 samples per
+     frame. A gap in the PTS leaves those frames unknown.
+   - A frame is known when it received at least half its samples.
 
 ## Design
 
@@ -276,3 +334,48 @@ rate on remote speech. Turn counts are not the measure.
 - `Sources/MainWindowView.swift`: lazy re-run on open; otherwise unchanged.
 - `Tests/`: as above.
 - `docs/specification.md`: a D14 note on enrichment and the token sidecar.
+
+## Spike on five calls: the speaker-level rule
+
+The word-level gate alone, as first implemented, split the local user into two
+speakers on two-person calls. When "You" appeared it was right 89-98% of the
+time, but about 30% of the user's speech time kept the provider's label: pauses
+inside turns and double-talk.
+
+**Method.**
+- Calls: five real calls, with ground truth from the per-turn chat logs in
+  `db-work/docs/chat-logs` and, for 2026-11-02, the Meet transcript.
+- Scoring: a 0.25 s grid, with the best one-to-one mapping of labels to people.
+- Bias: the chat logs were built on Blackbox's own Soniox segments, so they
+  flatter Soniox's boundaries.
+
+**Per-speaker evidence.** "Remote" means the mic is silent while the system
+track is active.
+
+| Provider speaker | Remote share |
+|---|---|
+| Only the local user (4 calls) | 2-13% |
+| Local user merged with a remote voice (2026-11-02, v5 and v6) | 27-39% |
+| Everyone else | 59-96% |
+
+**Rule.** A speaker with at least 30% local and at most 20% remote tokens
+becomes "You" whole, except its remote tokens.
+
+**Results.** "Accuracy" is the share of grid points labelled with the right
+person.
+
+| Call | Word gate only | Speaker-level rule |
+|---|---|---|
+| 10-28, 2 people | accuracy 0.77, You recall 0.64 | accuracy 0.90, recall 0.88, precision 0.92 |
+| 10-23, 2 people | accuracy 0.80, You recall 0.68 | accuracy 0.93, recall 0.93, precision 0.95 |
+| 10-26, 7 people | accuracy 0.84 | accuracy 0.88, recall 0.95, precision 0.86 |
+| 10-29, 6 people | accuracy 0.74 | accuracy 0.75, recall 0.85, precision 0.82 |
+| 11-02, 7 people (merged speaker) | no change: falls back to the word gate, as intended | |
+
+**FluidAudio, scored on the same calls, was not a consistent win.**
+- Speaker count: right on 3 of 5 calls.
+- One remote person was split into two on 10-23.
+- 10-26 was under-counted, 4 speakers found for 6.
+- Accuracy against the word gate ranged from -0.04 to +0.15.
+
+It is parked.
