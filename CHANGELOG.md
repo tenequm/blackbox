@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.6](https://github.com/tenequm/blackbox/compare/v0.9.5...v0.9.6) - 2026-11-03
+
+### <!-- 1 -->New Features
+- **transcription:** default to Soniox stt-async-v6 ([#41](https://github.com/tenequm/blackbox/pull/41)) ([7fe1550](https://github.com/tenequm/blackbox/commit/7fe1550d351ed9c9af25aa386f8ffc7e0d780134))
+  Transcription now uses Soniox's newer stt-async-v6 model by default,
+  with better accuracy and speaker separation on long meetings. You can
+  still pick v5 in Settings until Soniox retires it on December 15.
+
+### <!-- 6 -->Chores
+- **skills:** update swift-macos to 0.8.4 ([43e7842](https://github.com/tenequm/blackbox/commit/43e784214941845f779333e9ce58ec6efa9f35e7))
+- ignore .claude/settings.local.json.bak ([ff21ddc](https://github.com/tenequm/blackbox/commit/ff21ddcfce42747012807fdcbcf2e8f7d2285ea4))
+- **skills:** manage skills with kasetto, swap swift-macos for swift-dev ([4a60ce4](https://github.com/tenequm/blackbox/commit/4a60ce47cc4c0590e58924313a6bb25be0b43147))
+
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.5...v0.9.6
+
 ## [0.9.5](https://github.com/tenequm/blackbox/compare/v0.9.4...v0.9.5) - 2026-10-07
 
 ### <!-- 2 -->Bug Fixes
