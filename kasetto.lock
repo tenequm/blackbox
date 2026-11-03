@@ -1,0 +1,11 @@
+version: 3
+skills:
+  https://github.com/tenequm/skills::swift-dev:
+    destination: .claude/skills/swift-dev,.agents/skills/swift-dev
+    hash: 0288c589ff4160f75484bd93a232602087c1b0092cb0192763bb94cc78907fc9
+    skill: swift-dev
+    description: Native iOS and macOS apps in Swift 6 - SwiftUI, AppKit, SwiftData, concurrency, Swift Testing, XcodeGen, CallKit and audio, App Intents, devices, TestFlight, code signing, notarization. Use for any iPhone or Mac app, helper or CLI work.
+    source: https://github.com/tenequm/skills
+    source_revision: branch:main
+    scope: project
+assets: {}

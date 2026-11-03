@@ -41,8 +41,8 @@ Tests/
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
   Fixtures/Recordings/                     - Reference recordings for AEC regression tests
-.agents/skills/
-  release-dmg/SKILL.md                     - full release pipeline (not model-invocable; read the file directly)
+kasetto.yaml / kasetto.lock                - project skills (swift-dev), installed by `kst sync` into gitignored .claude/skills and .agents/skills
+lefthook.yml                               - post-checkout `kst sync` so fresh checkouts and worktrees get the skills
 ```
 
 ## Build & Run

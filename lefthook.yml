@@ -1,0 +1,6 @@
+# Setup once per clone: lefthook install
+# Materialize agent skills (gitignored) in fresh checkouts and worktrees
+post-checkout:
+  commands:
+    kasetto:
+      run: command -v kst >/dev/null 2>&1 && kst sync -q --color never || true
