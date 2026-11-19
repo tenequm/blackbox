@@ -4,6 +4,11 @@ import Foundation
 // MARK: - Data Models
 
 nonisolated struct RecordingMetadata: Codable, Sendable {
+  nonisolated struct WindowTitle: Codable, Sendable, Equatable {
+    let at: TimeInterval
+    let title: String
+  }
+
   var title: String
   var createdAt: Date
   var appName: String
@@ -11,8 +16,10 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   var perAppBundleID: String?
   var perAppName: String?
   var trackCount: Int?
+  private(set) var windowTitles: [WindowTitle]?
 
   static let fileName = "metadata.json"
+  static let windowTitleLimit = 200
 
   init(
     title: String, createdAt: Date, appName: String, speakers: [String: String],
@@ -45,6 +52,22 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     perAppBundleID = try container.decodeIfPresent(String.self, forKey: .perAppBundleID)
     perAppName = try container.decodeIfPresent(String.self, forKey: .perAppName)
     trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
+    windowTitles = try? container.decode([WindowTitle].self, forKey: .windowTitles)
+  }
+
+  @discardableResult
+  mutating func recordWindowTitles(_ titles: [String], at seconds: TimeInterval) -> Bool {
+    let remaining = Self.windowTitleLimit - (windowTitles?.count ?? 0)
+    guard remaining > 0 else { return false }
+    var seen = Set(windowTitles?.map(\.title) ?? [])
+    var additions: [WindowTitle] = []
+    for title in titles where !title.isEmpty && seen.insert(title).inserted {
+      additions.append(WindowTitle(at: seconds, title: title))
+      if additions.count == remaining { break }
+    }
+    guard !additions.isEmpty else { return false }
+    windowTitles = (windowTitles ?? []) + additions
+    return true
   }
 
   static func load(in directory: URL) -> RecordingMetadata? {
@@ -129,6 +152,8 @@ nonisolated struct ExportedSegment: Codable, Sendable {
   var speaker: String
   var time: String
   var text: String
+
+  var plainText: String { "[\(time)] \(speaker): \(text)" }
 }
 
 nonisolated struct TranscriptDocument: Codable, Sendable {
@@ -169,6 +194,10 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     recordingURL.appendingPathComponent("transcript.json")
   }
 
+  nonisolated static func plainTextURL(for recordingURL: URL) -> URL {
+    recordingURL.appendingPathComponent("transcript.txt")
+  }
+
   nonisolated static func load(for recordingURL: URL) -> TranscriptDocument? {
     let url = sidecarURL(for: recordingURL)
     guard let data = try? Data(contentsOf: url) else { return nil }
@@ -184,6 +213,41 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(self)
     try data.write(to: url, options: .atomic)
+    savePlainText(for: recordingURL, metadata: RecordingMetadata.load(in: recordingURL))
+  }
+
+  func savePlainText(for directory: URL, metadata: RecordingMetadata?) {
+    let url = Self.plainTextURL(for: directory)
+    do {
+      try plainText(for: directory, metadata: metadata).write(
+        to: url, atomically: true, encoding: .utf8)
+    } catch {
+      // A directory at the companion path can cause this failure. Never remove its contents.
+      _ = Darwin.remove(url.path)
+      Log.error(
+        Log.app, "transcription", "could not save text transcript: \(error.localizedDescription)")
+    }
+  }
+
+  private func plainText(for directory: URL, metadata: RecordingMetadata?) -> String {
+    let start =
+      metadata?.createdAt
+      ?? (try? directory.resourceValues(forKeys: [.creationDateKey]).creationDate)
+    let app = metadata?.appName ?? ""
+    var lines = [
+      "# Recording: \(directory.lastPathComponent)",
+      "# App: \(app.isEmpty ? "Unknown" : app)",
+      "# Start (UTC): \(start?.ISO8601Format() ?? "Unknown")",
+      "# \(provider ?? "Unknown") model: \(model ?? "Unknown")",
+      "# Language: \(language ?? "Unknown")",
+      "",
+    ]
+    for segment in segments {
+      var exported = segment.exported(using: metadata)
+      exported.text = exported.text.split(whereSeparator: \.isNewline).joined(separator: " ")
+      lines.append(exported.plainText)
+    }
+    return lines.joined(separator: "\n") + "\n"
   }
 }
 
@@ -192,6 +256,20 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
   var speaker: Int
   var time: Double
   var text: String
+
+  static func defaultSpeakerName(for id: Int) -> String {
+    // `+ 1` on `Int.max` traps, and this value comes off disk.
+    id == -1 ? "You" : "Speaker \(id &+ 1)"
+  }
+
+  func speakerName(in metadata: RecordingMetadata?) -> String {
+    if let name = metadata?.speakers[String(speaker)], !name.isEmpty { return name }
+    return Self.defaultSpeakerName(for: speaker)
+  }
+
+  func exported(using metadata: RecordingMetadata?) -> ExportedSegment {
+    ExportedSegment(speaker: speakerName(in: metadata), time: formatHMS(time), text: text)
+  }
 
   init(speaker: Int, time: Double, text: String) {
     self.id = UUID()

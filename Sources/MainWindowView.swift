@@ -1241,20 +1241,27 @@ struct RecordingDetailView: View {
   /// The one place that rebuilds a record from a failed load and writes it
   /// back. `appName` genuinely has no better source here - it is not on
   /// `RecordingFile` - so a reconstruction loses it, which is why the write
-  /// failing silently was worth surfacing.
+  /// failing silently was worth surfacing. Re-read from disk because the recorder
+  /// appends window titles while the view is open.
   private func writeMetadata(_ mutate: (inout RecordingMetadata) -> Void) {
     var meta =
-      metadata
+      RecordingMetadata.load(in: recording.url)
+      ?? metadata
       ?? RecordingMetadata(
         title: recording.title,
         createdAt: recording.date,
         appName: recording.title,
         speakers: [:]
       )
+    let previousSpeakers = meta.speakers
     mutate(&meta)
     do {
       try meta.save(in: recording.url)
       metadata = meta
+      if meta.speakers != previousSpeakers {
+        TranscriptDocument.load(for: recording.url)?.savePlainText(
+          for: recording.url, metadata: meta)
+      }
     } catch {
       // Was `try?` in all three rename paths, and two of them then assigned the
       // in-memory copy anyway - so the UI showed a rename that never reached
@@ -1267,14 +1274,6 @@ struct RecordingDetailView: View {
   private func saveTitle(_ newTitle: String) {
     writeMetadata { $0.title = newTitle }
     onTitleChanged()
-  }
-
-  private func speakerName(for speakerID: Int) -> String {
-    if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
-      return name
-    }
-    // `+ 1` on `Int.max` traps, and this value comes off disk.
-    return speakerID == -1 ? "You" : "Speaker \(speakerID &+ 1)"
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
@@ -1371,7 +1370,7 @@ struct RecordingDetailView: View {
           ForEach(Array(doc.segments.enumerated()), id: \.element.id) { index, segment in
             TranscriptSegmentView(
               segment: segment,
-              speakerName: speakerName(for: segment.speaker),
+              speakerName: segment.speakerName(in: metadata),
               isActive: index == active,
               onSeek: { jumpTo(time: segment.time) },
               onRenameSpeaker: { newName in
@@ -1478,9 +1477,8 @@ struct RecordingDetailView: View {
   /// into a message or a doc. The JSON export stays for anything programmatic.
   private func copyTranscript() {
     guard let transcript, !transcript.segments.isEmpty else { return }
-    let body = transcript.segments.map { segment in
-      "[\(formatHMS(segment.time))] \(speakerName(for: segment.speaker)): \(segment.text)"
-    }.joined(separator: "\n")
+    let body = transcript.segments.map { $0.exported(using: metadata).plainText }.joined(
+      separator: "\n")
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(body, forType: .string)
 
@@ -1509,13 +1507,7 @@ struct RecordingDetailView: View {
     )
     guard panel.runModal() == .OK, let dest = panel.url else { return }
 
-    let segments = transcript.segments.map { segment in
-      ExportedSegment(
-        speaker: speakerName(for: segment.speaker),
-        time: formatHMS(segment.time),
-        text: segment.text
-      )
-    }
+    let segments = transcript.segments.map { $0.exported(using: metadata) }
 
     do {
       let data: Data
@@ -1526,7 +1518,7 @@ struct RecordingDetailView: View {
       } else {
         // Plain text is the default now. Nobody outside this repo wants
         // `[{"speaker":…}]` when they meant to paste a transcript into a doc.
-        let body = segments.map { "[\($0.time)] \($0.speaker): \($0.text)" }
+        let body = segments.map(\.plainText)
           .joined(separator: "\n")
         data = Data(body.utf8)
       }

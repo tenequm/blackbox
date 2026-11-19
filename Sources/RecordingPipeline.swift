@@ -174,7 +174,8 @@ final class RecordingPipeline: @unchecked Sendable {
 
   nonisolated var currentDiagnostics: RecordingDiagnostics { diagnostics }
 
-  nonisolated func start() throws {
+  @discardableResult
+  nonisolated func start(windowTitles: [String] = []) throws -> URL {
     try FileManager.default.createDirectory(at: saveDirectory, withIntermediateDirectories: true)
 
     let attrs = try FileManager.default.attributesOfFileSystem(forPath: saveDirectory.path)
@@ -201,7 +202,7 @@ final class RecordingPipeline: @unchecked Sendable {
       let audioURL = dirURL.appendingPathComponent(RecordingStore.audioName)
       Log.info(Log.recorder, "recorder", "writing to \(dirName)/\(RecordingStore.audioName)")
 
-      let metadata = RecordingMetadata(
+      var metadata = RecordingMetadata(
         title: titlePrefix + appName,
         createdAt: now,
         appName: appName,
@@ -210,6 +211,7 @@ final class RecordingPipeline: @unchecked Sendable {
         perAppName: nil,
         trackCount: 1 + (micEnabled ? 1 : 0)
       )
+      metadata.recordWindowTitles(windowTitles, at: 0)
       try metadata.save(in: dirURL)
 
       // v0.6.0 parity: system track is stereo 128 kbps AAC so SCStream buffers
@@ -265,6 +267,7 @@ final class RecordingPipeline: @unchecked Sendable {
       stopped = false
       writerFailureReported = false
       diagnostics = RecordingDiagnostics()
+      return dirURL
     } catch {
       try? FileManager.default.removeItem(at: dirURL)
       throw error

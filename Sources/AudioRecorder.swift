@@ -38,6 +38,7 @@ actor AudioRecorder {
   // SCStream state
   private var displayStream: SCStream?
   private var streamProxy: SCStreamProxy?
+  private var windowTitleTask: Task<Void, Never>?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -127,6 +128,7 @@ actor AudioRecorder {
   }
 
   deinit {
+    windowTitleTask?.cancel()
     if let configChangeObserver {
       NotificationCenter.default.removeObserver(configChangeObserver)
     }
@@ -176,7 +178,8 @@ actor AudioRecorder {
       // 1. Discover a display to drive the system-audio SCStream. With the
       // display asleep (a restart after -3815 lands here) SCK reports none;
       // wait for it to come back rather than failing the whole recording.
-      let display = try await waitForDisplay()
+      let titleBundleID = isManualRecording ? nil : bundleID
+      let (display, titles) = try await waitForDisplay(titleBundleID: titleBundleID)
 
       // Display-wide audio capture (no window/app exclusions). SCStream's display
       // mix is driven by the OS-composited output path, not a specific hardware
@@ -213,7 +216,8 @@ actor AudioRecorder {
       // Assign before pipeline.start() so a partial-init throw is reachable
       // from cleanupPartialStart's take-and-nil sweep.
       self.pipeline = pipeline
-      try pipeline.start()
+      let startedAt = ContinuousClock.now
+      let directory = try pipeline.start(windowTitles: titles)
 
       await testStartCheckpoint?(.afterPipeline)
       try checkAlive()
@@ -253,6 +257,13 @@ actor AudioRecorder {
       try checkAlive()
 
       startDiskSpaceMonitor()
+      if let titleBundleID {
+        windowTitleTask = Task { @MainActor [appName, initialSampleEmpty = titles.isEmpty] in
+          await Self.sampleWindowTitles(
+            for: titleBundleID, appName: appName, in: directory, startedAt: startedAt,
+            initialSampleEmpty: initialSampleEmpty)
+        }
+      }
       if micEnabled { startDriftMonitor() }
 
       // Start mic capture independently - failure does not stop system audio.
@@ -308,6 +319,7 @@ actor AudioRecorder {
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
+    windowTitleTask?.cancel()
     Log.info(Log.recorder, "recorder", "stop() for \(appName) (phase=\(phase))")
 
     switch phase {
@@ -425,17 +437,18 @@ actor AudioRecorder {
   /// truly headless failure still surfaces.
   static let displayWaitTimeout: Duration = .seconds(300)
   static let displayPollInterval: Duration = .seconds(2)
+  static let windowTitleSampleInterval: Duration = .seconds(30)
 
-  private func waitForDisplay() async throws -> SCDisplay {
+  private func waitForDisplay(titleBundleID: String?) async throws -> (SCDisplay, [String]) {
     let deadline = ContinuousClock.now + Self.displayWaitTimeout
     var announced = false
     while true {
       let content = try await SCShareableContent.excludingDesktopWindows(
-        false, onScreenWindowsOnly: false)
+        false, onScreenWindowsOnly: true)
       try checkAlive()
       if let display = content.displays.first {
         if announced { Log.info(Log.recorder, "recorder", "display is back for \(appName)") }
-        return display
+        return (display, titleBundleID.map { Self.windowTitles(in: content, for: $0) } ?? [])
       }
       if !announced {
         announced = true
@@ -446,6 +459,56 @@ actor AudioRecorder {
       guard ContinuousClock.now < deadline else { throw RecorderError.noDisplay }
       try await Task.sleep(for: Self.displayPollInterval)
       try checkAlive()
+    }
+  }
+
+  private nonisolated static func windowTitles(
+    in content: SCShareableContent, for titleBundleID: String
+  )
+    -> [String]
+  {
+    content.windows.compactMap { window in
+      guard window.owningApplication?.bundleIdentifier == titleBundleID,
+        let title = window.title, !title.isEmpty
+      else { return nil }
+      return title
+    }
+  }
+
+  // Serialize metadata edits with recording and speaker renames in the UI.
+  @MainActor
+  private static func sampleWindowTitles(
+    for titleBundleID: String, appName: String, in directory: URL,
+    startedAt: ContinuousClock.Instant,
+    initialSampleEmpty: Bool
+  )
+    async
+  {
+    var emptySamples = initialSampleEmpty ? 1 : 0
+    while !Task.isCancelled && emptySamples < 10 {
+      do {
+        try await Task.sleep(for: windowTitleSampleInterval)
+        let content = try await SCShareableContent.excludingDesktopWindows(
+          false, onScreenWindowsOnly: true)
+        try Task.checkCancellation()
+        let titles = windowTitles(in: content, for: titleBundleID)
+        if titles.isEmpty {
+          emptySamples += 1
+          continue
+        }
+        emptySamples = 0
+        guard var metadata = RecordingMetadata.load(in: directory) else { continue }
+        let seconds = (ContinuousClock.now - startedAt) / .seconds(1)
+        if metadata.recordWindowTitles(titles, at: seconds) {
+          try metadata.save(in: directory)
+        }
+        if (metadata.windowTitles?.count ?? 0) >= RecordingMetadata.windowTitleLimit { return }
+      } catch {
+        if Task.isCancelled { return }
+        Log.error(
+          Log.recorder, "recorder",
+          "could not sample window titles for \(appName): \(error.localizedDescription)")
+      }
     }
   }
 
