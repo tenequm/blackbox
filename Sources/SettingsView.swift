@@ -469,6 +469,11 @@ struct SettingsView: View {
           .font(.caption)
           .buttonStyle(.link)
       }
+      Text(
+        "Vocabulary: a Soniox context JSON object at \((TranscriptionService.defaultContextURL.path as NSString).abbreviatingWithTildeInPath), such as {\"terms\": [\"Acme\"]}, is sent with each new transcription. A file that is not a JSON object, is over \(TranscriptionService.contextByteLimit) bytes, or that Soniox rejects is skipped."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
 
       Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
         .disabled(sonioxAPIKey.isEmpty)
@@ -486,8 +491,15 @@ struct SettingsView: View {
 
       TextField(
         "Run after each transcript", text: $transcriptHookPath, prompt: Text("/path/to/executable"))
+      if !transcriptHookPath.trimmingCharacters(in: .whitespaces).isEmpty,
+        TranscriptHook.executableURL(for: transcriptHookPath) == nil
+      {
+        Text("Not an executable file, so nothing will run.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
       Text(
-        "Optional. Started without waiting once a transcript is saved, with BLACKBOX_RECORDING_ID and BLACKBOX_RECORDING_DIR set; its output goes to hook.log in the recording's folder. Spelling: ~/Library/Application Support/Blackbox/context.json, if present, is sent to Soniox as context."
+        "Optional. Started without waiting after every successful transcription, Transcribe Again included, with \(TranscriptHook.recordingIDVariable) and \(TranscriptHook.recordingDirectoryVariable) set and a minimal PATH, so use absolute paths. Its output goes to \(TranscriptHook.logFileName) in the recording's folder."
       )
       .font(.caption)
       .foregroundStyle(.secondary)

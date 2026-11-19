@@ -463,23 +463,22 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   /// A hand-edited JSON file holding Soniox's `context` object as-is, typically
   /// `{"terms": [...]}` with the names and product words speech-to-text mangles.
-  static let defaultContextURL = URL(
-    fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/Blackbox/context.json")
-  /// Soniox rejects a context over 8,000 tokens with `invalid_request`; ~10,000
-  /// characters is its own rule of thumb. Checked locally so a grown vocabulary
-  /// costs the context, never the transcription.
-  static let contextCharacterLimit = 10_000
+  static let defaultContextURL = URL(fileURLWithPath: NSHomeDirectory())
+    .appendingPathComponent("Library/Application Support/Blackbox/context.json")
+  /// Soniox rejects a context over 8,000 tokens with `invalid_request` and gives
+  /// ~10,000 characters as the rule of thumb. Bytes, not characters: Cyrillic
+  /// costs more tokens per character, and its UTF-8 bytes track that better.
+  static let contextByteLimit = 10_000
 
-  /// Read on every job, so an edit applies from the next recording. Anything
-  /// wrong with the file - missing, not a JSON object, too large - means no
-  /// context, never a failed job.
-  static func loadContext(from url: URL?) -> [String: Any]? {
+  /// Read on every job, so an edit applies from the next recording. A missing
+  /// file, one that is not a JSON object, or one over the limit means no
+  /// context; a context Soniox rejects is dropped in `createTranscription`.
+  private static func loadContext(from url: URL?) -> [String: Any]? {
     guard let url, let data = try? Data(contentsOf: url) else { return nil }
-    guard let text = String(data: data, encoding: .utf8), text.count <= contextCharacterLimit
-    else {
+    guard data.count <= contextByteLimit else {
       Log.warning(
         Log.transcription, "transcription",
-        "ignoring \(url.lastPathComponent): over \(contextCharacterLimit) characters")
+        "ignoring \(url.lastPathComponent): over \(contextByteLimit) bytes")
       return nil
     }
     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -761,15 +760,27 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       // client loses track of is still identifiable in the Soniox console.
       "client_reference_id": String(reference.prefix(Self.referenceLimit)),
     ]
-    if let context = Self.loadContext(from: contextURL) {
-      config["context"] = context
+    let context = Self.loadContext(from: contextURL)
+    config["context"] = context
+
+    func send(_ body: [String: Any]) async throws -> (Data, URLResponse) {
+      var request = try makeRequest(.post, "/v1/transcriptions")
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+      return try await URLSession.shared.data(for: request)
     }
 
-    var request = try makeRequest(.post, "/v1/transcriptions")
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(withJSONObject: config)
-
-    let (data, response) = try await URLSession.shared.data(for: request)
+    var (data, response) = try await send(config)
+    // A 400 is terminal, and the uploaded audio is already paid for: a context
+    // Soniox refuses (a misspelled key, too many tokens) must cost the context,
+    // not every transcription until someone fixes the file.
+    if context != nil, (response as? HTTPURLResponse)?.statusCode == 400 {
+      Log.warning(
+        Log.transcription, "transcription",
+        "Soniox rejected the context file, retrying without it: \(Self.bodyExcerpt(from: data))")
+      config["context"] = nil
+      (data, response) = try await send(config)
+    }
     try checkHTTPResponse(response, data: data, context: "create transcription")
 
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]

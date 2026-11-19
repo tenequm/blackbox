@@ -132,8 +132,10 @@ final class TranscriptionHarness {
   /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
   /// before building the coordinator.
   var uploadConcurrency = 2
-  /// Recordings the coordinator handed to the after-transcript hook.
+  /// Recordings the coordinator handed to the after-transcript hook, and whether
+  /// each one's transcript was already on disk at that moment.
   var hookedDirectories: [URL] = []
+  var transcriptOnDiskAtHook: [Bool] = []
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -166,7 +168,10 @@ final class TranscriptionHarness {
         durationSeconds: { [weak self] _ in await self?.duration },
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
         uploadConcurrency: uploadConcurrency,
-        onTranscriptSaved: { [weak self] in self?.hookedDirectories.append($0) }
+        onTranscriptSaved: { [weak self] directory in
+          self?.hookedDirectories.append(directory)
+          self?.transcriptOnDiskAtHook.append(TranscriptDocument.load(for: directory) != nil)
+        }
       ))
     return coordinator
   }
@@ -227,7 +232,7 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(harness.hookedDirectories == [directory])
-    #expect(TranscriptDocument.load(for: directory) != nil)
+    #expect(harness.transcriptOnDiskAtHook == [true])
   }
 
   @Test("a failed transcription never fires the hook")
@@ -252,7 +257,9 @@ struct TranscriptionCoordinatorTests {
     let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call-1")
     let script = harness.root.appendingPathComponent("hook.sh")
-    try "#!/bin/sh\necho \"id=$BLACKBOX_RECORDING_ID dir=$BLACKBOX_RECORDING_DIR\"\n"
+    let id = TranscriptHook.recordingIDVariable
+    let dir = TranscriptHook.recordingDirectoryVariable
+    try "#!/bin/sh\necho \"id=$\(id) dir=$\(dir)\"\n"
       .write(to: script, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
@@ -266,12 +273,19 @@ struct TranscriptionCoordinatorTests {
     #expect(output.contains("id=call-1 dir=\(directory.path)"))
   }
 
-  @Test("a blank or non-executable hook path runs nothing")
+  @Test("a blank, missing, non-executable or directory hook path runs nothing")
   func hookIgnoresBadPaths() throws {
     let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call-1")
-    TranscriptHook.run(for: directory, path: "  ")
-    TranscriptHook.run(for: directory, path: harness.root.appendingPathComponent("missing").path)
+    let plain = harness.root.appendingPathComponent("plain.sh")
+    try "#!/bin/sh\necho ran\n".write(to: plain, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plain.path)
+    for path in [
+      "  ", harness.root.appendingPathComponent("missing").path, plain.path, harness.root.path,
+    ] {
+      #expect(TranscriptHook.executableURL(for: path) == nil, "\(path)")
+      TranscriptHook.run(for: directory, path: path)
+    }
     #expect(
       !FileManager.default.fileExists(
         atPath: directory.appendingPathComponent(TranscriptHook.logFileName).path))

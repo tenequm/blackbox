@@ -139,7 +139,12 @@ final class TranscriptionCoordinator {
     /// Called once a transcript is on disk. The live value runs the user's
     /// "after each transcript" command; tests capture the call instead, so a
     /// developer's real hook never fires from a test run.
-    var onTranscriptSaved: (URL) -> Void = { TranscriptHook.run(for: $0) }
+    var onTranscriptSaved: (URL) -> Void = { directory in
+      guard !BlackboxTestMode.isEnabled else { return }
+      TranscriptHook.run(
+        for: directory,
+        path: UserDefaults.standard.string(forKey: SettingsKeys.transcriptHookPath))
+    }
   }
 
   // MARK: - Upload Gate
@@ -682,6 +687,9 @@ final class TranscriptionCoordinator {
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
         let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        // `fetchTranscript` does not check for cancellation itself, and past this
+        // point a late Cancel would still save and fire the after-transcript hook.
+        try Task.checkCancellation()
 
         // The recording can be deleted while its job runs; writing the
         // transcript now would resurrect a file next to something that is
@@ -933,50 +941,63 @@ final class TranscriptionCoordinator {
 
 /// Runs the user's "after each transcript" command, detached: Blackbox starts it
 /// and never waits, so a slow or stuck command cannot hold up transcription or
-/// quitting. The command learns which recording through environment variables,
-/// never through a shell line, so a recording title can not inject anything.
-/// Its output goes to `hook.log` in the recording directory; nothing retries it.
+/// quitting. It fires after every successful transcription, Transcribe Again
+/// included, so the command must be idempotent. The command learns which
+/// recording through environment variables, never through a shell line, so a
+/// recording title cannot inject anything. It inherits the app's minimal PATH.
+/// Output is appended to `hook.log` in the recording directory; nothing retries.
 nonisolated enum TranscriptHook {
   static let logFileName = "hook.log"
+  static let recordingIDVariable = "BLACKBOX_RECORDING_ID"
+  static let recordingDirectoryVariable = "BLACKBOX_RECORDING_DIR"
 
-  static func run(
-    for recordingDirectory: URL,
-    path: String? = UserDefaults.standard.string(forKey: SettingsKeys.transcriptHookPath)
-  ) {
+  /// The configured path as a runnable file, or nil when it is blank, missing,
+  /// a directory, or not executable.
+  static func executableURL(for path: String?) -> URL? {
     let trimmed = (path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
-    let executable = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+    guard !trimmed.isEmpty else { return nil }
+    let url = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+      !isDirectory.boolValue, FileManager.default.isExecutableFile(atPath: url.path)
+    else { return nil }
+    return url
+  }
+
+  static func run(for recordingDirectory: URL, path: String?) {
     let name = recordingDirectory.lastPathComponent
-    guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-      Log.error(
-        Log.transcription, "hook",
-        "not running hook for \(name): \(executable.path) is not executable")
+    guard let executable = executableURL(for: path) else {
+      if !(path ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        Log.error(
+          Log.transcription, "hook",
+          "not running hook for \(name): \(path ?? "") is not an executable file")
+      }
       return
     }
 
-    let logURL = recordingDirectory.appendingPathComponent(logFileName)
-    if !FileManager.default.fileExists(atPath: logURL.path) {
-      FileManager.default.createFile(atPath: logURL.path, contents: nil)
-    }
-    guard let log = try? FileHandle(forWritingTo: logURL) else {
+    let logPath = recordingDirectory.appendingPathComponent(logFileName).path
+    let descriptor = open(logPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
+    guard descriptor >= 0 else {
       Log.error(
         Log.transcription, "hook", "not running hook for \(name): cannot open \(logFileName)")
       return
     }
-    _ = try? log.seekToEnd()
+    // The child gets its own copy at spawn, so the parent closes this as soon as
+    // `run()` returns instead of holding it for as long as the hook runs.
+    let log = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? log.close() }
 
     let process = Process()
     process.executableURL = executable
     var environment = ProcessInfo.processInfo.environment
-    environment["BLACKBOX_RECORDING_ID"] = name
-    environment["BLACKBOX_RECORDING_DIR"] = recordingDirectory.path
+    environment[recordingIDVariable] = name
+    environment[recordingDirectoryVariable] = recordingDirectory.path
     process.environment = environment
     process.currentDirectoryURL = recordingDirectory
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = log
     process.standardError = log
     process.terminationHandler = { finished in
-      try? log.close()
       Log.info(
         Log.transcription, "hook", "hook for \(name) exited with \(finished.terminationStatus)")
     }
@@ -984,7 +1005,6 @@ nonisolated enum TranscriptHook {
       try process.run()
       Log.info(Log.transcription, "hook", "started hook for \(name)")
     } catch {
-      try? log.close()
       Log.error(
         Log.transcription, "hook", "hook for \(name) failed to start: \(error.localizedDescription)"
       )

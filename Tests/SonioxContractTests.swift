@@ -318,7 +318,7 @@ struct SonioxContractTests {
     defer { try? FileManager.default.removeItem(at: directory) }
 
     let valid = directory.appendingPathComponent("valid.json")
-    try Data(#"{"terms":["GR8 Tech","Parimatch"]}"#.utf8).write(to: valid)
+    try Data(#"{"terms":["Acme Widgets","Zorblax"]}"#.utf8).write(to: valid)
     let broken = directory.appendingPathComponent("broken.json")
     try Data("{terms".utf8).write(to: broken)
     let oversized = directory.appendingPathComponent("oversized.json")
@@ -326,7 +326,7 @@ struct SonioxContractTests {
     try JSONSerialization.data(withJSONObject: ["terms": manyTerms]).write(to: oversized)
 
     for (url, expected) in [
-      (valid, ["GR8 Tech", "Parimatch"]), (broken, nil), (oversized, nil),
+      (valid, ["Acme Widgets", "Zorblax"]), (broken, nil), (oversized, nil),
       (directory.appendingPathComponent("missing.json"), nil),
     ] as [(URL, [String]?)] {
       let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL, contextURL: url)
@@ -337,6 +337,29 @@ struct SonioxContractTests {
       let context = body["context"] as? [String: Any]
       #expect(context?["terms"] as? [String] == expected, "\(url.lastPathComponent)")
     }
+  }
+
+  @Test("a context Soniox rejects is dropped and the job is created without it")
+  func rejectedContextIsRetriedWithout() async throws {
+    let server = try StubHTTPServer { request in
+      let body = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
+      return body?["context"] == nil
+        ? .json(201, ["id": "t-1"])
+        : .json(400, ["error_type": "invalid_request", "message": "invalid context"])
+    }
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("blackbox-context-\(UUID().uuidString).json")
+    try Data(#"{"terms":"not a list"}"#.utf8).write(to: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL, contextURL: file)
+
+    let id = try await service.createTranscription(fileId: "f", reference: "r")
+
+    #expect(id == "t-1")
+    let sent = server.requests(path: "/v1/transcriptions").map {
+      ((try? JSONSerialization.jsonObject(with: $0.body)) as? [String: Any])?["context"] != nil
+    }
+    #expect(sent == [true, false])
   }
 
   @Test("a blank configured model falls back to the default")
