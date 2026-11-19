@@ -1723,7 +1723,9 @@ struct AttributionCoordinatorTests {
     #expect(await harness.service.createCount == 0)
   }
 
-  private enum OlderRecord: CaseIterable { case missingProvenance, invalidVersion, invalidIndices }
+  private enum OlderRecord: CaseIterable {
+    case missingProvenance, tokenBasedVersionTwo, absentParameters, invalidVersion, invalidIndices
+  }
 
   @Test(arguments: OlderRecord.allCases)
   private func openingRepairsOldAttributionOffline(record: OlderRecord) async throws {
@@ -1743,17 +1745,23 @@ struct AttributionCoordinatorTests {
     ]
     switch record {
     case .missingProvenance: break
+    case .tokenBasedVersionTwo: old["version"] = 2
+    case .absentParameters:
+      old["version"] = 2
+      old.removeValue(forKey: "parameters")
     case .invalidVersion: old["version"] = "bad"
     case .invalidIndices: old["localTokenIndices"] = "bad"
     }
     try replaceAttribution(in: directory, with: old)
     let decoded = TranscriptTokens.load(for: directory)?.attribution
-    if record == .missingProvenance {
+    if record == .missingProvenance || record == .tokenBasedVersionTwo {
       #expect(decoded?.parameters.sampleRate == 8000)
       #expect(
         decoded?.parameters.minimumLocalFraction == MicActivity.Parameters().minimumLocalFraction)
       #expect(decoded?.thresholds.micThresholdDBFS == -48)
       #expect(decoded?.thresholds.usedAdaptiveMicThreshold == false)
+    } else if record == .absentParameters {
+      #expect(decoded?.isCurrent == false)
     } else {
       #expect(decoded == nil)
     }

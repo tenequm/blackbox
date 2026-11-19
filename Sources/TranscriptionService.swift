@@ -169,6 +169,12 @@ nonisolated struct SpeakerAttribution: Codable, Sendable {
   let thresholds: MicActivity.Thresholds
   let localTokenIndices: [Int]
   let appliedAt: Date
+
+  var isCurrent: Bool {
+    // Earlier version 2 records used per-token labels and had no fold thresholds.
+    version == MicActivity.version && parameters.minimumRunWords > 0
+      && parameters.minimumRunDurationMs > 0
+  }
 }
 
 extension SpeakerAttribution {
@@ -177,7 +183,8 @@ extension SpeakerAttribution {
     version = try values.decode(Int.self, forKey: .version)
     localTokenIndices = try values.decode([Int].self, forKey: .localTokenIndices)
     parameters =
-      try values.decodeIfPresent(MicActivity.Parameters.self, forKey: .parameters) ?? .init()
+      try values.decodeIfPresent(MicActivity.Parameters.self, forKey: .parameters)
+      ?? .init(minimumRunWords: 0, minimumRunDurationMs: 0)
     thresholds =
       try values.decodeIfPresent(MicActivity.Thresholds.self, forKey: .thresholds) ?? .init()
     appliedAt = try values.decodeIfPresent(Date.self, forKey: .appliedAt) ?? .distantPast

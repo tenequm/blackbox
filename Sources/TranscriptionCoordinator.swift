@@ -1031,7 +1031,7 @@ final class TranscriptionCoordinator {
         ?? TranscriptTokens.load(for: directory, onlyAttributed: !enabled && !hasLocal),
       tokens.belongs(to: document)
     else { return nil }
-    let alreadyCurrent = enabled && tokens.attribution?.version == MicActivity.version
+    let alreadyCurrent = enabled && tokens.attribution?.isCurrent == true
     if enabled {
       if let reason = tokens.analysisIneligibility {
         logIneligibility(reason, in: directory)

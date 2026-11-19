@@ -22,10 +22,20 @@ nonisolated enum MicActivity {
     var paddingMs = 40.0
     var minimumLocalFraction = 0.60
 
-    init() {}
+    // Fold a run if either its word count or its unpadded duration in milliseconds is shorter.
+    var minimumRunWords: Int
+    var minimumRunDurationMs: Double
+
+    init(minimumRunWords: Int = 3, minimumRunDurationMs: Double = 1_000) {
+      self.minimumRunWords = minimumRunWords
+      self.minimumRunDurationMs = minimumRunDurationMs
+    }
 
     init(from decoder: Decoder) throws {
       let values = try decoder.container(keyedBy: CodingKeys.self)
+      minimumRunWords = try values.decodeIfPresent(Int.self, forKey: .minimumRunWords) ?? 0
+      minimumRunDurationMs =
+        try values.decodeIfPresent(Double.self, forKey: .minimumRunDurationMs) ?? 0
       sampleRate = try values.decodeIfPresent(Int.self, forKey: .sampleRate) ?? sampleRate
       frameSamples = try values.decodeIfPresent(Int.self, forKey: .frameSamples) ?? frameSamples
       noisePercentile =
@@ -128,9 +138,7 @@ nonisolated enum MicActivity {
       usedAdaptiveMicThreshold: adaptive > parameters.micFloorDBFS,
       systemThresholdDBFS: noiseFloor(system) + parameters.systemMarginDB)
     let frames = localFrames(mic: mic, system: system, parameters, thresholds)
-    let indices = tokens.indices.filter {
-      isLocal(tokens[$0], frames: frames, parameters)
-    }
+    let indices = localTokenIndices(tokens, frames: frames, parameters)
     try checkCancelled()
     return SpeakerAttribution(
       version: version, parameters: parameters,
@@ -275,12 +283,112 @@ nonisolated enum MicActivity {
     return result
   }
 
-  private static func isLocal(_ token: TranscriptToken, frames: [Int32], _ parameters: Parameters)
-    -> Bool
-  {
-    guard let start = token.startMs, let end = token.endMs, start.isFinite, end.isFinite,
-      start >= 0, end >= start
-    else { return false }
+  private struct Run {
+    var tokens: Range<Int>
+    var span: ClosedRange<Double>
+    var words = 1
+    let local: Bool
+
+    mutating func absorb(_ other: Run) {
+      let firstToken = min(tokens.lowerBound, other.tokens.lowerBound)
+      let tokensEnd = max(tokens.upperBound, other.tokens.upperBound)
+      tokens = firstToken..<tokensEnd
+      let startMs = min(span.lowerBound, other.span.lowerBound)
+      let endMs = max(span.upperBound, other.span.upperBound)
+      span = startMs...endMs
+      words += other.words
+    }
+
+    func isShort(_ parameters: Parameters) -> Bool {
+      words < parameters.minimumRunWords
+        || span.upperBound - span.lowerBound < parameters.minimumRunDurationMs
+    }
+  }
+
+  static func localTokenIndices(
+    _ tokens: [TranscriptToken], frames: [Int32], _ parameters: Parameters
+  ) -> [Int] {
+    var indices: [Int] = []
+    var runs: [Run] = []
+    func finishRuns() {
+      for run in foldedRuns(runs, parameters) where run.local {
+        indices.append(contentsOf: run.tokens)
+      }
+      runs.removeAll(keepingCapacity: true)
+    }
+
+    var start = 0
+    while start < tokens.count {
+      let speaker = tokens[start].speaker
+      let end = tokens[start...].firstIndex { $0.speaker != speaker } ?? tokens.endIndex
+      for range in wordRanges(in: tokens[start..<end]) {
+        var span: ClosedRange<Double>?
+        for token in tokens[range] {
+          guard let lower = token.startMs, let upper = token.endMs,
+            lower.isFinite, upper.isFinite, lower >= 0, upper >= lower
+          else { continue }
+          span = min(lower, span?.lowerBound ?? lower)...max(upper, span?.upperBound ?? upper)
+        }
+        guard let span else {
+          finishRuns()
+          continue
+        }
+        var run = Run(tokens: range, span: span, local: isLocal(span, frames: frames, parameters))
+        if runs.last?.local == run.local { run.absorb(runs.removeLast()) }
+        runs.append(run)
+      }
+      finishRuns()
+      start = end
+    }
+    return indices
+  }
+
+  private static func foldedRuns(_ runs: [Run], _ parameters: Parameters) -> [Run] {
+    var folded: [Run] = []
+    for var run in runs {
+      // Coalesce both agreeing neighbours before judging the next run.
+      if folded.last?.isShort(parameters) == true {
+        run.absorb(folded.removeLast())
+        if let left = folded.popLast() { run.absorb(left) }
+      }
+      folded.append(run)
+    }
+    if folded.count > 1, folded[folded.count - 1].isShort(parameters) {
+      let tail = folded.removeLast()
+      folded[folded.count - 1].absorb(tail)
+    }
+    return folded
+  }
+
+  private static func wordRanges(in tokens: ArraySlice<TranscriptToken>) -> [Range<Int>] {
+    var words: [Range<Int>] = []
+    var start = tokens.startIndex
+    var separator: Int?
+    var hasWord = false
+    for index in tokens.indices {
+      let text = tokens[index].text
+      let content = text.drop(while: \.isWhitespace)
+      if content.isEmpty {
+        if !text.isEmpty && separator == nil { separator = index }
+        continue
+      }
+      if !content.allSatisfy({ $0.isPunctuation || $0.isWhitespace }) {
+        if hasWord && (separator != nil || text.first?.isWhitespace == true) {
+          let boundary = separator ?? index
+          words.append(start..<boundary)
+          start = boundary
+        }
+        hasWord = true
+      }
+      separator = nil
+    }
+    if hasWord { words.append(start..<tokens.endIndex) }
+    return words
+  }
+
+  private static func isLocal(
+    _ span: ClosedRange<Double>, frames: [Int32], _ parameters: Parameters
+  ) -> Bool {
     let frameMs = Double(parameters.frameSamples) * 1000 / Double(parameters.sampleRate)
     // Integral of the local mask up to an arbitrary timestamp, including fractional edge frames.
     func localMilliseconds(before time: Double) -> Double {
@@ -293,8 +401,8 @@ nonisolated enum MicActivity {
       guard low > 0 else { return 0 }
       return Double(low - 1) * frameMs + min(frameMs, time - Double(frames[low - 1]) * frameMs)
     }
-    let lower = start - parameters.paddingMs
-    let upper = end + parameters.paddingMs
+    let lower = span.lowerBound - parameters.paddingMs
+    let upper = span.upperBound + parameters.paddingMs
     let local = localMilliseconds(before: upper) - localMilliseconds(before: lower)
     return upper > lower && local >= (upper - lower) * parameters.minimumLocalFraction
   }

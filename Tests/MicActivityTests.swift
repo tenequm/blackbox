@@ -58,7 +58,9 @@ struct MicActivityTests {
       (200, 600), (1200, 1600), (2200, 2600), (3200, 3600),
       (1500, 1500), (nil, 1400), (1600, 1300), (-1, 1500), (1400, nil),
     ]
-    let tokens = times.map { TranscriptToken(text: "word", startMs: $0.0, endMs: $0.1, speaker: 2) }
+    let tokens = times.enumerated().map { index, time in
+      TranscriptToken(text: " word", startMs: time.0, endMs: time.1, speaker: index)
+    }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
     #expect(result.localTokenIndices == (systemSilent ? [1, 2, 4] : [1, 4]))
     #expect(
@@ -76,8 +78,8 @@ struct MicActivityTests {
         (700..<820).contains(ms) || (1020..<1140).contains(ms) || (2000..<2100).contains(ms)
       return burst ? 0.3 : 0.001
     }
-    let tokens = [920.0, 2050.0, 3000.0].map {
-      TranscriptToken(text: "voice", startMs: $0, endMs: $0, speaker: 2)
+    let tokens = [920.0, 2050.0, 3000.0].enumerated().map { index, time in
+      TranscriptToken(text: " voice", startMs: time, endMs: time, speaker: index)
     }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
     #expect(result.thresholds.usedAdaptiveMicThreshold)
@@ -94,11 +96,68 @@ struct MicActivityTests {
     let system = try #require(tracks.first)
     let systemEnd = try await system.load(.timeRange).end.seconds
     try #require(abs(systemEnd - 2) < 0.02)
-    let tokens = [1300.0, 2300.0].map {
-      TranscriptToken(text: "voice", startMs: $0, endMs: $0 + 200, speaker: 1)
+    let tokens = [1300.0, 2300.0].enumerated().map { index, time in
+      TranscriptToken(text: " voice", startMs: time, endMs: time + 200, speaker: index)
     }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
     #expect(result.localTokenIndices == [0])
+  }
+
+  @Test func wordUsesItsEntirePaddedSpanIncludingPunctuation() {
+    // The padded word spans 400 ms. Its final piece and punctuation miss the local frames.
+    let tokens = [
+      TranscriptToken(text: " long", startMs: 40, endMs: 60, speaker: 1),
+      TranscriptToken(text: "er", startMs: 260, endMs: 300, speaker: 1),
+      TranscriptToken(text: " ,", startMs: 300, endMs: 360, speaker: 1),
+    ]
+    #expect(MicActivity.localTokenIndices(tokens, frames: Array(0..<12), .init()) == [0, 1, 2])
+    #expect(MicActivity.localTokenIndices(tokens, frames: Array(0..<11), .init()).isEmpty)
+  }
+
+  @Test func whitespaceTokensSeparateWordsAndUntimedPunctuationFollowsItsWord() {
+    let tokens = [
+      TranscriptToken(text: "one", startMs: 40, endMs: 200, speaker: 1),
+      TranscriptToken(text: " ", startMs: nil, endMs: nil, speaker: 1),
+      TranscriptToken(text: "two", startMs: 1040, endMs: 1200, speaker: 1),
+      TranscriptToken(text: ".", startMs: nil, endMs: nil, speaker: 1),
+    ]
+    let parameters = MicActivity.Parameters(minimumRunWords: 1, minimumRunDurationMs: 0)
+    #expect(MicActivity.localTokenIndices(tokens, frames: Array(50..<62), parameters) == [1, 2, 3])
+  }
+
+  private func folded(_ labels: [Bool], speakers: [Int]? = nil, wordMs: Int = 400) -> [Int] {
+    let tokens = labels.indices.map { index in
+      TranscriptToken(
+        text: " word", startMs: Double(index * wordMs),
+        endMs: Double((index + 1) * wordMs), speaker: speakers?[index] ?? 1)
+    }
+    let frames = labels.indices.filter { labels[$0] }.flatMap { index in
+      (Int32(index * wordMs / 20)..<Int32((index + 1) * wordMs / 20))
+    }
+    return MicActivity.localTokenIndices(tokens, frames: frames, .init())
+  }
+
+  @Test func foldsIslandsAndAdjacentShortRuns() {
+    #expect(folded([true, true, true, false, true, true, true]) == Array(0..<7))
+    #expect(folded([false, false, false, true, false, true, false, false, false]).isEmpty)
+  }
+
+  @Test func foldsAtBothProviderEdges() {
+    #expect(folded([false, true, true, true, false]) == Array(0..<5))
+    #expect(folded([true, false, false, false, true]).isEmpty)
+  }
+
+  @Test func keepsSustainedLocalReplyBetweenRemoteWords() {
+    let labels = [false, false, false, true, true, true, false, false, false]
+    #expect(folded(labels) == [3, 4, 5])
+    let remote = Array(repeating: false, count: 6)
+    #expect(folded(remote + [true, true, true] + remote, wordMs: 200).isEmpty)
+    #expect(folded(remote + [true, true] + remote, wordMs: 600).isEmpty)
+  }
+
+  @Test func providerChangeProtectsShortRemoteReply() {
+    let labels = [true, true, true, false, true, true, true]
+    #expect(folded(labels, speakers: [1, 1, 1, 2, 1, 1, 1]) == [0, 1, 2, 4, 5, 6])
   }
 
   @Test(arguments: [[1], [1, 1], [2, 1, 1], [1, 2]])
