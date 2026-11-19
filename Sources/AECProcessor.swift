@@ -166,7 +166,7 @@ enum AECProcessor {
     let chunkSize = 1024
 
     let asset = AVURLAsset(url: inputURL)
-    let tracks = try asset.loadAudioTracksBlocking()
+    let tracks = try asset.loadAudioTracksBlocking(missingTracks: AECError.readFailed("no tracks"))
     guard tracks.count >= 2 else {
       Log.info(Log.recorder, "aec", "single-track recording, skipping")
       return false
@@ -449,16 +449,12 @@ enum AECError: Error, LocalizedError {
 }
 
 extension AVURLAsset {
-  /// Synchronous track load for the blocking work queue. The async
-  /// `loadTracks` would resume on the cooperative pool, which is exactly what
-  /// this path must stay off of.
-  nonisolated func loadAudioTracksBlocking() throws
-    -> [AVAssetTrack]
-  {
+  /// Keeps AEC and mic attribution on their dedicated blocking queues.
+  nonisolated func loadAudioTracksBlocking(missingTracks: Error) throws -> [AVAssetTrack] {
     let done = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var result: Result<[AVAssetTrack], Error>?
     loadTracks(withMediaType: .audio) { tracks, error in
-      result = tracks.map(Result.success) ?? .failure(error ?? CocoaError(.fileReadCorruptFile))
+      result = tracks.map(Result.success) ?? .failure(error ?? missingTracks)
       done.signal()
     }
     done.wait()

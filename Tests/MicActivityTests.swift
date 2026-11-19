@@ -61,9 +61,9 @@ struct MicActivityTests {
     let tokens = times.map { TranscriptToken(text: "word", startMs: $0.0, endMs: $0.1, speaker: 2) }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
     #expect(result.localTokenIndices == (systemSilent ? [1, 2, 4] : [1, 4]))
-    #expect(result.parameters.systemThresholdDBFS == -105)
-    #expect(result.parameters.micThresholdDBFS == -50)
-    #expect(!result.parameters.usedAdaptiveMicThreshold)
+    #expect(result.thresholds.systemThresholdDBFS == -105)
+    #expect(result.thresholds.micThresholdDBFS == -50)
+    #expect(!result.thresholds.usedAdaptiveMicThreshold)
   }
 
   @Test func bridgesBriefGapsBeforeDroppingShortMicRuns() async throws {
@@ -78,8 +78,8 @@ struct MicActivityTests {
       TranscriptToken(text: "voice", startMs: $0, endMs: $0, speaker: 2)
     }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
-    #expect(result.parameters.usedAdaptiveMicThreshold)
-    #expect(result.parameters.micThresholdDBFS > result.parameters.micFloorDBFS)
+    #expect(result.thresholds.usedAdaptiveMicThreshold)
+    #expect(result.thresholds.micThresholdDBFS > result.parameters.micFloorDBFS)
     #expect(result.localTokenIndices == [0])
   }
 
@@ -121,36 +121,50 @@ struct MicActivityTests {
         text: word.0, startMs: Double(index * 100), endMs: Double(index * 100 + 90), speaker: word.1
       )
     }
-    var document = TranscriptDocument(segments: [], createdAt: Date(), tokens: tokens)
-    let originals = document.project()
-    document.attribution = SpeakerAttribution(
-      version: 1, parameters: .init(), sourceAudio: RecordingStore.audioName,
+    let document = TranscriptDocument(tokens: tokens, createdAt: Date())
+    var sidecar = try #require(document.fetchedTokens)
+    let originals = document.segments
+    sidecar.attribution = SpeakerAttribution(
+      version: 1, parameters: .init(),
+      thresholds: .init(
+        micThresholdDBFS: -50, usedAdaptiveMicThreshold: false, systemThresholdDBFS: -105),
       localTokenIndices: [0, 1], appliedAt: Date())
-    let local = document.project()
+    let local = sidecar.project()
     #expect(local.map(\.text) == ["Hello there", "remote"])
-    #expect(local.map(\.speaker) == [-1, 2])
+    #expect(local.map(\.speaker) == [TranscriptSegment.localSpeaker, 2])
     let names = ["2": "Remote"]
     #expect(
       local.map { TranscriptSegment.speakerName(for: $0.speaker, names: names) } == [
         "You", "Remote",
       ])
-    #expect(TranscriptSegment.speakerName(for: -1, names: ["-1": "Local"]) == "Local")
-    document.attribution = nil
-    #expect(document.project().map(\.speaker) == [1, 2])
-    #expect(document.project().map(\.text) == ["Hello", "there remote"])
-    #expect(document.project().map(\.id) == originals.map(\.id))
-    #expect(document.tokens == tokens)
+    #expect(
+      TranscriptSegment.speakerName(
+        for: TranscriptSegment.localSpeaker,
+        names: [String(TranscriptSegment.localSpeaker): "Local"]) == "Local")
+    sidecar.attribution = nil
+    #expect(sidecar.project().map(\.speaker) == [1, 2])
+    #expect(sidecar.project().map(\.text) == ["Hello", "there remote"])
+    #expect(sidecar.project().map(\.id) == originals.map(\.id))
+    #expect(sidecar.tokens == tokens)
   }
 
-  @Test(arguments: ["", #","tokens":"bad""#, #","attribution":{"version":"bad"}"#])
-  func readsAndRoundTripsSegmentsWithoutEnrichment(extra: String) throws {
+  private enum Sidecar: CaseIterable { case legacy, malformedJSON, malformedTokens }
+
+  @Test(arguments: Sidecar.allCases)
+  private func readsAndRoundTripsSegmentsWithoutAttribution(sidecar: Sidecar) throws {
     let harness = try TranscriptionHarness()
     let file = TranscriptDocument.sidecarURL(for: harness.root)
-    let json = #"{"segments":[{"speaker":2,"time":1,"text":"paid"}]"# + extra + "}"
+    let json = #"{"segments":[{"speaker":2,"time":1,"text":"paid"}]}"#
     try Data(json.utf8).write(to: file)
+    switch sidecar {
+    case .legacy: break
+    case .malformedJSON: try Data("{".utf8).write(to: TranscriptTokens.url(for: harness.root))
+    case .malformedTokens:
+      try Data(#"{"createdAt":0,"tokens":"bad"}"#.utf8).write(
+        to: TranscriptTokens.url(for: harness.root))
+    }
     let document = try #require(TranscriptDocument.load(for: harness.root))
-    #expect(document.tokens == nil)
-    #expect(document.attribution == nil)
+    #expect(TranscriptTokens.load(for: harness.root) == nil)
     try document.save(for: harness.root)
     #expect(TranscriptDocument.load(for: harness.root)?.segments.first?.text == "paid")
   }

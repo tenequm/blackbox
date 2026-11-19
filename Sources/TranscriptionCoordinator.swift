@@ -145,8 +145,8 @@ final class TranscriptionCoordinator {
     }
     var analyzeMic: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution? =
       MicActivity.analyze
-    var saveAttribution: (TranscriptDocument, URL) throws -> Void = { try $0.save(for: $1) }
-    /// Called once a transcript is on disk. The live value runs the user's
+    var saveAttribution: (TranscriptDocument.Encoded, URL) throws -> Void = TranscriptDocument.save
+    /// Called once per paid save when local attribution settles. The live value runs the user's
     /// "after each transcript" command; tests capture the call instead, so a
     /// developer's real hook never fires from a test run.
     var onTranscriptSaved: (URL) -> Void = { directory in
@@ -247,7 +247,7 @@ final class TranscriptionCoordinator {
   /// Bumped whenever a job reaches a terminal state, so views can reload the
   /// sidecar files on disk without polling.
   private(set) var revision = 0
-  /// How many times each recording's job has reached a terminal state.
+  /// How many times a recording's transcript on disk changed.
   ///
   /// This replaced a single `lastFinishedPath`, which could only name one
   /// recording. With concurrent jobs, A finishing and then B finishing before
@@ -283,15 +283,18 @@ final class TranscriptionCoordinator {
   /// nothing starts an upload the process kill is about to interrupt
   /// mid-flight, which would strand the audio on Soniox with no local record of
   /// it. Running jobs are deliberately not cancelled: cancelling would drop them
-  /// and delete remote artifacts for work that would otherwise resume.
+  /// and delete remote artifacts for work that would otherwise resume. Local attribution
+  /// is cancelled on quit: the paid transcript is already saved and its hook can run immediately.
   @ObservationIgnored private var isSuspended = false
 
-  @ObservationIgnored private var attributionTasks: [String: Task<Void, Never>] = [:]
+  @ObservationIgnored private var attributionTasks: [String: PendingAttribution] = [:]
+  @ObservationIgnored private var negativeAnalyses: [String: AttributionFiles] = [:]
+  @ObservationIgnored private var restoreSweep: Task<Void, Never>?
 
   func suspendNewJobs() {
     isSuspended = true
-    for task in attributionTasks.values { task.cancel() }
-    attributionTasks.removeAll()
+    restoreSweep?.cancel()
+    for key in attributionTasks.keys { endAttribution(for: key, fireHook: true) }
   }
 
   @ObservationIgnored private let dependencies: Dependencies
@@ -450,7 +453,8 @@ final class TranscriptionCoordinator {
   /// trash gets an empty job, and an empty job has no ids to delete - which
   /// left the uploaded audio on Soniox with nothing naming it.
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
-    attributionTasks.removeValue(forKey: recordingDirectory.path)?.cancel()
+    endAttribution(for: recordingDirectory.path, fireHook: false)
+    negativeAnalyses[recordingDirectory.path] = nil
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
@@ -459,9 +463,6 @@ final class TranscriptionCoordinator {
   }
 
   func cancel(recordingDirectory: URL) {
-    let enrichment = attributionTasks.removeValue(forKey: recordingDirectory.path)
-    enrichment?.cancel()
-    if enrichment != nil && jobs[recordingDirectory.path] == nil { return }
     if let task = jobs[recordingDirectory.path] {
       // Marked synchronously. Cancellation is only observed at the next
       // suspension point, and an upload can sit inside one for minutes, so
@@ -488,6 +489,7 @@ final class TranscriptionCoordinator {
   /// names a running job is writing, so sweeping mid-session unlinks the mix or
   /// the multipart body out from under an in-flight upload.
   func resumePendingJobs(sweepScratchFiles: Bool = true) {
+    if sweepScratchFiles, !dependencies.isMicAttributionEnabled() { restoreProviderSpeakers() }
     guard apiKey() != nil else { return }
     let directory = dependencies.saveDirectory()
     let sweep = dependencies.sweepTemporaryFiles
@@ -676,12 +678,14 @@ final class TranscriptionCoordinator {
             return
           }
           statuses[key] = .mixing(fraction: 0)
-          job.sourceAudio = audioURL.lastPathComponent
-          job.save(for: recordingDirectory)
           job.fileId = try await service.upload(fileURL: audioURL) { [weak self] phase in
             Task { @MainActor [weak self] in
               self?.recordUploadProgress(phase, for: key)
             }
+          }
+          job.sourceAudio = audioURL.lastPathComponent
+          if TranscriptionJob.load(for: recordingDirectory)?.isAutomatic == false {
+            job.isAutomatic = false
           }
           job.save(for: recordingDirectory)
         }
@@ -709,9 +713,25 @@ final class TranscriptionCoordinator {
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
         var document = try await service.fetchTranscript(transcriptionId: transcriptionId)
-        document.sourceAudio = job.sourceAudio
-        // `fetchTranscript` does not check for cancellation itself, and past this
-        // point a late Cancel would still save and fire the after-transcript hook.
+        document.fetchedTokens?.sourceAudio = job.sourceAudio
+        let tokenData = await TranscriptTokens.encodeForPaidSave(document.fetchedTokens)
+        let encoded: TranscriptDocument.Encoded
+        do {
+          let metadataURL = recordingDirectory.appendingPathComponent(RecordingMetadata.fileName)
+          while true {
+            let version = FileVersion(metadataURL)
+            let candidate = try await Self.encode(document, for: recordingDirectory)
+            try Task.checkCancellation()
+            if FileVersion(metadataURL) == version {
+              encoded = candidate
+              break
+            }
+          }
+        } catch {
+          try Task.checkCancellation()
+          fail(&job, in: recordingDirectory, message: error.localizedDescription)
+          return
+        }
         try Task.checkCancellation()
 
         // The recording can be deleted while its job runs; writing the
@@ -726,7 +746,8 @@ final class TranscriptionCoordinator {
         }
 
         do {
-          try document.save(for: recordingDirectory)
+          endAttribution(for: key, fireHook: true)
+          try TranscriptDocument.save(encoded, for: recordingDirectory)
         } catch {
           // The transcript is paid for and in hand; losing it to a write error
           // is worth an explicit failure rather than a silent retry.
@@ -736,6 +757,16 @@ final class TranscriptionCoordinator {
             "failed to save transcript for \(name): \(error.localizedDescription)")
           return
         }
+
+        do {
+          try TranscriptTokens.write(tokenData, for: recordingDirectory)
+        } catch {
+          document.fetchedTokens = nil
+          Log.warning(
+            Log.transcription, "attribution",
+            "Could not save timed tokens: \(error.localizedDescription)")
+        }
+        negativeAnalyses[key] = nil
 
         // Deleted through `discardRemote` rather than awaited here: this task is
         // cancellable, and a cancel landing between the sidecar removal and the
@@ -747,7 +778,7 @@ final class TranscriptionCoordinator {
         releaseRemoteRecord(job, in: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
-        dependencies.onTranscriptSaved(recordingDirectory)
+        refreshAttribution(in: recordingDirectory, document: document, afterPaidSave: true)
         return
       } catch {
         switch failurePolicy(for: error, attempts: job.attempts) {
@@ -813,82 +844,132 @@ final class TranscriptionCoordinator {
 
   private func finish(key: String, status: TranscriptionStatus) {
     statuses[key] = status
-    finishCounts[key, default: 0] += 1
+    if status == .completed { finishCounts[key, default: 0] += 1 }
     revision += 1
-    if status == .completed {
-      attributionTasks.removeValue(forKey: key)?.cancel()
-      if dependencies.isMicAttributionEnabled() {
-        refreshAttribution(in: URL(fileURLWithPath: key))
-      }
+  }
+
+  // MARK: - Local speaker attribution
+
+  /// Atomic replacement changes the inode even for same-second, same-length transcripts.
+  private nonisolated struct FileVersion: Equatable, Sendable {
+    let inode: ino_t
+    let seconds: Int
+    let nanoseconds: Int
+
+    init?(_ url: URL) {
+      var info = stat()
+      guard stat(url.path, &info) == 0 else { return nil }
+      inode = info.st_ino
+      seconds = info.st_mtimespec.tv_sec
+      nanoseconds = info.st_mtimespec.tv_nsec
     }
   }
 
-  func micAttributionDisabled() {
-    for task in attributionTasks.values { task.cancel() }
-    attributionTasks.removeAll()
+  private nonisolated struct AttributionFiles: Equatable, Sendable {
+    let transcript: FileVersion
+    let tokens: FileVersion
+
+    init?(in directory: URL) {
+      guard let transcript = FileVersion(TranscriptDocument.sidecarURL(for: directory)),
+        let tokens = FileVersion(TranscriptTokens.url(for: directory))
+      else { return nil }
+      self.transcript = transcript
+      self.tokens = tokens
+    }
+  }
+
+  private struct PendingAttribution {
+    let task: Task<Void, Never>
+    let enabled: Bool
+    let hookDirectory: URL?
+  }
+
+  private func endAttribution(for key: String, fireHook: Bool) {
+    guard let pending = attributionTasks.removeValue(forKey: key) else { return }
+    pending.task.cancel()
+    if fireHook, let directory = pending.hookDirectory { dependencies.onTranscriptSaved(directory) }
+  }
+
+  func attributionSettingChanged() {
+    let enabled = dependencies.isMicAttributionEnabled()
+    for (key, pending) in attributionTasks where pending.enabled != enabled {
+      endAttribution(for: key, fireHook: true)
+    }
+    if enabled { restoreSweep?.cancel() } else { restoreProviderSpeakers() }
+  }
+
+  private func restoreProviderSpeakers() {
+    restoreSweep?.cancel()
     let root = dependencies.saveDirectory()
-    Task {
-      let directories = await Self.directoriesWithAttribution(in: root)
+    restoreSweep = Task {
+      let directories = await Self.directoriesWithTokens(in: root)
       for directory in directories {
-        guard !dependencies.isMicAttributionEnabled(), !isSuspended else { return }
-        refreshAttribution(in: directory)
-        await Task.yield()
+        guard !Task.isCancelled, !dependencies.isMicAttributionEnabled(), !isSuspended else {
+          return
+        }
+        await refreshAttribution(in: directory)?.value
       }
     }
   }
 
   @concurrent
-  private static func directoriesWithAttribution(in root: URL) async -> [URL] {
+  private static func directoriesWithTokens(in root: URL) async -> [URL] {
     RecordingStore.directories(in: root).filter {
-      TranscriptDocument.load(for: $0)?.attribution != nil
+      !Task.isCancelled
+        && FileManager.default.fileExists(atPath: TranscriptTokens.url(for: $0).path)
     }
   }
 
   @discardableResult
-  func refreshAttribution(in directory: URL, document: TranscriptDocument? = nil) -> Task<
-    Void, Never
-  >? {
+  func refreshAttribution(
+    in directory: URL, document: TranscriptDocument? = nil, afterPaidSave: Bool = false
+  ) -> Task<Void, Never>? {
     let key = directory.path
-    guard !isSuspended else { return nil }
-    if let pending = attributionTasks[key] { return pending }
-    if let document, !dependencies.isMicAttributionEnabled(), document.attribution == nil {
+    let enabled = dependencies.isMicAttributionEnabled()
+    if let pending = attributionTasks[key] {
+      if pending.enabled == enabled { return pending.task }
+      endAttribution(for: key, fireHook: true)
+    }
+    guard !isSuspended, !afterPaidSave || (enabled && document?.fetchedTokens?.canAnalyze == true),
+      let files = AttributionFiles(in: directory), !enabled || negativeAnalyses[key] != files
+    else {
+      if afterPaidSave { dependencies.onTranscriptSaved(directory) }
       return nil
     }
-    attributionTasks[key] = Task {
-      // Cancellation removes the entry synchronously. Its replacement owns the new entry.
-      defer { if !Task.isCancelled { attributionTasks[key] = nil } }
-      guard !Task.isCancelled, let saved = document ?? TranscriptDocument.load(for: directory)
-      else { return }
-      do {
-        let attribution: SpeakerAttribution?
-        if dependencies.isMicAttributionEnabled() {
-          guard saved.attribution?.version != MicActivity.version else { return }
-          guard let tokens = saved.tokens, saved.sourceAudio == RecordingStore.audioName else {
-            Log.info(
-              Log.transcription, "attribution",
-              "Skipping transcript without timed tokens on the raw capture")
-            return
-          }
-          attribution = try await dependencies.analyzeMic(
-            directory.appendingPathComponent(RecordingStore.audioName), tokens)
-          guard attribution != nil else {
-            Log.info(Log.transcription, "attribution", "Skipping unsupported or empty audio tracks")
-            return
-          }
-        } else {
-          guard saved.attribution != nil, saved.tokens != nil else { return }
-          attribution = nil
+    let analyze = dependencies.analyzeMic
+    let attributionTask = Task {
+      defer {
+        if !Task.isCancelled {
+          attributionTasks[key] = nil
+          if afterPaidSave { dependencies.onTranscriptSaved(directory) }
         }
-        // Sidecar dates have whole-second precision. Compare tokens and source as well.
-        guard !Task.isCancelled, dependencies.isMicAttributionEnabled() == (attribution != nil),
-          var current = TranscriptDocument.load(for: directory),
-          current.createdAt == saved.createdAt,
-          current.tokens == saved.tokens, current.sourceAudio == saved.sourceAudio
+      }
+      do {
+        guard !Task.isCancelled,
+          let update = try await Self.prepareAttribution(
+            in: directory, document: document, enabled: enabled, analyze: analyze)
         else { return }
-        current.attribution = attribution
-        current.segments = current.project()
-        try dependencies.saveAttribution(current, directory)
-        finishCounts[key, default: 0] += 1
+        guard !Task.isCancelled, dependencies.isMicAttributionEnabled() == enabled,
+          AttributionFiles(in: directory) == files
+        else { return }
+        switch update {
+        case .negative:
+          negativeAnalyses[key] = files
+        case .save(let projected, let tokenData):
+          let metadataURL = directory.appendingPathComponent(RecordingMetadata.fileName)
+          while !Task.isCancelled {
+            let version = FileVersion(metadataURL)
+            let encoded = try await Self.encode(projected, for: directory)
+            guard !Task.isCancelled, dependencies.isMicAttributionEnabled() == enabled,
+              AttributionFiles(in: directory) == files
+            else { return }
+            guard FileVersion(metadataURL) == version else { continue }
+            try TranscriptTokens.write(tokenData, for: directory)
+            try dependencies.saveAttribution(encoded, directory)
+            finishCounts[key, default: 0] += 1
+            break
+          }
+        }
       } catch {
         if !Task.isCancelled {
           Log.warning(
@@ -897,7 +978,66 @@ final class TranscriptionCoordinator {
         }
       }
     }
-    return attributionTasks[key]
+    attributionTasks[key] = PendingAttribution(
+      task: attributionTask, enabled: enabled, hookDirectory: afterPaidSave ? directory : nil)
+    return attributionTask
+  }
+
+  private nonisolated enum AttributionUpdate {
+    case negative
+    case save(TranscriptDocument, Data)
+  }
+
+  @concurrent
+  private static func prepareAttribution(
+    in directory: URL, document: TranscriptDocument?, enabled: Bool,
+    analyze: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution?
+  ) async throws -> AttributionUpdate? {
+    guard var document = document ?? TranscriptDocument.load(for: directory) else { return nil }
+    let hasLocal = document.segments.contains { $0.speaker == TranscriptSegment.localSpeaker }
+    guard
+      var sidecar = document.fetchedTokens
+        ?? TranscriptTokens.load(for: directory, onlyAttributed: !enabled && !hasLocal),
+      sidecar.belongs(to: document)
+    else { return nil }
+    let alreadyCurrent = enabled && sidecar.attribution?.version == MicActivity.version
+    if enabled {
+      guard sidecar.canAnalyze else { return nil }
+      if !alreadyCurrent {
+        try Task.checkCancellation()
+        do {
+          guard
+            let result = try await analyze(
+              directory.appendingPathComponent(RecordingStore.audioName), sidecar.tokens)
+          else { return .negative }
+          if result.localTokenIndices.isEmpty, !hasLocal, sidecar.attribution == nil {
+            return .negative
+          }
+          sidecar.attribution = result
+        } catch {
+          try Task.checkCancellation()
+          Log.warning(
+            Log.transcription, "attribution",
+            "Could not analyse microphone audio: \(error.localizedDescription)")
+          return .negative
+        }
+      }
+    } else {
+      guard hasLocal || sidecar.attribution != nil else { return nil }
+      sidecar.attribution = nil
+    }
+    try Task.checkCancellation()
+    let segments = sidecar.project()
+    if alreadyCurrent, document.segments == segments { return nil }
+    document.segments = segments
+    return try .save(document, JSONEncoder().encode(sidecar))
+  }
+
+  @concurrent
+  private static func encode(_ document: TranscriptDocument, for directory: URL) async throws
+    -> TranscriptDocument.Encoded
+  {
+    try document.encoded(for: directory)
   }
 
   /// Abandons a job without calling it a failure: the recording went away, the

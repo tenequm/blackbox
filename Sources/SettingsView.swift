@@ -480,8 +480,9 @@ struct SettingsView: View {
         .help(
           "Existing speaker names stay with their original speaker IDs. Renaming You applies to all speech labelled You."
         )
-        .onChange(of: micAttribution) { _, enabled in
-          if !enabled { transcription.micAttributionDisabled() }
+        .onChange(of: micAttribution) {
+          // The recording detail refreshes its open transcript on enable.
+          transcription.attributionSettingChanged()
         }
       Text(
         "Uses your microphone track to find your own speech. Experimental: works best with headphones."

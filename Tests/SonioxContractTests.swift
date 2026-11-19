@@ -413,7 +413,7 @@ struct SonioxContractTests {
 
     let document = try await service.fetchTranscript(transcriptionId: "t-1")
 
-    let tokens = try #require(document.tokens)
+    let tokens = try #require(document.fetchedTokens?.tokens)
     #expect(tokens.map(\.text) == ["Hello", " there", "General"])
     #expect(tokens.map(\.endMs) == [400, 800, 2200])
     #expect(document.segments.count == 2)

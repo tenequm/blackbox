@@ -378,13 +378,9 @@ final class BlackboxSmokeClient {
       runID,
       "--test-save-directory",
       saveDirectory.path,
-      // NSArgumentDomain outranks every persisted domain, so this pins the
-      // setting for the launched process without touching what the developer
-      // has stored. Transcription is the one setting the app under test still
-      // reads from the real defaults - the rest are already replaced wholesale
-      // by the test-mode branch of `AudioMonitorDependencies.live.loadSettings`.
-      "-\(SettingsKeys.autoTranscribe)",
-      "NO",
+      // Argument-domain overrides keep the developer's transcription defaults out of smoke runs.
+      "-\(SettingsKeys.autoTranscribe)", "NO",
+      "-\(SettingsKeys.micAttribution)", "NO",
     ]
     try process.run()
     process.waitUntilExit()

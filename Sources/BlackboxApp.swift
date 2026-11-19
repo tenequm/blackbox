@@ -468,10 +468,7 @@ struct BlackboxApp: App {
       guard !isTerminating else { return .terminateLater }
       isTerminating = true
       testController?.stop()
-      // Precise replacement for the recording gate that used to defer jobs at
-      // quit as a side effect. One synchronous bool on the main actor, so it
-      // cannot extend the 8s budget - and unlike the gate, it fires on quit and
-      // only on quit.
+      // Pending local analyses can be retried on open. Dispatch their paid hooks before exit.
       transcriptionCoordinator?.suspendNewJobs()
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")

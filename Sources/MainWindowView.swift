@@ -706,6 +706,7 @@ struct RecordingDetailView: View {
   // Transcription
   @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @State private var transcript: TranscriptDocument?
+  @State private var hasSavedTokens: Bool?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -765,26 +766,33 @@ struct RecordingDetailView: View {
       // file only produces an error to show underneath a message that already
       // says the same thing.
       if recording.hasAudio { setupPlayer() }
-      loadTranscript()
-      if let transcript {
+    }
+    .task(id: transcription.finishCount(for: recording.url)) {
+      let count = transcription.finishCount(for: recording.url)
+      let loaded = await Self.loadTranscript(in: recording.url)
+      guard !Task.isCancelled, count == transcription.finishCount(for: recording.url) else {
+        return
+      }
+      let firstLoad = hasSavedTokens == nil
+      transcript = loaded.document
+      hasSavedTokens = loaded.hasTokens
+      if firstLoad, let transcript {
         transcription.refreshAttribution(in: recording.url, document: transcript)
       }
     }
     .onChange(of: micAttribution) { _, enabled in
-      if enabled, transcript != nil { transcription.refreshAttribution(in: recording.url) }
+      // SettingsView schedules the library-wide restore on disable.
+      if enabled, let transcript {
+        transcription.refreshAttribution(in: recording.url, document: transcript)
+      }
     }
     // The cached metadata is the source for every write below, and `.id` is the
     // directory path, which a rename does not change - so renaming in the
     // sidebar left this view holding the old title, and the next speaker rename
     // wrote it back over the new one.
     .onChange(of: recording.title) { _, _ in loadMetadata() }
-    .onChange(of: transcription.finishCount(for: recording.url)) { _, _ in
-      // Decoding a transcript is main-thread JSON work proportional to call
-      // length, so only the recording that actually finished reloads - not
-      // every open detail view every time any job anywhere completes.
-      loadTranscript()
-    }
     .onDisappear {
+      hasSavedTokens = nil
       teardownPlayer()
     }
     .focusable()
@@ -1327,8 +1335,10 @@ struct RecordingDetailView: View {
             .disabled(transcriptionStatus == .cancelling)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if hasSavedTokens == nil {
+        ProgressView("Loading transcript")
       } else if let transcript, !transcript.segments.isEmpty {
-        if micAttribution, transcript.tokens == nil {
+        if micAttribution, hasSavedTokens == false {
           Text("This transcript has no saved speaker tokens for local voice labelling.")
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1465,8 +1475,14 @@ struct RecordingDetailView: View {
 
   // MARK: - Transcription Lifecycle
 
-  private func loadTranscript() {
-    transcript = TranscriptDocument.load(for: recording.url)
+  @concurrent
+  private static func loadTranscript(in directory: URL) async -> (
+    document: TranscriptDocument?, hasTokens: Bool
+  ) {
+    (
+      TranscriptDocument.load(for: directory),
+      FileManager.default.fileExists(atPath: TranscriptTokens.url(for: directory).path)
+    )
   }
 
   /// Covers the first transcription, Retry, and Transcribe Again - they were
@@ -1573,7 +1589,7 @@ private struct TranscriptSegmentView: View {
     .blue, .green, .orange, .purple, .pink, .teal,
   ]
 
-  private var isLocalUser: Bool { segment.speaker == -1 }
+  private var isLocalUser: Bool { segment.speaker == TranscriptSegment.localSpeaker }
 
   private var speakerColor: Color {
     if isLocalUser { return .accentColor }
