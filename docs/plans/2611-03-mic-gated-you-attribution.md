@@ -176,23 +176,38 @@ The numbers are defined exactly, so the result is reproducible:
     system's 10th-percentile energy plus 15 dB.
   - Digital silence gives a floor at -120 dBFS, so the gate stays finite.
   - Unknown system frames fail the gate.
-- **Token rule:**
-  - A token becomes local when at least 60% of its span, padded by 40 ms on
-    each side, lies in local frames.
-  - A zero-length token is judged on the padded window.
-  - A token whose timing is malformed keeps its label.
-- **No run-consistency pass.** The first draft's sandwich rule contradicted
-  itself, and it changed six tokens on the sample.
+- **Word rule (version 2).** Within each uninterrupted provider speaker, a
+  leading space starts a word and a sub-word piece continues it. A separate
+  whitespace token separates words. Punctuation stays with the preceding word.
+  The span runs from the earliest valid start to the latest valid end across
+  the pieces, including punctuation. Pad that span by 40 ms on each side.
+  At least 60% local-frame coverage labels every token of the word local.
+  Zero-duration words use the padded window. A word with no usable timestamps
+  keeps its provider label and ends the fold.
+- **Fold short runs.** Group consecutive words with the same local or provider
+  label. A run is short below 3 words **or** below 1,000 ms from its first to
+  last word (before padding). Fold from left to right, merging a short run with
+  its agreeing neighbours before considering the next run. At either edge use
+  the sole neighbour. A provider-speaker change ends the fold, and an isolated
+  run keeps its label.
 
-On the sample, these constants move 944 tokens to -1: 939 of v6 speaker 2's
-1,779 (53%), 5 from speaker 1, and none from speakers 3 and 4. The gate rejects
-116 mic-qualified tokens. The local user's speech comes out as 57 "You"
-segments; without the gate it is 37. Segments are not turns, so this is not a
-precision figure, but it is why the feature ships off. The constants are a
-reproducible baseline, not a validated tuning.
+On a hand-checked 1:1 call with 50 local and 53 remote turns:
 
-The pass took 1.7-1.8 s for 31 minutes on this machine, so roughly 7 s for a
-2-hour call.
+| Rule | You segments | You segments of at most 2 words | Punctuation-only You | Local recall | False You on remote |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Saved per-token attribution | 120 | 35 | 3 | 87.87% | 0.405% |
+| Words and folding | 40 | 4 | 0 | 92.67% | 0.405% |
+
+Recall and false You count provider-text characters, including spaces, by
+token midpoint in the reference turn windows. The two uncertain local windows
+were excluded. Four short You segments remain, each a whole provider-speaker
+run inside a remote window. Varying the fold thresholds could not remove
+these four. The feature remains off by default.
+
+The original seven-person sample measured the per-token rule only. It moved
+944 tokens to You, including 939 of the merged cluster's 1,779 tokens, and
+produced 57 You segments. The plan recorded no recording ID. The word rule
+has no verified comparison on that call.
 
 ### 5. Setting
 
@@ -269,7 +284,7 @@ rate on remote speech. Turn counts are not the measure.
 - `Sources/TranscriptionService.swift`: the `TranscriptToken` and
   `SpeakerAttribution` types, `project()`, the fetch that keeps tokens, and the
   tolerant decoding.
-- `Sources/MicActivity.swift` (new): the decode, energies and token rule.
+- `Sources/MicActivity.swift` (new): the decode, energies, word rule and run folding.
 - `Sources/TranscriptionCoordinator.swift`: `sourceAudio` on the job, the
   enrichment task, cancellation and re-run.
 - `Sources/SettingsView.swift`: the toggle and key.
