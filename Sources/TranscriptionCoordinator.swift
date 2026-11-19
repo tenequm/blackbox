@@ -314,6 +314,7 @@ final class TranscriptionCoordinator {
   private static let maxAttempts = 3
   /// Offline waits do not spend an attempt, so they get their own bound.
   private static let maxOfflineWaits = 60
+  private static let attributionDeadline = Duration.seconds(120)
   private static let offlineRetry = Duration.seconds(60)
   /// Automatic jobs upload without asking, so a file too short to be a call is
   /// dropped rather than billed. In practice this catches an early manual stop
@@ -721,6 +722,7 @@ final class TranscriptionCoordinator {
         let tokenData = await TranscriptTokens.encodeForPaidSave(
           document.fetchedTokens, in: recordingDirectory)
         do {
+          // The fetch can return after cancellation. Check again during encoding before committing the paid save.
           try await withStableEncoding(of: document, in: recordingDirectory) { encoded in
             // The recording may have moved to the Trash while its transcript was fetched.
             guard FileManager.default.fileExists(atPath: key) else {
@@ -852,7 +854,7 @@ final class TranscriptionCoordinator {
     let id = UUID()
     var task: Task<Void, Never>?
     let enabled: Bool
-    let hookDirectory: URL?
+    var hookDirectory: URL?
     var timeout: Task<Void, Never>?
   }
 
@@ -864,6 +866,7 @@ final class TranscriptionCoordinator {
   }
 
   func cancelLazyAnalysis(in directory: URL) {
+    // Provider-label restores must finish even after the detail closes.
     guard let pending = attributionTasks[directory.path], pending.enabled,
       pending.hookDirectory == nil
     else { return }
@@ -880,9 +883,9 @@ final class TranscriptionCoordinator {
     for (key, pending) in attributionTasks where pending.enabled != enabled {
       endAttribution(for: key, fireHook: true)
     }
+    restorePending = true
     if enabled {
       restoreSweep?.cancel()
-      restorePending = true
     } else {
       restoreProviderSpeakersIfPending()
     }
@@ -895,11 +898,20 @@ final class TranscriptionCoordinator {
     let root = dependencies.saveDirectory()
     let sweep = Task(priority: .utility) {
       let directories = await Self.directories(in: root, containing: TranscriptTokens.fileName)
+      var allSettled = true
       for directory in directories {
         guard !Task.isCancelled, !dependencies.isMicAttributionEnabled() else { return }
         await refreshAttribution(in: directory)?.value
+        if let settled = settledAttributions[directory.path],
+          settled == AttributionFiles(in: directory, enabled: false)
+        {
+          continue
+        }
+        allSettled = false
       }
-      if !Task.isCancelled, !dependencies.isMicAttributionEnabled() { restorePending = false }
+      if allSettled, !Task.isCancelled, !dependencies.isMicAttributionEnabled() {
+        restorePending = false
+      }
     }
     restoreSweep = sweep
     return sweep
@@ -927,9 +939,10 @@ final class TranscriptionCoordinator {
       return
     }
     attributionTasks[key]?.timeout = Task {
-      await dependencies.sleepForAttributionDeadline(.seconds(120))
-      guard !Task.isCancelled else { return }
-      endAttribution(for: key, fireHook: true)
+      await dependencies.sleepForAttributionDeadline(Self.attributionDeadline)
+      guard !Task.isCancelled, let owed = attributionTasks[key]?.hookDirectory else { return }
+      attributionTasks[key]?.hookDirectory = nil
+      dependencies.onTranscriptSaved(owed)
     }
     startAttribution(in: directory, document: document, files: files)
   }
@@ -1076,7 +1089,6 @@ final class TranscriptionCoordinator {
     while true {
       let version = FileVersion(metadataURL)
       let encoded = try await Self.encode(document, for: directory)
-      // fetchTranscript does not check cancellation; a late Cancel must still suppress the paid save and hook.
       try Task.checkCancellation()
       if FileVersion(metadataURL) == version {
         try commit(encoded)
