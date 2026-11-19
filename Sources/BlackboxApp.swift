@@ -234,6 +234,7 @@ struct BlackboxApp: App {
       // permission requests don't race with the onboarding UI.
       monitor?.startMonitoring(skipPermissionRequests: willOnboard)
       // Pick up anything a previous session left mid-flight.
+      transcriptionCoordinator?.restoreProviderSpeakersIfPending()
       transcriptionCoordinator?.resumePendingJobs()
       // A killed echo-cancellation run cannot clean up after itself.
       let saveDirectory =
@@ -468,11 +469,8 @@ struct BlackboxApp: App {
       guard !isTerminating else { return .terminateLater }
       isTerminating = true
       testController?.stop()
-      // Precise replacement for the recording gate that used to defer jobs at
-      // quit as a side effect. One synchronous bool on the main actor, so it
-      // cannot extend the 8s budget - and unlike the gate, it fires on quit and
-      // only on quit.
-      transcriptionCoordinator?.suspendNewJobs()
+      // The recorder owns the 8s termination budget. Dispatch paid hooks without waiting for analysis or the command.
+      transcriptionCoordinator?.prepareForTermination()
       guard let monitor else {
         Log.info(Log.app, "app", "terminating (no monitor)")
         if !BlackboxTestMode.isEnabled {

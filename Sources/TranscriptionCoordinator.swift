@@ -7,6 +7,7 @@ import Foundation
 /// A job interrupted by quit or a crash resumes from its persisted stage on the
 /// next launch instead of re-uploading audio that Soniox already holds.
 nonisolated struct TranscriptionJob: Codable, Sendable {
+  var sourceAudio: String?
   var fileId: String?
   var transcriptionId: String?
   var attempts: Int = 0
@@ -25,8 +26,10 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 
   init(
     fileId: String? = nil, transcriptionId: String? = nil, attempts: Int = 0,
-    isAutomatic: Bool = false, lastError: String? = nil, awaitingRemoteDelete: Bool = false
+    isAutomatic: Bool = false, lastError: String? = nil, awaitingRemoteDelete: Bool = false,
+    sourceAudio: String? = nil
   ) {
+    self.sourceAudio = sourceAudio
     self.fileId = fileId
     self.transcriptionId = transcriptionId
     self.attempts = attempts
@@ -43,6 +46,7 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// the format stays additive.
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    sourceAudio = try? container.decodeIfPresent(String.self, forKey: .sourceAudio)
     fileId = try container.decodeIfPresent(String.self, forKey: .fileId)
     transcriptionId = try container.decodeIfPresent(String.self, forKey: .transcriptionId)
     attempts = try container.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
@@ -136,7 +140,17 @@ final class TranscriptionCoordinator {
     /// scratch at four recording-sized files while still overlapping one job's
     /// network transmit with another's encode.
     var uploadConcurrency: Int = 2
-    /// Called once a transcript is on disk. The live value runs the user's
+    var isMicAttributionEnabled: () -> Bool = {
+      UserDefaults.standard.bool(forKey: SettingsKeys.micAttribution)
+    }
+    var analyzeMic: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution? =
+      MicActivity.analyze
+    var defaults: UserDefaults = .standard
+    var sleepForAttributionDeadline: (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+    /// Writes the projected transcript.json and its transcript.txt companion.
+    var saveProjectedTranscript: (TranscriptDocument.Encoded, URL) throws -> Void =
+      TranscriptDocument.save
+    /// Called once per paid save when local attribution settles. The live value runs the user's
     /// "after each transcript" command; tests capture the call instead, so a
     /// developer's real hook never fires from a test run.
     var onTranscriptSaved: (URL) -> Void = { directory in
@@ -211,7 +225,7 @@ final class TranscriptionCoordinator {
       uploadSlotsInUse -= 1
       return
     }
-    // Nothing new starts once quit has begun. `suspendNewJobs` only guarded
+    // Nothing new starts once quit has begun. The original suspension flag only guarded
     // `enqueue`, so a job already parked here was handed a slot during the 8s
     // termination window and began a POST the process kill then cut - the exact
     // outcome that flag exists to prevent.
@@ -237,7 +251,7 @@ final class TranscriptionCoordinator {
   /// Bumped whenever a job reaches a terminal state, so views can reload the
   /// sidecar files on disk without polling.
   private(set) var revision = 0
-  /// How many times each recording's job has reached a terminal state.
+  /// How many times a recording's transcript on disk changed.
   ///
   /// This replaced a single `lastFinishedPath`, which could only name one
   /// recording. With concurrent jobs, A finishing and then B finishing before
@@ -273,10 +287,99 @@ final class TranscriptionCoordinator {
   /// nothing starts an upload the process kill is about to interrupt
   /// mid-flight, which would strand the audio on Soniox with no local record of
   /// it. Running jobs are deliberately not cancelled: cancelling would drop them
-  /// and delete remote artifacts for work that would otherwise resume.
+  /// and delete remote artifacts for work that would otherwise resume. Local attribution
+  /// is cancelled on quit: the paid transcript is already saved and its hook can run immediately.
   @ObservationIgnored private var isSuspended = false
 
-  func suspendNewJobs() { isSuspended = true }
+  @ObservationIgnored private var attributionTasks: [String: PendingAttribution] = [:]
+  @ObservationIgnored private var settledAttributions: [String: AttributionFiles] = [:]
+  @ObservationIgnored private var restoreSweep: Task<Void, Never>?
+
+  private struct RecordingsMove {
+    let source: URL
+    let destination: URL
+    var owedHooks: [String: Int] = [:]
+  }
+
+  private var recordingsMove: RecordingsMove?
+  var isMovingRecordings: Bool { recordingsMove != nil }
+
+  func prepareForTermination() {
+    isSuspended = true
+    for directory in cancelPendingAttributions() { dependencies.onTranscriptSaved(directory) }
+    if let move = recordingsMove {
+      for path in move.owedHooks.keys {
+        let source = URL(fileURLWithPath: path)
+        let target = move.destination.appendingPathComponent(source.lastPathComponent)
+        fireMoveHooks(
+          for: source, at: FileManager.default.fileExists(atPath: path) ? source : target)
+      }
+    }
+  }
+
+  private func cancelPendingAttributions() -> [URL] {
+    restoreSweep?.cancel()
+    let owed = attributionTasks.values.compactMap(\.hookDirectory)
+    for key in attributionTasks.keys { endAttribution(for: key, fireHook: false) }
+    return owed
+  }
+
+  func moveRecordings(
+    from source: URL, to destination: URL,
+    moveItem: @Sendable (URL, URL) async throws -> Void = moveRecordingItem
+  ) async -> [String] {
+    recordingsMove = RecordingsMove(source: source, destination: destination)
+    for directory in cancelPendingAttributions() { dispatchPaidHook(in: directory) }
+    defer {
+      if let move = recordingsMove {
+        for path in move.owedHooks.keys {
+          let directory = URL(fileURLWithPath: path)
+          fireMoveHooks(for: directory, at: directory)
+        }
+      }
+      recordingsMove = nil
+      restoreProviderSpeakersIfPending()
+    }
+    let directories = await Task.detached { RecordingStore.directories(in: source) }.value
+    var failed: [String] = []
+    for directory in directories {
+      guard !isSuspended else { break }
+      let target = destination.appendingPathComponent(directory.lastPathComponent)
+      do {
+        try await moveItem(directory, target)
+        fireMoveHooks(for: directory, at: target)
+      } catch {
+        failed.append(directory.lastPathComponent)
+        Log.error(
+          Log.app, "settings",
+          "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
+        fireMoveHooks(for: directory, at: directory)
+      }
+    }
+    return failed
+  }
+
+  @concurrent
+  private static func moveRecordingItem(from source: URL, to destination: URL) async throws {
+    try FileManager.default.moveItem(at: source, to: destination)
+  }
+
+  private func dispatchPaidHook(in directory: URL) {
+    if let source = recordingsMove?.source,
+      directory.deletingLastPathComponent().path == source.path, !isSuspended
+    {
+      recordingsMove?.owedHooks[directory.path, default: 0] += 1
+    } else {
+      dependencies.onTranscriptSaved(directory)
+    }
+  }
+
+  private func fireMoveHooks(for source: URL, at directory: URL) {
+    guard let count = recordingsMove?.owedHooks.removeValue(forKey: source.path),
+      FileManager.default.fileExists(atPath: TranscriptDocument.sidecarURL(for: directory).path)
+    else { return }
+    for _ in 0..<count { dependencies.onTranscriptSaved(directory) }
+  }
 
   @ObservationIgnored private let dependencies: Dependencies
   /// Outer nil means "not read yet". Cached because `hasAPIKey` is read from a
@@ -287,6 +390,7 @@ final class TranscriptionCoordinator {
   private static let maxAttempts = 3
   /// Offline waits do not spend an attempt, so they get their own bound.
   private static let maxOfflineWaits = 60
+  private static let attributionDeadline = Duration.seconds(120)
   private static let offlineRetry = Duration.seconds(60)
   /// Automatic jobs upload without asking, so a file too short to be a call is
   /// dropped rather than billed. In practice this catches an early manual stop
@@ -434,6 +538,9 @@ final class TranscriptionCoordinator {
   /// trash gets an empty job, and an empty job has no ids to delete - which
   /// left the uploaded audio on Soniox with nothing naming it.
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
+    endAttribution(for: recordingDirectory.path, fireHook: false)
+    recordingsMove?.owedHooks[recordingDirectory.path] = nil
+    settledAttributions[recordingDirectory.path] = nil
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
@@ -473,7 +580,7 @@ final class TranscriptionCoordinator {
     let sweep = dependencies.sweepTemporaryFiles
     Task { [weak self] in
       if sweepScratchFiles { await sweep() }
-      let pending = await Self.directoriesWithPendingJobs(in: directory)
+      let pending = await Self.directories(in: directory, containing: TranscriptionJob.fileName)
       guard let self else { return }
       for recordingDirectory in pending {
         // Read fresh, and skip anything already in flight: the user can have
@@ -637,7 +744,7 @@ final class TranscriptionCoordinator {
           case .suspended:
             // Sidecar deliberately left in place: this is the quit path, and
             // the next launch resumes from it. Dropping here would delete the
-            // record `suspendNewJobs` exists to preserve.
+            // record quit-time deferral exists to preserve.
             Log.info(
               Log.transcription, "transcription",
               "deferring \(name) to the next launch: quit began while it waited to upload")
@@ -661,6 +768,7 @@ final class TranscriptionCoordinator {
               self?.recordUploadProgress(phase, for: key)
             }
           }
+          job.sourceAudio = audioURL.lastPathComponent
           job.save(for: recordingDirectory)
         }
         // Checked again here rather than only at the top of the pass: `upload`
@@ -686,45 +794,38 @@ final class TranscriptionCoordinator {
 
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
-        let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
-        // `fetchTranscript` does not check for cancellation itself, and past this
-        // point a late Cancel would still save and fire the after-transcript hook.
-        try Task.checkCancellation()
-
-        // The recording can be deleted while its job runs; writing the
-        // transcript now would resurrect a file next to something that is
-        // already in the Trash.
-        guard FileManager.default.fileExists(atPath: key) else {
-          Log.info(
-            Log.transcription, "transcription",
-            "\(name) went away mid-job, discarding transcript")
-          drop(job: job, in: recordingDirectory)
-          return
-        }
-
+        var document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        document.fetchedTokens?.sourceAudio = job.sourceAudio
+        let tokenData = await TranscriptTokens.encodeForPaidSave(
+          document.fetchedTokens, in: recordingDirectory)
         do {
-          try document.save(for: recordingDirectory)
+          // The fetch can return after cancellation. Check again during encoding before committing the paid save.
+          try await withStableEncoding(of: document, in: recordingDirectory) { encoded in
+            // The recording may have moved to the Trash while its transcript was fetched.
+            guard FileManager.default.fileExists(atPath: key) else {
+              Log.info(
+                Log.transcription, "transcription",
+                "\(name) went away mid-job, discarding transcript")
+              drop(job: job, in: recordingDirectory)
+              return
+            }
+            @MainActor func finishPaidSave() -> TranscriptDocument? {
+              let savedTokens = TranscriptTokens.commitPaidSave(tokenData, in: recordingDirectory)
+              releaseRemoteRecord(job, in: recordingDirectory)
+              finish(key: key, status: .completed)
+              Log.info(Log.transcription, "transcription", "transcribed \(name)")
+              return savedTokens ? document : nil
+            }
+            try TranscriptDocument.save(encoded, for: recordingDirectory)
+            attributeAfterPaidSave(finishPaidSave, in: recordingDirectory)
+          }
         } catch {
-          // The transcript is paid for and in hand; losing it to a write error
-          // is worth an explicit failure rather than a silent retry.
+          try Task.checkCancellation()
           fail(&job, in: recordingDirectory, message: error.localizedDescription)
           Log.error(
             Log.transcription, "transcription",
             "failed to save transcript for \(name): \(error.localizedDescription)")
-          return
         }
-
-        // Deleted through `discardRemote` rather than awaited here: this task is
-        // cancellable, and a cancel landing between the sidecar removal and the
-        // DELETEs would strand the uploaded audio on Soniox with nothing left
-        // on disk that could name it. No test covers that race directly - one
-        // would have to hit a window between an HTTP response and the next
-        // executor hop - so this is defended by sharing `discardRemote` with the
-        // cancellation path, which is covered.
-        releaseRemoteRecord(job, in: recordingDirectory)
-        finish(key: key, status: .completed)
-        Log.info(Log.transcription, "transcription", "transcribed \(name)")
-        dependencies.onTranscriptSaved(recordingDirectory)
         return
       } catch {
         switch failurePolicy(for: error, attempts: job.attempts) {
@@ -790,8 +891,297 @@ final class TranscriptionCoordinator {
 
   private func finish(key: String, status: TranscriptionStatus) {
     statuses[key] = status
-    finishCounts[key, default: 0] += 1
+    if status == .completed { finishCounts[key, default: 0] += 1 }
     revision += 1
+  }
+
+  // MARK: - Local speaker attribution
+
+  /// Atomic replacement changes the inode even for same-second, same-length transcripts.
+  private nonisolated struct FileVersion: Equatable, Sendable {
+    let inode: ino_t
+    let seconds: Int
+    let nanoseconds: Int
+
+    init?(_ url: URL) {
+      var info = stat()
+      guard stat(url.path, &info) == 0 else { return nil }
+      inode = info.st_ino
+      seconds = info.st_mtimespec.tv_sec
+      nanoseconds = info.st_mtimespec.tv_nsec
+    }
+  }
+
+  private nonisolated struct AttributionFiles: Equatable, Sendable {
+    let transcript: FileVersion
+    let tokens: FileVersion
+    let enabled: Bool
+
+    init?(in directory: URL, enabled: Bool) {
+      self.enabled = enabled
+      guard let transcript = FileVersion(TranscriptDocument.sidecarURL(for: directory)),
+        let tokens = FileVersion(TranscriptTokens.url(for: directory))
+      else { return nil }
+      self.transcript = transcript
+      self.tokens = tokens
+    }
+  }
+
+  private struct PendingAttribution {
+    let id = UUID()
+    var task: Task<Void, Never>?
+    let enabled: Bool
+    var hookDirectory: URL?
+    var timeout: Task<Void, Never>?
+  }
+
+  private func endAttribution(for key: String, fireHook: Bool) {
+    guard let pending = attributionTasks.removeValue(forKey: key) else { return }
+    pending.timeout?.cancel()
+    pending.task?.cancel()
+    if fireHook, let directory = pending.hookDirectory { dispatchPaidHook(in: directory) }
+  }
+
+  func cancelLazyAnalysis(in directory: URL) {
+    // Provider-label restores must finish even after the detail closes.
+    guard let pending = attributionTasks[directory.path], pending.enabled,
+      pending.hookDirectory == nil
+    else { return }
+    endAttribution(for: directory.path, fireHook: false)
+  }
+
+  private var restorePending: Bool {
+    get { dependencies.defaults.bool(forKey: SettingsKeys.micAttributionRestorePending) }
+    set { dependencies.defaults.set(newValue, forKey: SettingsKeys.micAttributionRestorePending) }
+  }
+
+  func attributionSettingChanged() {
+    let enabled = dependencies.isMicAttributionEnabled()
+    for (key, pending) in attributionTasks where pending.enabled != enabled {
+      endAttribution(for: key, fireHook: true)
+    }
+    restorePending = true
+    if enabled {
+      restoreSweep?.cancel()
+    } else {
+      restoreProviderSpeakersIfPending()
+    }
+  }
+
+  @discardableResult
+  func restoreProviderSpeakersIfPending() -> Task<Void, Never>? {
+    guard restorePending, !dependencies.isMicAttributionEnabled(), !isMovingRecordings, !isSuspended
+    else { return nil }
+    restoreSweep?.cancel()
+    let root = dependencies.saveDirectory()
+    let sweep = Task(priority: .utility) {
+      let directories = await Self.directories(in: root, containing: TranscriptTokens.fileName)
+      var allSettled = true
+      for directory in directories {
+        guard !Task.isCancelled, !dependencies.isMicAttributionEnabled() else { return }
+        await refreshAttribution(in: directory)?.value
+        if let settled = settledAttributions[directory.path],
+          settled == AttributionFiles(in: directory, enabled: false)
+        {
+          continue
+        }
+        allSettled = false
+      }
+      if allSettled, !Task.isCancelled, !dependencies.isMicAttributionEnabled() {
+        restorePending = false
+      }
+    }
+    restoreSweep = sweep
+    return sweep
+  }
+
+  private func attributeAfterPaidSave(
+    _ finishPaidSave: @MainActor () -> TranscriptDocument?, in directory: URL
+  ) {
+    let key = directory.path
+    endAttribution(for: key, fireHook: true)
+    settledAttributions[key] = nil
+    let document = finishPaidSave()
+    let enabled = dependencies.isMicAttributionEnabled()
+    attributionTasks[key] = PendingAttribution(enabled: enabled, hookDirectory: directory)
+    guard !isSuspended, !isMovingRecordings, enabled, let document,
+      let tokens = document.fetchedTokens,
+      let files = AttributionFiles(in: directory, enabled: true)
+    else {
+      endAttribution(for: key, fireHook: true)
+      return
+    }
+    if let reason = tokens.analysisIneligibility {
+      Self.logIneligibility(reason, in: directory)
+      settledAttributions[key] = files
+      endAttribution(for: key, fireHook: true)
+      return
+    }
+    attributionTasks[key]?.timeout = Task {
+      await dependencies.sleepForAttributionDeadline(Self.attributionDeadline)
+      guard !Task.isCancelled, let owed = attributionTasks[key]?.hookDirectory else { return }
+      attributionTasks[key]?.hookDirectory = nil
+      dependencies.onTranscriptSaved(owed)
+    }
+    startAttribution(in: directory, document: document, files: files)
+  }
+
+  @discardableResult
+  func refreshAttribution(in directory: URL) -> Task<Void, Never>? {
+    let key = directory.path
+    let enabled = dependencies.isMicAttributionEnabled()
+    if let pending = attributionTasks[key] {
+      if pending.enabled == enabled { return pending.task }
+      endAttribution(for: key, fireHook: true)
+    }
+    guard !isSuspended, !isMovingRecordings,
+      let files = AttributionFiles(in: directory, enabled: enabled),
+      settledAttributions[key] != files
+    else { return nil }
+    attributionTasks[key] = PendingAttribution(enabled: enabled, hookDirectory: nil)
+    return startAttribution(in: directory, document: nil, files: files)
+  }
+
+  @discardableResult
+  private func startAttribution(
+    in directory: URL, document: TranscriptDocument?, files: AttributionFiles
+  ) -> Task<Void, Never> {
+    let key = directory.path
+    let enabled = files.enabled
+    let id = attributionTasks[key]?.id
+    func isCurrent() -> Bool {
+      !Task.isCancelled && dependencies.isMicAttributionEnabled() == enabled
+        && AttributionFiles(in: directory, enabled: enabled) == files
+    }
+    let task = Task {
+      defer {
+        if attributionTasks[key]?.id == id { endAttribution(for: key, fireHook: true) }
+      }
+      do {
+        try Task.checkCancellation()
+        let update = try await Self.prepareAttribution(
+          in: directory, document: document, enabled: enabled, analyze: dependencies.analyzeMic)
+        guard isCurrent() else { return }
+        switch update {
+        case nil:
+          settledAttributions[key] = files
+        case .tokensOnly(let data):
+          try TranscriptTokens.write(data, for: directory)
+          if enabled { restorePending = true }
+          settledAttributions[key] = AttributionFiles(in: directory, enabled: enabled)
+        case .project(let projected, let data):
+          try await withStableEncoding(of: projected, in: directory) { encoded in
+            guard isCurrent() else { return }
+            let previous = try Data(
+              contentsOf: TranscriptTokens.url(for: directory), options: .mappedIfSafe)
+            try TranscriptTokens.write(data, for: directory)
+            do {
+              try dependencies.saveProjectedTranscript(encoded, directory)
+            } catch {
+              try TranscriptTokens.write(previous, for: directory)
+              throw error
+            }
+            if enabled { restorePending = true }
+            finishCounts[key, default: 0] += 1
+            settledAttributions[key] = AttributionFiles(in: directory, enabled: enabled)
+          }
+        }
+      } catch {
+        if !Task.isCancelled {
+          Log.warning(
+            Log.transcription, "attribution",
+            "could not update local speaker labels for \(directory.lastPathComponent): \(error.localizedDescription)"
+          )
+        }
+      }
+    }
+    attributionTasks[key]?.task = task
+    return task
+  }
+
+  private nonisolated enum AttributionUpdate {
+    case tokensOnly(Data)
+    case project(TranscriptDocument, Data)
+  }
+
+  private nonisolated static func logIneligibility(
+    _ reason: TranscriptTokens.Ineligibility, in directory: URL
+  ) {
+    Log.info(
+      Log.transcription, "attribution",
+      "skipping \(directory.lastPathComponent): \(reason.rawValue)")
+  }
+
+  @concurrent
+  private static func prepareAttribution(
+    in directory: URL, document: TranscriptDocument?, enabled: Bool,
+    analyze: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution?
+  ) async throws -> AttributionUpdate? {
+    guard var document = document ?? TranscriptDocument.load(for: directory) else { return nil }
+    let hasLocal = document.segments.contains { $0.speaker == TranscriptSegment.localSpeaker }
+    guard
+      var tokens = document.fetchedTokens
+        ?? TranscriptTokens.load(for: directory, onlyAttributed: !enabled && !hasLocal),
+      tokens.belongs(to: document)
+    else { return nil }
+    let alreadyCurrent = enabled && tokens.attribution?.isCurrent == true
+    if enabled {
+      if let reason = tokens.analysisIneligibility {
+        logIneligibility(reason, in: directory)
+        return nil
+      }
+      if !alreadyCurrent {
+        try Task.checkCancellation()
+        do {
+          guard
+            let result = try await analyze(
+              directory.appendingPathComponent(RecordingStore.audioName), tokens.tokens)
+          else { return nil }
+          tokens.attribution = result
+        } catch {
+          try Task.checkCancellation()
+          Log.warning(
+            Log.transcription, "attribution",
+            "could not analyse microphone audio for \(directory.lastPathComponent): \(error.localizedDescription)"
+          )
+          return nil
+        }
+      }
+    } else {
+      guard hasLocal || tokens.hasAttributionRecord else { return nil }
+      tokens.attribution = nil
+    }
+    try Task.checkCancellation()
+    let segments = tokens.project()
+    if document.segments == segments {
+      return alreadyCurrent ? nil : try .tokensOnly(JSONEncoder().encode(tokens))
+    }
+    document.segments = segments
+    return try .project(document, JSONEncoder().encode(tokens))
+  }
+
+  // A speaker rename during encoding would leave stale names in transcript.txt.
+  private func withStableEncoding(
+    of document: TranscriptDocument, in directory: URL,
+    commit: (TranscriptDocument.Encoded) throws -> Void
+  ) async throws {
+    let metadataURL = directory.appendingPathComponent(RecordingMetadata.fileName)
+    while true {
+      let version = FileVersion(metadataURL)
+      let encoded = try await Self.encode(document, for: directory)
+      try Task.checkCancellation()
+      if FileVersion(metadataURL) == version {
+        try commit(encoded)
+        return
+      }
+    }
+  }
+
+  @concurrent
+  private static func encode(_ document: TranscriptDocument, for directory: URL) async throws
+    -> TranscriptDocument.Encoded
+  {
+    try document.encoded(for: directory)
   }
 
   /// Abandons a job without calling it a failure: the recording went away, the
@@ -896,15 +1286,18 @@ final class TranscriptionCoordinator {
 
   // MARK: - Helpers
 
-  /// Returns directories that hold a job record, not the records themselves.
+  /// Returns directories that contain the requested sidecar.
   /// The enumeration is the expensive part and belongs off the main actor; the
   /// records are deliberately read back on it, because this runs after two
   /// awaits and anything the user did in that window has already rewritten
   /// them. Acting on a snapshot taken beforehand would clobber a live job.
   @concurrent
-  nonisolated private static func directoriesWithPendingJobs(in directory: URL) async -> [URL] {
+  nonisolated private static func directories(in directory: URL, containing fileName: String) async
+    -> [URL]
+  {
     RecordingStore.directories(in: directory).filter {
-      FileManager.default.fileExists(atPath: TranscriptionJob.url(for: $0).path)
+      !Task.isCancelled
+        && FileManager.default.fileExists(atPath: $0.appendingPathComponent(fileName).path)
     }
   }
 

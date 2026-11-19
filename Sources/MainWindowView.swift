@@ -704,7 +704,10 @@ struct RecordingDetailView: View {
   @State private var editedTitle = ""
 
   // Transcription
+  @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @State private var transcript: TranscriptDocument?
+  @State private var transcriptLoaded = false
+  @State private var hasSavedTokens = false
 
   var body: some View {
     VStack(spacing: 0) {
@@ -764,20 +767,38 @@ struct RecordingDetailView: View {
       // file only produces an error to show underneath a message that already
       // says the same thing.
       if recording.hasAudio { setupPlayer() }
-      loadTranscript()
+    }
+    .task(id: transcription.finishCount(for: recording.url)) {
+      let count = transcription.finishCount(for: recording.url)
+      let loaded = await Self.loadTranscript(in: recording.url)
+      guard !Task.isCancelled, count == transcription.finishCount(for: recording.url) else {
+        return
+      }
+      let firstLoad = !transcriptLoaded
+      transcriptLoaded = true
+      transcript = loaded.document
+      hasSavedTokens = loaded.hasTokens
+      if firstLoad, let transcript, hasSavedTokens,
+        micAttribution
+          || transcript.segments.contains(where: { $0.speaker == TranscriptSegment.localSpeaker })
+      {
+        transcription.refreshAttribution(in: recording.url)
+      }
+    }
+    .onChange(of: micAttribution) { _, enabled in
+      // SettingsView schedules the library-wide restore on disable.
+      if enabled, transcriptLoaded, hasSavedTokens, transcript != nil {
+        transcription.refreshAttribution(in: recording.url)
+      }
     }
     // The cached metadata is the source for every write below, and `.id` is the
     // directory path, which a rename does not change - so renaming in the
     // sidebar left this view holding the old title, and the next speaker rename
     // wrote it back over the new one.
     .onChange(of: recording.title) { _, _ in loadMetadata() }
-    .onChange(of: transcription.finishCount(for: recording.url)) { _, _ in
-      // Decoding a transcript is main-thread JSON work proportional to call
-      // length, so only the recording that actually finished reloads - not
-      // every open detail view every time any job anywhere completes.
-      loadTranscript()
-    }
     .onDisappear {
+      transcriptLoaded = false
+      transcription.cancelLazyAnalysis(in: recording.url)
       teardownPlayer()
     }
     .focusable()
@@ -1297,6 +1318,7 @@ struct RecordingDetailView: View {
       // An existing transcript then wins over an error, because a failed
       // re-transcribe must not cost the user the transcript they already had.
       // The row's indicator still shows the failure.
+      // Leave the pane empty until the first disk read settles so the Transcribe button cannot flash.
       if transcriptionStatus.isActive {
         VStack(spacing: 12) {
           // Determinate wherever the stage can actually report itself. Mixing
@@ -1320,7 +1342,14 @@ struct RecordingDetailView: View {
             .disabled(transcriptionStatus == .cancelling)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if !transcriptLoaded {
+        Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
       } else if let transcript, !transcript.segments.isEmpty {
+        if micAttribution, !hasSavedTokens {
+          Text("This transcript has no saved speaker tokens for local voice labelling.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         transcriptView(transcript)
       } else if case .error(let msg) = transcriptionStatus {
         VStack(spacing: 12) {
@@ -1453,8 +1482,14 @@ struct RecordingDetailView: View {
 
   // MARK: - Transcription Lifecycle
 
-  private func loadTranscript() {
-    transcript = TranscriptDocument.load(for: recording.url)
+  @concurrent
+  private static func loadTranscript(in directory: URL) async -> (
+    document: TranscriptDocument?, hasTokens: Bool
+  ) {
+    (
+      TranscriptDocument.load(for: directory),
+      FileManager.default.fileExists(atPath: TranscriptTokens.url(for: directory).path)
+    )
   }
 
   /// Covers the first transcription, Retry, and Transcribe Again - they were
@@ -1561,7 +1596,7 @@ private struct TranscriptSegmentView: View {
     .blue, .green, .orange, .purple, .pink, .teal,
   ]
 
-  private var isLocalUser: Bool { segment.speaker == -1 }
+  private var isLocalUser: Bool { segment.speaker == TranscriptSegment.localSpeaker }
 
   private var speakerColor: Color {
     if isLocalUser { return .accentColor }

@@ -6,6 +6,12 @@ import Testing
 
 @testable import Blackbox
 
+extension TranscriptDocument {
+  func save(for directory: URL) throws {
+    try Self.save(encoded(for: directory), for: directory)
+  }
+}
+
 extension Duration {
   fileprivate var timeInterval: TimeInterval {
     let seconds = Double(components.seconds)
@@ -15,6 +21,8 @@ extension Duration {
 }
 
 enum TestFixtures {
+  nonisolated static let thresholds = MicActivity.Thresholds()
+
   static func recordingDirectory(named name: String) throws -> URL {
     let base = try #require(Bundle.module.resourceURL)
       .appendingPathComponent("Fixtures", isDirectory: true)
@@ -378,13 +386,9 @@ final class BlackboxSmokeClient {
       runID,
       "--test-save-directory",
       saveDirectory.path,
-      // NSArgumentDomain outranks every persisted domain, so this pins the
-      // setting for the launched process without touching what the developer
-      // has stored. Transcription is the one setting the app under test still
-      // reads from the real defaults - the rest are already replaced wholesale
-      // by the test-mode branch of `AudioMonitorDependencies.live.loadSettings`.
-      "-\(SettingsKeys.autoTranscribe)",
-      "NO",
+      // Argument-domain overrides keep the developer's transcription defaults out of smoke runs.
+      "-\(SettingsKeys.autoTranscribe)", "NO",
+      "-\(SettingsKeys.micAttribution)", "NO",
     ]
     try process.run()
     process.waitUntilExit()

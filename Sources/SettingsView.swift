@@ -26,6 +26,7 @@ struct SettingsView: View {
   /// a synchronous Keychain round-trip in it pays `SecItemCopyMatching` every
   /// time this view's body runs.
   @State private var sonioxAPIKey = ""
+  @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
   @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
   @AppStorage(SettingsKeys.transcriptHookPath) private var transcriptHookPath = ""
@@ -389,6 +390,7 @@ struct SettingsView: View {
           .truncationMode(.head)
         Spacer()
         Button("Choose…") { pickFolder() }
+          .disabled(transcription.isMovingRecordings)
       }
       if let stats = storageStats {
         Text(
@@ -471,6 +473,20 @@ struct SettingsView: View {
       }
       Text(
         "Vocabulary: a Soniox context JSON object at \((TranscriptionService.defaultContextURL.path as NSString).abbreviatingWithTildeInPath), such as {\"terms\": [\"Acme\"]}, is sent with each new transcription. A file that is not a JSON object, is over \(TranscriptionService.contextByteLimit) bytes, or that Soniox rejects is skipped."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      Toggle("Label my voice as You", isOn: $micAttribution)
+        .help(
+          "Existing speaker names stay with their original speaker IDs. Renaming You applies to all speech labelled You."
+        )
+        .onChange(of: micAttribution) {
+          // The recording detail refreshes its open transcript on enable.
+          transcription.attributionSettingChanged()
+        }
+      Text(
+        "Uses your microphone track to find your own speech. Experimental: works best with headphones."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -638,29 +654,13 @@ struct SettingsView: View {
       actionError = "Recording in progress. Existing recordings were left where they are."
       return
     }
-    Task.detached {
-      var failed: [String] = []
-      for directory in RecordingStore.directories(in: source) {
-        let target = destination.appendingPathComponent(directory.lastPathComponent)
-        do {
-          try FileManager.default.moveItem(at: directory, to: target)
-        } catch {
-          // Was `try?`. This is the most destructive bulk operation in the app,
-          // and a partial move split the library across two folders silently.
-          failed.append(directory.lastPathComponent)
-          Log.error(
-            Log.app, "settings",
-            "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
-        }
-      }
+    Task {
+      let failed = await transcription.moveRecordings(from: source, to: destination)
       if !failed.isEmpty {
-        let names = failed
-        await MainActor.run {
-          actionError =
-            names.count == 1
-            ? "Could not move \"\(names[0])\". It is still in the old folder."
-            : "Could not move \(names.count) recordings. They are still in the old folder."
-        }
+        actionError =
+          failed.count == 1
+          ? "Could not move \"\(failed[0])\". It is still in the old folder."
+          : "Could not move \(failed.count) recordings. They are still in the old folder."
       }
     }
   }
@@ -835,6 +835,8 @@ nonisolated enum SettingsKeys {
   static let notifyOnSaved = "notifyOnSaved"
   static let notifyOnError = "notifyOnError"
   static let excludedBundleIDs = "excludedBundleIDs"
+  static let micAttribution = "micAttribution"
+  static let micAttributionRestorePending = "micAttributionRestorePending"
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
   static let transcriptHookPath = "transcriptHookPath"

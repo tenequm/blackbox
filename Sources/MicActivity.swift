@@ -1,0 +1,422 @@
+import AVFoundation
+import os
+
+nonisolated enum MicActivity {
+  /// Bump when the analysis or its provenance changes so enabled recordings are re-analysed on open.
+  static let version = 2
+  private static let queue = DispatchQueue(label: "blackbox.mic-attribution", qos: .utility)
+
+  /// Section 4 of `docs/plans/2611-03-mic-gated-you-attribution.md` defines 20 ms frames,
+  /// 300 ms gap bridging and a 200 ms minimum active run.
+  struct Parameters: Codable, Sendable {
+    var sampleRate = 16_000
+    var frameSamples = 320
+    var noisePercentile = 0.10
+    var energyEpsilon = 1e-12
+    var minimumDBFS: Float = -120
+    var micMarginDB: Float = 25
+    var micFloorDBFS: Float = -50
+    var maximumGapFrames = 15
+    var minimumRunFrames = 10
+    var systemMarginDB: Float = 15
+    var paddingMs = 40.0
+    var minimumLocalFraction = 0.60
+
+    // Fold a run if either its word count or its unpadded duration in milliseconds is shorter.
+    var minimumRunWords: Int
+    var minimumRunDurationMs: Double
+
+    init(minimumRunWords: Int = 3, minimumRunDurationMs: Double = 1_000) {
+      self.minimumRunWords = minimumRunWords
+      self.minimumRunDurationMs = minimumRunDurationMs
+    }
+
+    init(from decoder: Decoder) throws {
+      let values = try decoder.container(keyedBy: CodingKeys.self)
+      minimumRunWords = try values.decodeIfPresent(Int.self, forKey: .minimumRunWords) ?? 0
+      minimumRunDurationMs =
+        try values.decodeIfPresent(Double.self, forKey: .minimumRunDurationMs) ?? 0
+      sampleRate = try values.decodeIfPresent(Int.self, forKey: .sampleRate) ?? sampleRate
+      frameSamples = try values.decodeIfPresent(Int.self, forKey: .frameSamples) ?? frameSamples
+      noisePercentile =
+        try values.decodeIfPresent(Double.self, forKey: .noisePercentile) ?? noisePercentile
+      energyEpsilon =
+        try values.decodeIfPresent(Double.self, forKey: .energyEpsilon) ?? energyEpsilon
+      minimumDBFS = try values.decodeIfPresent(Float.self, forKey: .minimumDBFS) ?? minimumDBFS
+      micMarginDB = try values.decodeIfPresent(Float.self, forKey: .micMarginDB) ?? micMarginDB
+      micFloorDBFS = try values.decodeIfPresent(Float.self, forKey: .micFloorDBFS) ?? micFloorDBFS
+      maximumGapFrames =
+        try values.decodeIfPresent(Int.self, forKey: .maximumGapFrames) ?? maximumGapFrames
+      minimumRunFrames =
+        try values.decodeIfPresent(Int.self, forKey: .minimumRunFrames) ?? minimumRunFrames
+      systemMarginDB =
+        try values.decodeIfPresent(Float.self, forKey: .systemMarginDB) ?? systemMarginDB
+      paddingMs = try values.decodeIfPresent(Double.self, forKey: .paddingMs) ?? paddingMs
+      minimumLocalFraction =
+        try values.decodeIfPresent(Double.self, forKey: .minimumLocalFraction)
+        ?? minimumLocalFraction
+    }
+  }
+
+  struct Thresholds: Codable, Sendable {
+    var micThresholdDBFS = Parameters().micFloorDBFS
+    var usedAdaptiveMicThreshold = false
+    var systemThresholdDBFS = Parameters().minimumDBFS + Parameters().systemMarginDB
+  }
+
+  private struct Frame {
+    let index: Int32
+    let db: Float
+  }
+
+  static func analyze(audio: URL, tokens: [TranscriptToken]) async throws -> SpeakerAttribution? {
+    let cancelled = OSAllocatedUnfairLock(initialState: false)
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        queue.async {
+          continuation.resume(
+            with: Result {
+              try analyzeOnQueue(audio: audio, tokens: tokens) {
+                if cancelled.withLock({ $0 }) { throw CancellationError() }
+              }
+            })
+        }
+      }
+    } onCancel: {
+      cancelled.withLock { $0 = true }
+    }
+  }
+
+  private static func analyzeOnQueue(
+    audio: URL, tokens: [TranscriptToken], checkCancelled: () throws -> Void
+  ) throws -> SpeakerAttribution? {
+    try checkCancelled()
+    let name = audio.deletingLastPathComponent().lastPathComponent
+    let asset = AVURLAsset(url: audio)
+    let tracks = try asset.loadAudioTracksBlocking(missingTracks: CocoaError(.fileReadCorruptFile))
+    guard tracks.count == 2 else {
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): unsupported track count"
+      )
+      return nil
+    }
+    guard let systemChannels = try channelCount(asset, track: tracks[0]),
+      let micChannels = try channelCount(asset, track: tracks[1])
+    else {
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): empty audio track")
+      return nil
+    }
+    guard systemChannels == 2, micChannels == 1 else {
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): unsupported audio channel layout"
+      )
+      return nil
+    }
+    let parameters = Parameters()
+    guard
+      let system = try energies(asset, track: tracks[0], channels: 2, parameters, checkCancelled),
+      let mic = try energies(asset, track: tracks[1], channels: 1, parameters, checkCancelled)
+    else {
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): tracks without complete audio frames"
+      )
+      return nil
+    }
+    try checkCancelled()
+    func noiseFloor(_ frames: [Frame]) -> Float {
+      let sorted = frames.map(\.db).sorted()
+      return sorted[Int(Double(sorted.count - 1) * parameters.noisePercentile)]
+    }
+    let adaptive = noiseFloor(mic) + parameters.micMarginDB
+    let thresholds = Thresholds(
+      micThresholdDBFS: max(adaptive, parameters.micFloorDBFS),
+      usedAdaptiveMicThreshold: adaptive > parameters.micFloorDBFS,
+      systemThresholdDBFS: noiseFloor(system) + parameters.systemMarginDB)
+    let frames = localFrames(mic: mic, system: system, parameters, thresholds)
+    let indices = localTokenIndices(tokens, frames: frames, parameters)
+    try checkCancelled()
+    return SpeakerAttribution(
+      version: version, parameters: parameters,
+      thresholds: thresholds, localTokenIndices: indices, appliedAt: Date())
+  }
+
+  /// A passthrough output exposes the source channel layout without decoding PCM.
+  private static func channelCount(_ asset: AVAsset, track: AVAssetTrack) throws -> UInt32? {
+    let reader = try AVAssetReader(asset: asset)
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    guard reader.canAdd(output) else { throw CocoaError(.fileReadCorruptFile) }
+    reader.add(output)
+    guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
+    defer { reader.cancelReading() }
+    return output.copyNextSampleBuffer()?.formatDescription?.audioStreamBasicDescription?
+      .mChannelsPerFrame
+  }
+
+  private static func energies(
+    _ asset: AVAsset, track: AVAssetTrack, channels: Int,
+    _ parameters: Parameters, _ checkCancelled: () throws -> Void
+  ) throws -> [Frame]? {
+    try checkCancelled()
+    let reader = try AVAssetReader(asset: asset)
+    // Preserve the native channel layout so a legacy mono system track cannot pass as stereo.
+    let output = AVAssetReaderTrackOutput(
+      track: track,
+      outputSettings: [
+        AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: parameters.sampleRate,
+        AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false,
+      ])
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { throw CocoaError(.fileReadCorruptFile) }
+    reader.add(output)
+    guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
+    defer { reader.cancelReading() }
+
+    var frames: [Frame] = []
+    var nextSample: Int64?
+    var sum = 0.0
+    var count = 0
+    while true {
+      try checkCancelled()
+      guard let sample = output.copyNextSampleBuffer() else { break }
+      guard let format = sample.formatDescription?.audioStreamBasicDescription,
+        Int(format.mChannelsPerFrame) == channels
+      else { return nil }
+      let time = sample.presentationTimeStamp.convertScale(
+        Int32(parameters.sampleRate), method: .roundHalfAwayFromZero)
+      guard time.isNumeric, time.value <= Int64(Int32.max) * Int64(parameters.frameSamples),
+        let block = sample.dataBuffer
+      else {
+        throw CocoaError(.fileReadCorruptFile)
+      }
+      let length = CMBlockBufferGetDataLength(block)
+      guard length == sample.numSamples * channels * MemoryLayout<Float>.size,
+        format.mSampleRate == Double(parameters.sampleRate)
+      else { throw CocoaError(.fileReadCorruptFile) }
+      var samples = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
+      guard !samples.isEmpty else { continue }
+      let result = samples.withUnsafeMutableBytes {
+        CMBlockBufferCopyDataBytes(
+          block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
+      }
+      guard result == noErr else { throw CocoaError(.fileReadCorruptFile) }
+
+      var position = time.value
+      if position != nextSample {
+        guard nextSample.map({ position >= $0 }) ?? true else {
+          throw CocoaError(.fileReadCorruptFile)
+        }
+        sum = 0
+        count = 0
+      }
+      for offset in stride(from: 0, to: samples.count, by: channels) {
+        defer { position += 1 }
+        guard position >= 0, count > 0 || position.isMultiple(of: Int64(parameters.frameSamples))
+        else {
+          continue
+        }
+        for channel in 0..<channels {
+          let value = Double(samples[offset + channel])
+          sum += value * value
+        }
+        count += 1
+        if count == parameters.frameSamples {
+          guard let index = Int32(exactly: position / Int64(count)) else {
+            throw CocoaError(.fileReadCorruptFile)
+          }
+          let db = Float(10 * log10(sum / Double(count * channels) + parameters.energyEpsilon))
+          if db.isFinite { frames.append(Frame(index: index, db: max(parameters.minimumDBFS, db))) }
+          count = 0
+          sum = 0
+        }
+      }
+      nextSample = position
+    }
+    guard reader.status == .completed else {
+      throw reader.error ?? CocoaError(.fileReadCorruptFile)
+    }
+    return frames.isEmpty ? nil : frames
+  }
+
+  private static func localFrames(
+    mic: [Frame], system: [Frame], _ parameters: Parameters, _ thresholds: Thresholds
+  ) -> [Int32] {
+    var active = mic.map { $0.db >= thresholds.micThresholdDBFS }
+    var previous: Int?
+    for i in mic.indices where active[i] {
+      if let previous, i - previous - 1 <= parameters.maximumGapFrames,
+        Int(mic[i].index) - Int(mic[previous].index) == i - previous
+      {
+        for gap in (previous + 1)..<i { active[gap] = true }
+      }
+      previous = i
+    }
+    var result: [Int32] = []
+    var systemIndex = 0
+    var start = 0
+    while start < mic.count {
+      guard active[start] else {
+        start += 1
+        continue
+      }
+      var end = start + 1
+      while end < mic.count, active[end], mic[end].index - mic[end - 1].index == 1 { end += 1 }
+      if end - start >= parameters.minimumRunFrames {
+        for frame in mic[start..<end] {
+          while systemIndex < system.count, system[systemIndex].index < frame.index {
+            systemIndex += 1
+          }
+          if systemIndex < system.count, system[systemIndex].index == frame.index,
+            system[systemIndex].db < thresholds.systemThresholdDBFS
+          {
+            result.append(frame.index)
+          }
+        }
+      }
+      start = end
+    }
+    return result
+  }
+
+  private struct Run {
+    var tokens: Range<Int>
+    var span: ClosedRange<Double>
+    var words = 1
+    let local: Bool
+
+    mutating func absorb(_ other: Run) {
+      let firstToken = min(tokens.lowerBound, other.tokens.lowerBound)
+      let tokensEnd = max(tokens.upperBound, other.tokens.upperBound)
+      tokens = firstToken..<tokensEnd
+      let startMs = min(span.lowerBound, other.span.lowerBound)
+      let endMs = max(span.upperBound, other.span.upperBound)
+      span = startMs...endMs
+      words += other.words
+    }
+
+    func isShort(_ parameters: Parameters) -> Bool {
+      words < parameters.minimumRunWords
+        || span.upperBound - span.lowerBound < parameters.minimumRunDurationMs
+    }
+  }
+
+  static func localTokenIndices(
+    _ tokens: [TranscriptToken], frames: [Int32], _ parameters: Parameters
+  ) -> [Int] {
+    var indices: [Int] = []
+    var runs: [Run] = []
+    func finishRuns() {
+      for run in foldedRuns(runs, parameters) where run.local {
+        indices.append(contentsOf: run.tokens)
+      }
+      runs.removeAll(keepingCapacity: true)
+    }
+
+    var start = 0
+    while start < tokens.count {
+      let speaker = tokens[start].speaker
+      let end = tokens[start...].firstIndex { $0.speaker != speaker } ?? tokens.endIndex
+      for range in wordRanges(in: tokens[start..<end]) {
+        var span: ClosedRange<Double>?
+        for token in tokens[range] {
+          guard let lower = token.startMs, let upper = token.endMs,
+            lower.isFinite, upper.isFinite, lower >= 0, upper >= lower
+          else { continue }
+          span = min(lower, span?.lowerBound ?? lower)...max(upper, span?.upperBound ?? upper)
+        }
+        guard let span else {
+          finishRuns()
+          continue
+        }
+        var run = Run(tokens: range, span: span, local: isLocal(span, frames: frames, parameters))
+        if runs.last?.local == run.local { run.absorb(runs.removeLast()) }
+        runs.append(run)
+      }
+      finishRuns()
+      start = end
+    }
+    return indices
+  }
+
+  private static func foldedRuns(_ runs: [Run], _ parameters: Parameters) -> [Run] {
+    var folded: [Run] = []
+    for var run in runs {
+      // Coalesce both agreeing neighbours before judging the next run.
+      if folded.last?.isShort(parameters) == true {
+        run.absorb(folded.removeLast())
+        if let left = folded.popLast() { run.absorb(left) }
+      }
+      folded.append(run)
+    }
+    if folded.count > 1, folded[folded.count - 1].isShort(parameters) {
+      let tail = folded.removeLast()
+      folded[folded.count - 1].absorb(tail)
+    }
+    return folded
+  }
+
+  private static func wordRanges(in tokens: ArraySlice<TranscriptToken>) -> [Range<Int>] {
+    var words: [Range<Int>] = []
+    var start = tokens.startIndex
+    var separator: Int?
+    var hasWord = false
+    for index in tokens.indices {
+      let text = tokens[index].text
+      let content = text.drop(while: \.isWhitespace)
+      if content.isEmpty {
+        if !text.isEmpty && separator == nil { separator = index }
+        continue
+      }
+      if !content.allSatisfy({ $0.isPunctuation || $0.isWhitespace }) {
+        if hasWord && (separator != nil || text.first?.isWhitespace == true) {
+          let boundary = separator ?? index
+          words.append(start..<boundary)
+          start = boundary
+        }
+        hasWord = true
+      }
+      separator = nil
+    }
+    if hasWord { words.append(start..<tokens.endIndex) }
+    return words
+  }
+
+  private static func isLocal(
+    _ span: ClosedRange<Double>, frames: [Int32], _ parameters: Parameters
+  ) -> Bool {
+    let frameMs = Double(parameters.frameSamples) * 1000 / Double(parameters.sampleRate)
+    // Integral of the local mask up to an arbitrary timestamp, including fractional edge frames.
+    func localMilliseconds(before time: Double) -> Double {
+      var low = 0
+      var high = frames.count
+      while low < high {
+        let mid = low + (high - low) / 2
+        if Double(frames[mid]) * frameMs < time { low = mid + 1 } else { high = mid }
+      }
+      guard low > 0 else { return 0 }
+      return Double(low - 1) * frameMs + min(frameMs, time - Double(frames[low - 1]) * frameMs)
+    }
+    let lower = span.lowerBound - parameters.paddingMs
+    let upper = span.upperBound + parameters.paddingMs
+    let local = localMilliseconds(before: upper) - localMilliseconds(before: lower)
+    return upper > lower && local >= (upper - lower) * parameters.minimumLocalFraction
+  }
+}
+
+extension MicActivity.Thresholds {
+  nonisolated init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    micThresholdDBFS =
+      try values.decodeIfPresent(Float.self, forKey: .micThresholdDBFS) ?? micThresholdDBFS
+    usedAdaptiveMicThreshold =
+      try values.decodeIfPresent(Bool.self, forKey: .usedAdaptiveMicThreshold)
+      ?? usedAdaptiveMicThreshold
+    systemThresholdDBFS =
+      try values.decodeIfPresent(Float.self, forKey: .systemThresholdDBFS) ?? systemThresholdDBFS
+  }
+}

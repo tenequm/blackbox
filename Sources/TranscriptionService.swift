@@ -156,7 +156,181 @@ nonisolated struct ExportedSegment: Codable, Sendable {
   var plainText: String { "[\(time)] \(speaker): \(text)" }
 }
 
+nonisolated struct TranscriptToken: Codable, Equatable, Sendable {
+  let text: String
+  let startMs: Double?
+  let endMs: Double?
+  let speaker: Int
+}
+
+nonisolated struct SpeakerAttribution: Codable, Sendable {
+  let version: Int
+  let parameters: MicActivity.Parameters
+  let thresholds: MicActivity.Thresholds
+  let localTokenIndices: [Int]
+  let appliedAt: Date
+
+  var isCurrent: Bool {
+    // Earlier version 2 records used per-token labels and had no fold thresholds.
+    version == MicActivity.version && parameters.minimumRunWords > 0
+      && parameters.minimumRunDurationMs > 0
+  }
+}
+
+extension SpeakerAttribution {
+  nonisolated init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    version = try values.decode(Int.self, forKey: .version)
+    localTokenIndices = try values.decode([Int].self, forKey: .localTokenIndices)
+    parameters =
+      try values.decodeIfPresent(MicActivity.Parameters.self, forKey: .parameters)
+      ?? .init(minimumRunWords: 0, minimumRunDurationMs: 0)
+    thresholds =
+      try values.decodeIfPresent(MicActivity.Thresholds.self, forKey: .thresholds) ?? .init()
+    appliedAt = try values.decodeIfPresent(Date.self, forKey: .appliedAt) ?? .distantPast
+  }
+}
+
+nonisolated struct TranscriptTokens: Codable, Sendable {
+  private enum CodingKeys: String, CodingKey { case tokens, createdAt, sourceAudio, attribution }
+  private(set) var hasAttributionRecord = false
+  let tokens: [TranscriptToken]
+  let createdAt: Date
+  var sourceAudio: String?
+  var attribution: SpeakerAttribution?
+
+  init(tokens: [TranscriptToken], createdAt: Date) {
+    self.tokens = tokens
+    self.createdAt = createdAt
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    tokens = try container.decode([TranscriptToken].self, forKey: .tokens)
+    createdAt = try container.decode(Date.self, forKey: .createdAt)
+    sourceAudio = try container.decodeIfPresent(String.self, forKey: .sourceAudio)
+    hasAttributionRecord = container.contains(.attribution)
+    attribution = try? container.decode(SpeakerAttribution.self, forKey: .attribution)
+  }
+
+  static let fileName = "tokens.json"
+  static func url(for directory: URL) -> URL { directory.appendingPathComponent(fileName) }
+
+  @concurrent
+  static func encodeForPaidSave(_ tokens: Self?, in directory: URL) async -> Data? {
+    guard let tokens else { return nil }
+    do {
+      return try JSONEncoder().encode(tokens)
+    } catch {
+      Log.warning(
+        Log.transcription, "attribution",
+        "could not encode timed tokens for \(directory.lastPathComponent): \(error.localizedDescription)"
+      )
+      return nil
+    }
+  }
+
+  static func commitPaidSave(_ data: Data?, in directory: URL) -> Bool {
+    do {
+      guard let data else {
+        try remove(for: directory)
+        return false
+      }
+      try write(data, for: directory)
+      return true
+    } catch {
+      Log.warning(
+        Log.transcription, "attribution",
+        "could not save timed tokens for \(directory.lastPathComponent): \(error.localizedDescription)"
+      )
+      return false
+    }
+  }
+
+  static func write(_ data: Data, for directory: URL) throws {
+    try data.write(to: url(for: directory), options: .atomic)
+  }
+
+  static func remove(for directory: URL) throws {
+    if unlink(url(for: directory).path) != 0, errno != ENOENT {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+  }
+
+  enum Ineligibility: String {
+    case empty = "no timed tokens"
+    case unknownSource = "unknown source audio"
+    case processedSource = "non-raw source audio"
+  }
+
+  var analysisIneligibility: Ineligibility? {
+    guard !tokens.isEmpty else { return .empty }
+    guard let sourceAudio else { return .unknownSource }
+    return sourceAudio == RecordingStore.audioName ? nil : .processedSource
+  }
+
+  private struct AttributionProbe: Decodable {
+    let present: Bool
+
+    init(from decoder: Decoder) throws {
+      present = try decoder.container(keyedBy: CodingKeys.self).contains(.attribution)
+    }
+  }
+
+  static func load(for directory: URL, onlyAttributed: Bool = false) -> Self? {
+    guard let data = try? Data(contentsOf: url(for: directory), options: .mappedIfSafe) else {
+      return nil
+    }
+    let decoder = JSONDecoder()
+    if onlyAttributed, (try? decoder.decode(AttributionProbe.self, from: data))?.present != true {
+      return nil
+    }
+    return try? decoder.decode(Self.self, from: data)
+  }
+
+  // Both projections keep the first row's identity, including when leading tokens are whitespace.
+  func belongs(to document: TranscriptDocument) -> Bool {
+    document.segments.first?.id == segmentID(at: 0)
+  }
+
+  private func segmentID(at index: Int) -> UUID {
+    let identity = (
+      createdAt.timeIntervalSinceReferenceDate.bitPattern.bigEndian,
+      UInt64(index).bigEndian
+    )
+    return withUnsafeBytes(of: identity) { UUID(uuid: $0.loadUnaligned(as: uuid_t.self)) }
+  }
+
+  func project() -> [TranscriptSegment] {
+    let local = Set(attribution?.localTokenIndices ?? [])
+    var projected: [TranscriptSegment] = []
+    var start = 0
+    while start < tokens.count {
+      let speaker = local.contains(start) ? TranscriptSegment.localSpeaker : tokens[start].speaker
+      var end = start + 1
+      while end < tokens.count,
+        (local.contains(end) ? TranscriptSegment.localSpeaker : tokens[end].speaker) == speaker
+      {
+        end += 1
+      }
+      let text = tokens[start..<end].map(\.text).joined().trimmingCharacters(in: .whitespaces)
+      if !text.isEmpty {
+        // The first provider token identifies this row across local re-projections.
+        let id = segmentID(at: projected.isEmpty ? 0 : start)
+        projected.append(
+          TranscriptSegment(
+            speaker: speaker, time: (tokens[start].startMs ?? 0) / 1000, text: text, id: id))
+      }
+      start = end
+    }
+    return projected
+  }
+}
+
 nonisolated struct TranscriptDocument: Codable, Sendable {
+  private enum CodingKeys: String, CodingKey { case segments, language, createdAt, provider, model }
+  // Only a fresh provider response carries tokens. Reading a transcript never opens tokens.json.
+  var fetchedTokens: TranscriptTokens?
   var segments: [TranscriptSegment]
   var language: String?
   var createdAt: Date
@@ -175,6 +349,12 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     self.createdAt = createdAt
     self.provider = provider
     self.model = model
+  }
+
+  init(tokens originalTokens: [TranscriptToken], language: String? = nil, createdAt: Date) {
+    let tokens = TranscriptTokens(tokens: originalTokens, createdAt: createdAt)
+    self.init(segments: tokens.project(), language: language, createdAt: createdAt)
+    fetchedTokens = tokens
   }
 
   /// Hand-written for the same reason as `RecordingMetadata`'s. Here the cost of
@@ -206,21 +386,33 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     return try? decoder.decode(TranscriptDocument.self, from: data)
   }
 
-  func save(for recordingURL: URL) throws {
-    let url = Self.sidecarURL(for: recordingURL)
+  struct Encoded: Sendable {
+    let json: Data
+    let text: Data
+  }
+
+  func encoded(for directory: URL) throws -> Encoded {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    let data = try encoder.encode(self)
-    try data.write(to: url, options: .atomic)
-    savePlainText(for: recordingURL, metadata: RecordingMetadata.load(in: recordingURL))
+    return try Encoded(
+      json: encoder.encode(self),
+      text: Data(plainText(for: directory, metadata: RecordingMetadata.load(in: directory)).utf8))
+  }
+
+  static func save(_ encoded: Encoded, for directory: URL) throws {
+    try encoded.json.write(to: sidecarURL(for: directory), options: .atomic)
+    writePlainText(encoded.text, for: directory)
   }
 
   func savePlainText(for directory: URL, metadata: RecordingMetadata?) {
-    let url = Self.plainTextURL(for: directory)
+    Self.writePlainText(Data(plainText(for: directory, metadata: metadata).utf8), for: directory)
+  }
+
+  private static func writePlainText(_ text: Data, for directory: URL) {
+    let url = plainTextURL(for: directory)
     do {
-      try plainText(for: directory, metadata: metadata).write(
-        to: url, atomically: true, encoding: .utf8)
+      try text.write(to: url, options: .atomic)
     } catch {
       // A directory at the companion path can cause this failure. Never remove its contents.
       _ = Darwin.remove(url.path)
@@ -251,28 +443,24 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   }
 }
 
-nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
+nonisolated struct TranscriptSegment: Codable, Identifiable, Equatable, Sendable {
   var id: UUID
   var speaker: Int
   var time: Double
   var text: String
 
-  static func defaultSpeakerName(for id: Int) -> String {
-    // `+ 1` on `Int.max` traps, and this value comes off disk.
-    id == -1 ? "You" : "Speaker \(id &+ 1)"
-  }
+  static let localSpeaker = -1
 
   func speakerName(in metadata: RecordingMetadata?) -> String {
-    if let name = metadata?.speakers[String(speaker)], !name.isEmpty { return name }
-    return Self.defaultSpeakerName(for: speaker)
+    Self.speakerName(for: speaker, names: metadata?.speakers ?? [:])
   }
 
   func exported(using metadata: RecordingMetadata?) -> ExportedSegment {
     ExportedSegment(speaker: speakerName(in: metadata), time: formatHMS(time), text: text)
   }
 
-  init(speaker: Int, time: Double, text: String) {
-    self.id = UUID()
+  init(speaker: Int, time: Double, text: String, id: UUID = UUID()) {
+    self.id = id
     self.speaker = Self.clampSpeaker(speaker)
     self.time = Self.clampTime(time)
     self.text = text
@@ -295,6 +483,14 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
     self.speaker = Self.clampSpeaker((try? container.decode(Int.self, forKey: .speaker)) ?? 0)
     self.time = Self.clampTime((try? container.decode(Double.self, forKey: .time)) ?? 0)
     self.text = (try? container.decode(String.self, forKey: .text)) ?? ""
+  }
+
+  static func speakerName(for speakerID: Int, names: [String: String]) -> String {
+    if let name = names[String(speakerID)], !name.isEmpty {
+      return name
+    }
+    // `+ 1` on `Int.max` traps, and this value comes off disk.
+    return speakerID == localSpeaker ? "You" : "Speaker \(speakerID &+ 1)"
   }
 
   /// Clamped at the parse boundary rather than in each formatter. `abs(Int.min)`
@@ -961,53 +1157,14 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   }
 
   private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
-    var segments: [TranscriptSegment] = []
-    var currentSpeaker: Int?
-    var currentText = ""
-    var currentTime: Double = 0
-
-    for token in tokens {
-      // Skip translation tokens
-      if token["translation_status"] as? String == "translation" { continue }
-
-      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
-      let speaker: Int
-      if let s = token["speaker"] as? Int {
-        speaker = s
-      } else if let s = token["speaker"] as? String, let i = Int(s) {
-        speaker = i
-      } else {
-        speaker = 0
-      }
-      let text = token["text"] as? String ?? ""
-
-      if speaker != currentSpeaker {
-        if let s = currentSpeaker,
-          !currentText.trimmingCharacters(in: .whitespaces)
-            .isEmpty
-        {
-          segments.append(
-            TranscriptSegment(
-              speaker: s,
-              time: currentTime,
-              text: currentText.trimmingCharacters(in: .whitespaces)))
-        }
-        currentSpeaker = speaker
-        currentText = ""
-        currentTime = (token["start_ms"] as? Double ?? 0) / 1000.0
-      }
-      currentText += text
-    }
-
-    // Last segment
-    if let s = currentSpeaker,
-      !currentText.trimmingCharacters(in: .whitespaces).isEmpty
-    {
-      segments.append(
-        TranscriptSegment(
-          speaker: s,
-          time: currentTime,
-          text: currentText.trimmingCharacters(in: .whitespaces)))
+    let originals = tokens.compactMap { token -> TranscriptToken? in
+      guard token["translation_status"] as? String != "translation" else { return nil }
+      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int.
+      let speaker = token["speaker"] as? Int ?? (token["speaker"] as? String).flatMap(Int.init) ?? 0
+      return TranscriptToken(
+        text: token["text"] as? String ?? "",
+        startMs: Self.milliseconds(token["start_ms"]), endMs: Self.milliseconds(token["end_ms"]),
+        speaker: speaker)
     }
 
     let language =
@@ -1016,8 +1173,14 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
           && $0["translation_status"] as? String != "translation"
       })?["language"] as? String
 
-    return TranscriptDocument(
-      segments: segments, language: language, createdAt: Date())
+    return TranscriptDocument(tokens: originals, language: language, createdAt: Date())
+  }
+
+  private static func milliseconds(_ value: Any?) -> Double? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+      return nil
+    }
+    return number.doubleValue.isFinite ? number.doubleValue : nil
   }
 
   // MARK: - Cleanup
