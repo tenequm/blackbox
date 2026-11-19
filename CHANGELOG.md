@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.9.7](https://github.com/tenequm/blackbox/compare/v0.9.6...v0.9.7) - 2026-11-19
+
+Recordings now keep the titles of the calling app's visible windows in
+`metadata.json`, sampled every 30 seconds during automatic recordings.
+For a browser this includes every visible window's title, not only the
+meeting tab. Titles stay on your Mac, never reach logs or Soniox, and
+are deleted with the recording.
+
+### <!-- 1 -->New Features
+- **transcription:** after-transcript hook command and Soniox context file ([#44](https://github.com/tenequm/blackbox/pull/44)) ([1e188e9](https://github.com/tenequm/blackbox/commit/1e188e9f2db3b520c4e3c38696019195cceabb0a))
+  Blackbox can now run a command of your choice after each transcript is
+  saved, for example to file the transcript into your notes automatically.
+  It can also send your own list of names and product terms to Soniox, so
+  they come out spelled right.
+- **recordings:** window titles in metadata and transcript.txt ([#45](https://github.com/tenequm/blackbox/pull/45)) ([5082b28](https://github.com/tenequm/blackbox/commit/5082b282e8698b38b53fb6177827bc6edc64c429))
+  Blackbox now saves a plain-text copy of every transcript next to the
+  original, with your speaker names. During a call it also notes the
+  calling app's window titles, such as the meeting name, so tools can tell
+  which call a recording was.
+- **transcription:** label your own speech as You from the mic track ([#47](https://github.com/tenequm/blackbox/pull/47)) ([b9aa4d0](https://github.com/tenequm/blackbox/commit/b9aa4d0a7166fa10667888450a587d7a4c28e308))
+  Blackbox can now label your own speech as "You" in transcripts, using
+  the activity on your microphone track. Turn it on in Settings; turning
+  it off restores the original speaker labels.
+
+### <!-- 5 -->Documentation
+- **plans:** plan mic-gated "You" speaker attribution ([38bfe03](https://github.com/tenequm/blackbox/commit/38bfe0398934bee4bbd792f45284a22dd77ea290))
+
+**Full Changelog**: https://github.com/tenequm/blackbox/compare/v0.9.6...v0.9.7
+
 ## [0.9.6](https://github.com/tenequm/blackbox/compare/v0.9.5...v0.9.6) - 2026-11-03
 
 ### <!-- 1 -->New Features
