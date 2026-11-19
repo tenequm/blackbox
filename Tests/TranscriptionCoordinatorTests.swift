@@ -866,6 +866,59 @@ struct TranscriptionCoordinatorTests {
     #expect(loaded.title == "Standup")
     #expect(loaded.appName == "Zoom")
     #expect(loaded.speakers.isEmpty)
+    #expect(loaded.windowTitles == nil)
+  }
+
+  @Test("saving a transcript writes and replaces the readable companion")
+  func savesPlainTextTranscript() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    try RecordingMetadata(
+      title: "Standup", createdAt: Date(timeIntervalSince1970: 0), appName: "Meet", speakers: [:]
+    )
+    .save(in: directory)
+    var document = TranscriptDocument(
+      segments: [
+        TranscriptSegment(speaker: -1, time: 0.92, text: "Hello"),
+        TranscriptSegment(speaker: 0, time: 3605.9, text: "Hi\r\nthere"),
+      ], language: "en", createdAt: Date(), provider: "Soniox", model: "stt-async-v4")
+    try document.save(for: directory)
+
+    let url = directory.appendingPathComponent("transcript.txt")
+    let text = try String(contentsOf: url, encoding: .utf8)
+    #expect(
+      text == """
+        # Recording: call-1
+        # App: Meet
+        # Start (UTC): 1970-01-01T00:00:00Z
+        # Soniox model: stt-async-v4
+        # Language: en
+
+        [0:00] You: Hello
+        [60:05] Speaker 1: Hi there
+
+        """)
+
+    document.segments = [TranscriptSegment(speaker: 2, time: 66.3, text: "Replacement")]
+    try document.save(for: directory)
+    #expect(
+      try String(contentsOf: url, encoding: .utf8) == text.components(separatedBy: "[0:00]")[0]
+        + "[1:06] Speaker 3: Replacement\n")
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.text) == ["Replacement"])
+  }
+
+  @Test("a failed JSON write rolls back the plain text companion", arguments: [true, false])
+  func rollsBackPlainText(hadText: Bool) throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let textURL = directory.appendingPathComponent("transcript.txt")
+    let original = Data("previous transcript".utf8)
+    if hadText { try original.write(to: textURL) }
+    try FileManager.default.createDirectory(
+      at: TranscriptDocument.sidecarURL(for: directory), withIntermediateDirectories: false)
+    let document = TranscriptDocument(segments: [], createdAt: Date())
+    #expect(throws: (any Error).self) { try document.save(for: directory) }
+    #expect((try? Data(contentsOf: textURL)) == (hadText ? original : nil))
   }
 
   @Test("a transcript written before a field existed still decodes")

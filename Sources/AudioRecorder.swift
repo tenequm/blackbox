@@ -38,6 +38,7 @@ actor AudioRecorder {
   // SCStream state
   private var displayStream: SCStream?
   private var streamProxy: SCStreamProxy?
+  private var windowTitleTask: Task<Void, Never>?
 
   // AVAudioEngine
   private var audioEngine: AVAudioEngine?
@@ -127,6 +128,7 @@ actor AudioRecorder {
   }
 
   deinit {
+    windowTitleTask?.cancel()
     if let configChangeObserver {
       NotificationCenter.default.removeObserver(configChangeObserver)
     }
@@ -176,7 +178,9 @@ actor AudioRecorder {
       // 1. Discover a display to drive the system-audio SCStream. With the
       // display asleep (a restart after -3815 lands here) SCK reports none;
       // wait for it to come back rather than failing the whole recording.
-      let display = try await waitForDisplay()
+      let callerID = isManualRecording ? nil : bundleID
+      let (display, titles) = try await waitForDisplay(callerID: callerID)
+      try checkAlive()
 
       // Display-wide audio capture (no window/app exclusions). SCStream's display
       // mix is driven by the OS-composited output path, not a specific hardware
@@ -213,7 +217,8 @@ actor AudioRecorder {
       // Assign before pipeline.start() so a partial-init throw is reachable
       // from cleanupPartialStart's take-and-nil sweep.
       self.pipeline = pipeline
-      try pipeline.start()
+      let startedAt = ProcessInfo.processInfo.systemUptime
+      let directory = try pipeline.start(windowTitles: titles)
 
       await testStartCheckpoint?(.afterPipeline)
       try checkAlive()
@@ -253,6 +258,11 @@ actor AudioRecorder {
       try checkAlive()
 
       startDiskSpaceMonitor()
+      if let callerID {
+        windowTitleTask = Task { @MainActor in
+          await Self.sampleWindowTitles(for: callerID, in: directory, startedAt: startedAt)
+        }
+      }
       if micEnabled { startDriftMonitor() }
 
       // Start mic capture independently - failure does not stop system audio.
@@ -308,6 +318,7 @@ actor AudioRecorder {
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
+    windowTitleTask?.cancel()
     Log.info(Log.recorder, "recorder", "stop() for \(appName) (phase=\(phase))")
 
     switch phase {
@@ -426,7 +437,7 @@ actor AudioRecorder {
   static let displayWaitTimeout: Duration = .seconds(300)
   static let displayPollInterval: Duration = .seconds(2)
 
-  private func waitForDisplay() async throws -> SCDisplay {
+  private func waitForDisplay(callerID: String?) async throws -> (SCDisplay, [String]) {
     let deadline = ContinuousClock.now + Self.displayWaitTimeout
     var announced = false
     while true {
@@ -435,7 +446,7 @@ actor AudioRecorder {
       try checkAlive()
       if let display = content.displays.first {
         if announced { Log.info(Log.recorder, "recorder", "display is back for \(appName)") }
-        return display
+        return (display, callerID.map { Self.windowTitles(in: content, for: $0) } ?? [])
       }
       if !announced {
         announced = true
@@ -446,6 +457,40 @@ actor AudioRecorder {
       guard ContinuousClock.now < deadline else { throw RecorderError.noDisplay }
       try await Task.sleep(for: Self.displayPollInterval)
       try checkAlive()
+    }
+  }
+
+  private nonisolated static func windowTitles(in content: SCShareableContent, for callerID: String)
+    -> [String]
+  {
+    content.windows.compactMap { window in
+      guard window.owningApplication?.bundleIdentifier == callerID else { return nil }
+      return window.title
+    }
+  }
+
+  // Serialize metadata edits with recording and speaker renames in the UI.
+  @MainActor
+  private static func sampleWindowTitles(
+    for callerID: String, in directory: URL, startedAt: TimeInterval
+  )
+    async
+  {
+    while !Task.isCancelled {
+      do {
+        try await Task.sleep(for: .seconds(30))
+        let content = try await SCShareableContent.excludingDesktopWindows(
+          false, onScreenWindowsOnly: false)
+        try Task.checkCancellation()
+        let titles = windowTitles(in: content, for: callerID)
+        guard !titles.isEmpty, var metadata = RecordingMetadata.load(in: directory),
+          metadata.recordWindowTitles(titles, at: ProcessInfo.processInfo.systemUptime - startedAt)
+        else { continue }
+        try metadata.save(in: directory)
+      } catch {
+        if Task.isCancelled { return }
+        Log.error(Log.recorder, "recorder", "could not sample window titles")
+      }
     }
   }
 

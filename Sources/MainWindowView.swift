@@ -1244,7 +1244,8 @@ struct RecordingDetailView: View {
   /// failing silently was worth surfacing.
   private func writeMetadata(_ mutate: (inout RecordingMetadata) -> Void) {
     var meta =
-      metadata
+      RecordingMetadata.load(in: recording.url)
+      ?? metadata
       ?? RecordingMetadata(
         title: recording.title,
         createdAt: recording.date,
@@ -1273,8 +1274,7 @@ struct RecordingDetailView: View {
     if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
       return name
     }
-    // `+ 1` on `Int.max` traps, and this value comes off disk.
-    return speakerID == -1 ? "You" : "Speaker \(speakerID &+ 1)"
+    return TranscriptSegment.defaultSpeakerName(for: speakerID)
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
