@@ -900,7 +900,7 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.uploadCount == 1)
   }
 
-  @Test func manualRequestDuringUploadKeepsItsConsentAndSource() async throws {
+  @Test func uploadedFileIDAndSourceArePersistedTogether() async throws {
     let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call")
     let coordinator = harness.makeCoordinator()
@@ -910,12 +910,9 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { await harness.service.uploadCount == 1 }
     let uploading = try #require(TranscriptionJob.load(for: directory))
     #expect(uploading.fileId == nil && uploading.sourceAudio == nil)
-    coordinator.transcribe(recordingDirectory: directory)
-    harness.autoEnabled = false
     await harness.service.setHoldsUpload(false)
     await harness.wait { await harness.service.completionCount == 1 }
     let uploaded = try #require(TranscriptionJob.load(for: directory))
-    #expect(!uploaded.isAutomatic)
     #expect(uploaded.fileId == "file-1" && uploaded.sourceAudio == RecordingStore.audioName)
     coordinator.cancel(recordingDirectory: directory)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }

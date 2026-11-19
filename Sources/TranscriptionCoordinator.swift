@@ -684,9 +684,6 @@ final class TranscriptionCoordinator {
             }
           }
           job.sourceAudio = audioURL.lastPathComponent
-          if TranscriptionJob.load(for: recordingDirectory)?.isAutomatic == false {
-            job.isAutomatic = false
-          }
           job.save(for: recordingDirectory)
         }
         // Checked again here rather than only at the top of the pass: `upload`
