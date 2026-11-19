@@ -140,6 +140,10 @@ final class TranscriptionHarness {
     return nil
   }
   var saveAttribution: (TranscriptDocument, URL) throws -> Void = { try $0.save(for: $1) }
+  /// Recordings the coordinator handed to the after-transcript hook, and whether
+  /// each one's transcript was already on disk at that moment.
+  var hookedDirectories: [URL] = []
+  var transcriptOnDiskAtHook: [Bool] = []
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -173,7 +177,11 @@ final class TranscriptionHarness {
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
         uploadConcurrency: uploadConcurrency,
         isMicAttributionEnabled: { [weak self] in self?.micEnabled == true },
-        analyzeMic: analyzeMic, saveAttribution: saveAttribution
+        analyzeMic: analyzeMic, saveAttribution: saveAttribution,
+        onTranscriptSaved: { [weak self] directory in
+          self?.hookedDirectories.append(directory)
+          self?.transcriptOnDiskAtHook.append(TranscriptDocument.load(for: directory) != nil)
+        }
       ))
     return coordinator
   }
@@ -222,6 +230,75 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.deletedTranscriptionIds == ["transcription-1"])
     // The remote job is tagged with the recording it belongs to.
     #expect(await harness.service.references == ["call-1"])
+  }
+
+  @Test("the after-transcript hook fires once, only after the transcript is on disk")
+  func hookFiresAfterSave() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(harness.hookedDirectories == [directory])
+    #expect(harness.transcriptOnDiskAtHook == [true])
+  }
+
+  @Test("a failed transcription never fires the hook")
+  func hookSkipsFailures() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setUploadError(
+      TranscriptionError.balanceExhausted("prepaid balance is zero"))
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait {
+      if case .error = coordinator.status(for: directory) { return true }
+      return false
+    }
+
+    #expect(harness.hookedDirectories.isEmpty)
+  }
+
+  @Test("the hook command gets the recording through its environment and logs to hook.log")
+  func hookRunsCommandWithEnvironment() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let script = harness.root.appendingPathComponent("hook.sh")
+    let id = TranscriptHook.recordingIDVariable
+    let dir = TranscriptHook.recordingDirectoryVariable
+    try "#!/bin/sh\necho \"id=$\(id) dir=$\(dir)\"\n"
+      .write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    TranscriptHook.run(for: directory, path: script.path)
+
+    let log = directory.appendingPathComponent(TranscriptHook.logFileName)
+    await harness.wait {
+      ((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains("dir=")
+    }
+    let output = try String(contentsOf: log, encoding: .utf8)
+    #expect(output.contains("id=call-1 dir=\(directory.path)"))
+  }
+
+  @Test("a blank, missing, non-executable or directory hook path runs nothing")
+  func hookIgnoresBadPaths() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let plain = harness.root.appendingPathComponent("plain.sh")
+    try "#!/bin/sh\necho ran\n".write(to: plain, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plain.path)
+    for path in [
+      "  ", harness.root.appendingPathComponent("missing").path, plain.path, harness.root.path,
+    ] {
+      #expect(TranscriptHook.executableURL(for: path) == nil, "\(path)")
+      TranscriptHook.run(for: directory, path: path)
+    }
+    #expect(
+      !FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(TranscriptHook.logFileName).path))
   }
 
   @Test("a 409 while fetching the transcript is retried, not treated as failure")
@@ -876,6 +953,89 @@ struct TranscriptionCoordinatorTests {
     #expect(loaded.title == "Standup")
     #expect(loaded.appName == "Zoom")
     #expect(loaded.speakers.isEmpty)
+    #expect(loaded.windowTitles == nil)
+  }
+
+  @Test("a malformed window title loses only the title history")
+  func metadataSurvivesMalformedWindowTitle() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"title":"Standup","speakers":{"0":"Alex"},"windowTitles":[{"at":1,"title":42}]}"#
+    try Data(json.utf8).write(to: directory.appendingPathComponent(RecordingMetadata.fileName))
+    let metadata = try #require(RecordingMetadata.load(in: directory))
+    #expect(metadata.title == "Standup")
+    #expect(metadata.speakers == ["0": "Alex"])
+    #expect(metadata.windowTitles == nil)
+  }
+
+  @Test("saving a transcript writes and replaces the readable companion")
+  func savesPlainTextTranscript() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    try RecordingMetadata(
+      title: "Standup", createdAt: Date(timeIntervalSince1970: 0), appName: "Meet",
+      speakers: ["0": "Alex"]
+    )
+    .save(in: directory)
+    var document = TranscriptDocument(
+      segments: [
+        TranscriptSegment(speaker: -1, time: 0.92, text: "Hello"),
+        TranscriptSegment(speaker: 0, time: 3605.9, text: "Hi\r\nthere"),
+      ], language: "en", createdAt: Date(), provider: "Test Provider", model: "test-model")
+    try document.save(for: directory)
+
+    let url = TranscriptDocument.plainTextURL(for: directory)
+    let text = try String(contentsOf: url, encoding: .utf8)
+    #expect(
+      text == """
+        # Recording: call-1
+        # App: Meet
+        # Start (UTC): 1970-01-01T00:00:00Z
+        # Test Provider model: test-model
+        # Language: en
+
+        [0:00] You: Hello
+        [1:00:05] Alex: Hi there
+
+        """)
+
+    document.segments = [TranscriptSegment(speaker: 2, time: 66.3, text: "Replacement")]
+    try document.save(for: directory)
+    #expect(
+      try String(contentsOf: url, encoding: .utf8) == text.components(separatedBy: "[0:00]")[0]
+        + "[1:06] Speaker 3: Replacement\n")
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.text) == ["Replacement"])
+  }
+
+  @Test("a JSON write failure preserves the text companion and reports the JSON path")
+  func jsonWriteFailurePreservesText() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let textURL = TranscriptDocument.plainTextURL(for: directory)
+    let original = Data("previous transcript".utf8)
+    try original.write(to: textURL)
+    let jsonURL = TranscriptDocument.sidecarURL(for: directory)
+    try FileManager.default.createDirectory(at: jsonURL, withIntermediateDirectories: false)
+    let document = TranscriptDocument(segments: [], createdAt: Date())
+    #expect {
+      try document.save(for: directory)
+    } throws: { error in
+      (error as? CocoaError)?.filePath == jsonURL.path
+    }
+    #expect(try Data(contentsOf: textURL) == original)
+  }
+
+  @Test("a text write failure keeps the updated JSON and removes the failed companion")
+  func textWriteFailurePreservesJSON() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let textURL = TranscriptDocument.plainTextURL(for: directory)
+    try FileManager.default.createDirectory(at: textURL, withIntermediateDirectories: false)
+    let document = TranscriptDocument(
+      segments: [.init(speaker: 1, time: 2, text: "Saved")], createdAt: Date())
+    try document.save(for: directory)
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.text) == ["Saved"])
+    #expect(!FileManager.default.fileExists(atPath: textURL.path))
   }
 
   @Test("a transcript written before a field existed still decodes")

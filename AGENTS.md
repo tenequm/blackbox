@@ -10,11 +10,11 @@ Sources/
   BlackboxApp.swift                        - @main App, MenuBarExtra, Window scenes, AppDelegate
   AudioMonitor.swift                       - @Observable: call detection (polling), auto/manual recording lifecycle
   AudioMonitorSupport.swift                - RecorderSession protocol, AudioMonitorDependencies (DI), factory types
-  AudioRecorder.swift                      - SCStream (system audio) + AVAudioEngine (mic), dual-track capture
+  AudioRecorder.swift                      - SCStream (system audio) + AVAudioEngine (mic), dual-track capture, samples calling-app window titles into metadata.json
   RecordingPipeline.swift                  - AVAssetWriter management, gap filling, tail padding, audio level metering
   AECProcessor.swift                       - DTLN-aec CoreML post-processing: echo cancellation on mic track
-  TranscriptionService.swift               - Soniox stage-level client (upload/create/poll/fetch), TranscriptDocument sidecar
-  TranscriptionCoordinator.swift           - App-level transcription: auto-trigger, one independent job per recording, resumable job sidecar
+  TranscriptionService.swift               - Soniox stage-level client (upload/create/poll/fetch), transcript.json sidecar and transcript.txt companion
+  TranscriptionCoordinator.swift           - App-level transcription: auto-trigger, one independent job per recording, resumable job sidecar, after-transcript hook
   BlackboxTestMode.swift                   - Test mode flags (--ui-test-mode), IPC types for smoke tests
   BlackboxTestController.swift             - File-based IPC controller for smoke test automation
   MainWindowView.swift                     - Main window: Recordings tab (NavigationSplitView list + detail) and Settings tab
@@ -36,7 +36,7 @@ Tests/
   AudioMonitorIntegrationTests.swift       - AudioMonitor integration tests with fake dependencies
   RecordingPipelineIntegrationTests.swift  - RecordingPipeline file output, gap fill, tail padding tests
   AudioRecorderRaceTests.swift             - Start/stop race tests (one reaches live SCK, gated on the permission being granted)
-  TranscriptionCoordinatorTests.swift      - Trigger decision, queueing, retry/failure, cancel, launch resume (fake Soniox client)
+  TranscriptionCoordinatorTests.swift      - Trigger decision, queueing, retry/failure, cancel, launch resume, after-transcript hook (fake Soniox client)
   SonioxContractTests.swift                - Real client against a loopback HTTP stub speaking Soniox's documented wire format
   HardwareSmokeTests.swift                 - End-to-end smoke test via real app bundle (hardware-gated)
   TestSupport.swift                        - TestClock, FakeHUD, MonitorHarness, BlackboxSmokeClient
@@ -225,6 +225,7 @@ With `defaultIsolation(MainActor.self)`:
 - All types are `@MainActor` by default (BlackboxApp, AudioMonitor, SettingsView)
 - AudioMonitor is purely MainActor-isolated (polling-only, no C callbacks)
 - AudioRecorder is an `actor` with custom `DispatchSerialQueue` executor (`audioQueue`). All actor-isolated state accessed on `audioQueue` - same runtime behavior as the previous `nonisolated(unsafe)` approach, but with compile-time safety
+- AudioRecorder owns the MainActor window-title sampler Task, which samples every 30 seconds and is cancelled in `stop()` and `deinit`. After startup, the sampler, `writeMetadata`, and `renameRecording` each read, modify, and write `metadata.json` synchronously on MainActor, which serializes their edits.
 - RecordingPipeline is `@unchecked Sendable` with `nonisolated(unsafe)` state - safe because all access is serialized on AudioRecorder's `audioQueue`
 - SCStream sample handler (via `SCStreamProxy`, a thin NSObject adapter) dispatches to `audioQueue.async` with `assumeIsolated` for direct passthrough to RecordingPipeline (no downmix)
 - SCStream stop/error callbacks hop through `audioQueue.async` to `assumeIsolated` for `RecorderFailure` routing

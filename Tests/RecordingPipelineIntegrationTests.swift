@@ -59,6 +59,41 @@ struct RecordingPipelineIntegrationTests {
 
   // MARK: - Core alignment & tail padding
 
+  @Test("metadata keeps each raw window title at its first observation")
+  func windowTitleHistory() async throws {
+    let (pipeline, root) = try makePipeline()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let directory = try pipeline.start(windowTitles: ["  Call  ", "", "  Call  ", "Chat"])
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      defer { group.addTask { _ = await pipeline.stop() } }
+      var metadata = try #require(RecordingMetadata.load(in: directory))
+      let repeated = metadata.recordWindowTitles(["Chat", ""], at: 30)
+      let added = metadata.recordWindowTitles(["Review", "  Call  ", "Review"], at: 60.5)
+      #expect(!repeated)
+      #expect(added)
+      try metadata.save(in: directory)
+      #expect(
+        RecordingMetadata.load(in: directory)?.windowTitles == [
+          .init(at: 0, title: "  Call  "), .init(at: 0, title: "Chat"),
+          .init(at: 60.5, title: "Review"),
+        ])
+    }
+  }
+
+  @Test("a sample stops appending titles when the history reaches 200 entries")
+  func windowTitleHistoryLimit() {
+    var metadata = RecordingMetadata(
+      title: "Call", createdAt: Date(), appName: "Meet", speakers: [:])
+    metadata.recordWindowTitles(["First"], at: 0)
+    let titles = (1...200).map { "Title \($0)" }
+    let added = metadata.recordWindowTitles(titles, at: 30)
+    #expect(added)
+    #expect(metadata.windowTitles?.count == 200)
+    #expect(metadata.windowTitles?.last == .init(at: 30, title: "Title 199"))
+    let addedAfterLimit = metadata.recordWindowTitles(["Later"], at: 60)
+    #expect(!addedAfterLimit)
+  }
+
   /// Pins the shape of what `stop()` hands back, which every consumer of a
   /// saved recording depends on. Auto-transcription read it as the audio file
   /// and took its parent, which meant the whole save directory was enqueued as
@@ -79,6 +114,7 @@ struct RecordingPipelineIntegrationTests {
     #expect(FileManager.default.fileExists(atPath: saved.path, isDirectory: &isDirectory))
     #expect(isDirectory.boolValue, "stop() returned a file, not a directory: \(saved.path)")
     #expect(RecordingStore.audioURL(in: saved) != nil)
+    #expect(try #require(RecordingMetadata.load(in: saved)).windowTitles == nil)
     #expect(saved.deletingLastPathComponent().path == root.path)
   }
 
