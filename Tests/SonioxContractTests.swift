@@ -238,6 +238,9 @@ nonisolated private func transcriptPayload() -> [String: Any] {
         "language": "en",
       ],
       [
+        "text": "translation", "translation_status": "translation", "speaker": 3,
+      ],
+      [
         "text": "General", "start_ms": 1500, "end_ms": 2200, "confidence": 0.95, "speaker": "2",
         "language": "en",
       ],
@@ -357,6 +360,9 @@ struct SonioxContractTests {
 
     let document = try await service.fetchTranscript(transcriptionId: "t-1")
 
+    let tokens = try #require(document.tokens)
+    #expect(tokens.map(\.text) == ["Hello", " there", "General"])
+    #expect(tokens.map(\.endMs) == [400, 800, 2200])
     #expect(document.segments.count == 2)
     #expect(document.segments.first?.speaker == 1)
     #expect(document.segments.first?.text == "Hello there")

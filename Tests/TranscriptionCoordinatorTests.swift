@@ -23,7 +23,8 @@ actor FakeTranscriptionService: TranscriptionServicing {
   private let document = TranscriptDocument(
     segments: [TranscriptSegment(speaker: 1, time: 0, text: "hello")],
     language: "en",
-    createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+    createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+    tokens: [TranscriptToken(text: "hello", startMs: 0, endMs: 500, speaker: 1)]
   )
 
   /// Runs just before `upload` returns, so a test can model the user changing
@@ -132,6 +133,13 @@ final class TranscriptionHarness {
   /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
   /// before building the coordinator.
   var uploadConcurrency = 2
+  var micEnabled = false
+  var analyzeMic: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution? = {
+    _, _ in
+    Issue.record("Unexpected attribution")
+    return nil
+  }
+  var saveAttribution: (TranscriptDocument, URL) throws -> Void = { try $0.save(for: $1) }
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -163,7 +171,9 @@ final class TranscriptionHarness {
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
         durationSeconds: { [weak self] _ in await self?.duration },
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
-        uploadConcurrency: uploadConcurrency
+        uploadConcurrency: uploadConcurrency,
+        isMicAttributionEnabled: { [weak self] in self?.micEnabled == true },
+        analyzeMic: analyzeMic, saveAttribution: saveAttribution
       ))
     return coordinator
   }
@@ -1290,5 +1300,178 @@ struct TranscriptionCoordinatorTests {
 
     #expect(TranscriptionJob.load(for: directory)?.awaitingRemoteDelete == true)
     #expect(TranscriptionJob.load(for: directory)?.fileId == "file-1")
+  }
+}
+
+@Suite("Local attribution lifecycle")
+struct AttributionCoordinatorTests {
+  private actor AnalysisGate {
+    var calls = 0
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func analyze(audio: URL, tokens: [TranscriptToken]) async -> SpeakerAttribution {
+      calls += 1
+      if !isOpen { await withCheckedContinuation { waiting.append($0) } }
+      return SpeakerAttribution(
+        version: MicActivity.version, parameters: .init(),
+        sourceAudio: audio.lastPathComponent, localTokenIndices: Array(tokens.indices),
+        appliedAt: Date())
+    }
+
+    func release() {
+      isOpen = true
+      for waiter in waiting { waiter.resume() }
+      waiting.removeAll()
+    }
+  }
+
+  @Test(arguments: ["cancel", "delete", "replace", "save failure", "disable"])
+  func interruptedEnrichmentPreservesThePaidResult(action: String) async throws {
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = true
+    let gate = AnalysisGate()
+    harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
+    var saveAttempts = 0
+    harness.saveAttribution = { _, _ in
+      saveAttempts += 1
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    let coordinator = harness.makeCoordinator()
+    let directory = try harness.makeRecording("call")
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { await gate.calls == 1 }
+    let paid = try #require(TranscriptDocument.load(for: directory))
+    let sidecar = TranscriptDocument.sidecarURL(for: directory)
+    let before = try Data(contentsOf: sidecar)
+    #expect(paid.sourceAudio == RecordingStore.audioName)
+    #expect(paid.attribution == nil)
+    #expect(coordinator.status(for: directory) == .completed)
+    await harness.wait { TranscriptionJob.load(for: directory) == nil }
+    #expect(await harness.service.deletedFileIds == ["file-1"])
+
+    let pending = try #require(coordinator.refreshAttribution(in: directory))
+    switch action {
+    case "cancel":
+      coordinator.cancel(recordingDirectory: directory)
+    case "delete":
+      try FileManager.default.removeItem(at: directory)
+      coordinator.forgetDeletedRecording(recordingDirectory: directory, job: nil)
+    case "replace":
+      var replacement = TranscriptDocument(
+        segments: [], createdAt: paid.createdAt,
+        tokens: [TranscriptToken(text: "new", startMs: 200, endMs: 400, speaker: 3)])
+      replacement.segments = replacement.project()
+      replacement.sourceAudio = paid.sourceAudio
+      try replacement.save(for: directory)
+    case "disable":
+      harness.micEnabled = false
+      coordinator.micAttributionDisabled()
+    default: break
+    }
+    await gate.release()
+    await pending.value
+    #expect(saveAttempts == (action == "save failure" ? 1 : 0))
+    if action == "delete" {
+      #expect(!FileManager.default.fileExists(atPath: directory.path))
+    } else if action == "replace" {
+      #expect(TranscriptDocument.load(for: directory)?.segments.first?.text == "new")
+    } else {
+      #expect(try Data(contentsOf: sidecar) == before)
+      #expect(coordinator.status(for: directory) == .completed)
+    }
+    #expect(TranscriptionJob.load(for: directory) == nil)
+    #expect(coordinator.finishCount(for: directory) == 1)
+  }
+
+  @Test func bothRecordingsReloadAndCanBeRestoredOffline() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = true
+    let gate = AnalysisGate()
+    harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    let directories = try ["a", "b"].map(harness.makeRecording)
+    for directory in directories { coordinator.transcribe(recordingDirectory: directory) }
+    await harness.wait { await gate.calls == 2 }
+    let tasks = directories.compactMap { coordinator.refreshAttribution(in: $0) }
+    await gate.release()
+    for task in tasks { await task.value }
+    for directory in directories {
+      #expect(coordinator.finishCount(for: directory) == 2)
+      #expect(TranscriptDocument.load(for: directory)?.segments.first?.speaker == -1)
+    }
+    harness.apiKey = nil
+    harness.micEnabled = false
+    let offline = harness.makeCoordinator()
+    offline.micAttributionDisabled()
+    await harness.wait { directories.allSatisfy { offline.finishCount(for: $0) == 1 } }
+    for directory in directories {
+      let doc = try #require(TranscriptDocument.load(for: directory))
+      #expect(doc.segments.first?.speaker == 1)
+      #expect(doc.attribution == nil)
+    }
+    harness.micEnabled = true
+    let pending = try #require(offline.refreshAttribution(in: directories[0]))
+    await harness.wait { await gate.calls == 3 }
+    await gate.release()
+    await pending.value
+    await offline.refreshAttribution(in: directories[0])?.value
+    #expect(await gate.calls == 3)
+    #expect(TranscriptDocument.load(for: directories[0])?.segments.first?.speaker == -1)
+    #expect(TranscriptDocument.load(for: directories[1])?.segments.first?.speaker == 1)
+    var previous = try #require(TranscriptDocument.load(for: directories[0]))
+    previous.attribution = SpeakerAttribution(
+      version: 0, parameters: .init(), sourceAudio: RecordingStore.audioName,
+      localTokenIndices: [], appliedAt: .distantPast)
+    previous.segments = previous.project()
+    try previous.save(for: directories[0])
+    await offline.refreshAttribution(in: directories[0])?.value
+    #expect(await gate.calls == 4)
+    #expect(
+      TranscriptDocument.load(for: directories[0])?.attribution?.version == MicActivity.version)
+    #expect(await harness.service.createCount == 2)
+  }
+
+  @Test(arguments: [
+    "off", "processed", "resumed processed", "unknown source", "suspended", "queued cancel",
+  ])
+  func skipsAnalysis(reason: String) async throws {
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = reason != "off"
+    let coordinator = harness.makeCoordinator()
+    let directory = try harness.makeRecording("call")
+    if reason == "processed" {
+      try Data([1]).write(to: directory.appendingPathComponent(RecordingStore.processedAudioName))
+    }
+    let isResumed = reason == "resumed processed" || reason == "unknown source"
+    if isResumed {
+      TranscriptionJob(
+        fileId: "file", transcriptionId: "id",
+        sourceAudio: reason == "resumed processed" ? RecordingStore.processedAudioName : nil
+      ).save(for: directory)
+      coordinator.resumePendingJobs()
+    } else {
+      if reason == "suspended" || reason == "queued cancel" { harness.micEnabled = false }
+      coordinator.transcribe(recordingDirectory: directory)
+    }
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    if reason == "suspended" {
+      harness.micEnabled = true
+      coordinator.suspendNewJobs()
+      #expect(coordinator.refreshAttribution(in: directory) == nil)
+    } else {
+      if reason == "queued cancel" { harness.micEnabled = true }
+      let task = coordinator.refreshAttribution(in: directory)
+      if reason == "queued cancel" { coordinator.cancel(recordingDirectory: directory) }
+      await task?.value
+    }
+    let doc = try #require(TranscriptDocument.load(for: directory))
+    #expect(doc.attribution == nil)
+    #expect(doc.segments.first?.speaker == 1)
+    if reason.contains("processed") {
+      #expect(doc.sourceAudio == RecordingStore.processedAudioName)
+    }
+    if isResumed { #expect(await harness.service.uploadCount == 0) }
+    if reason == "unknown source" { #expect(doc.sourceAudio == nil) }
   }
 }
