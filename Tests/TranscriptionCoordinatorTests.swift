@@ -131,13 +131,17 @@ final class TranscriptionHarness {
   /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
   /// before building the coordinator.
   var uploadConcurrency = 2
+  let defaults: UserDefaults
+  var sleepForAttributionDeadline = TranscriptionCoordinator.Dependencies()
+    .sleepForAttributionDeadline
   var micEnabled = false
   var analyzeMic: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution? = {
     _, _ in
     Issue.record("Unexpected attribution")
     return nil
   }
-  var saveAttribution: (TranscriptDocument.Encoded, URL) throws -> Void = TranscriptDocument.save
+  var saveProjectedTranscript: (TranscriptDocument.Encoded, URL) throws -> Void = TranscriptDocument
+    .save
   /// Recordings the coordinator handed to the after-transcript hook, and whether
   /// each one's transcript was already on disk at that moment.
   var hookedDirectories: [URL] = []
@@ -148,10 +152,12 @@ final class TranscriptionHarness {
   init() throws {
     root = FileManager.default.temporaryDirectory
       .appendingPathComponent("blackbox-transcription-\(UUID().uuidString)")
+    defaults = UserDefaults(suiteName: root.lastPathComponent)!
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
   }
 
   deinit {
+    UserDefaults.standard.removePersistentDomain(forName: root.lastPathComponent)
     try? FileManager.default.removeItem(at: root)
   }
 
@@ -177,7 +183,9 @@ final class TranscriptionHarness {
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
         uploadConcurrency: uploadConcurrency,
         isMicAttributionEnabled: { [weak self] in self?.micEnabled == true },
-        analyzeMic: analyzeMic, saveAttribution: saveAttribution,
+        analyzeMic: analyzeMic, defaults: defaults,
+        sleepForAttributionDeadline: sleepForAttributionDeadline,
+        saveProjectedTranscript: saveProjectedTranscript,
         onTranscriptSaved: { [weak self] directory in
           self?.hookedDirectories.append(directory)
           let transcript = TranscriptDocument.load(for: directory)
@@ -552,7 +560,7 @@ struct TranscriptionCoordinatorTests {
     let directory = try harness.makeRecording("call-1")
     let coordinator = harness.makeCoordinator()
 
-    coordinator.suspendNewJobs()
+    coordinator.prepareForTermination()
     coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait(upTo: 0.2) { await harness.service.uploadCount > 0 }
 
@@ -1384,7 +1392,7 @@ struct TranscriptionCoordinatorTests {
     let coordinator = harness.makeCoordinator()
 
     coordinator.transcribe(recordingDirectory: directory)
-    coordinator.suspendNewJobs()
+    coordinator.prepareForTermination()
 
     await harness.wait(upTo: 0.5) { await harness.service.uploadCount > 0 }
     #expect(await harness.service.uploadCount == 0)
@@ -1412,7 +1420,7 @@ struct TranscriptionCoordinatorTests {
     try await Task.sleep(for: .milliseconds(300))
     #expect(await harness.service.uploadCount == 1, "second was not parked on the gate")
 
-    coordinator.suspendNewJobs()
+    coordinator.prepareForTermination()
     await harness.service.setHoldsUpload(false)
     await harness.wait { coordinator.status(for: first) == .completed }
     // Give the drained waiter a chance to do the wrong thing.
@@ -1498,8 +1506,7 @@ struct AttributionCoordinatorTests {
       if !isOpen { await withCheckedContinuation { waiting.append($0) } }
       return SpeakerAttribution(
         version: MicActivity.version, parameters: .init(),
-        thresholds: .init(
-          micThresholdDBFS: -50, usedAdaptiveMicThreshold: false, systemThresholdDBFS: -105),
+        thresholds: TestFixtures.thresholds,
         localTokenIndices: Array(tokens.indices),
         appliedAt: Date())
     }
@@ -1511,16 +1518,27 @@ struct AttributionCoordinatorTests {
     }
   }
 
-  private enum Interruption: CaseIterable { case quit, delete, replace, saveFailure, disable }
+  private enum Interruption: CaseIterable {
+    case quit, move, timeout, delete, replace, saveFailure, disable
+  }
 
   @Test(arguments: Interruption.allCases)
   private func interruptedAttributionPreservesThePaidResult(action: Interruption) async throws {
     let harness = try TranscriptionHarness()
     harness.micEnabled = true
+    let clock = TestClock()
+    var deadlineStarted = false
+    if action == .timeout {
+      harness.sleepForAttributionDeadline = { duration in
+        #expect(duration == .seconds(120))
+        deadlineStarted = true
+        await clock.sleep(for: duration)
+      }
+    }
     let gate = AnalysisGate()
     harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
     var saveAttempts = 0
-    harness.saveAttribution = { _, _ in
+    harness.saveProjectedTranscript = { _, _ in
       saveAttempts += 1
       throw CocoaError(.fileWriteNoPermission)
     }
@@ -1537,7 +1555,8 @@ struct AttributionCoordinatorTests {
     #expect(harness.hookedDirectories.isEmpty)
     let json = try #require(JSONSerialization.jsonObject(with: before) as? [String: Any])
     #expect(Set(json.keys) == ["segments", "language", "createdAt"])
-    #expect(!(try Data(contentsOf: TranscriptTokens.url(for: directory))).contains(10))
+    let originalTokens = try Data(contentsOf: TranscriptTokens.url(for: directory))
+    #expect(!originalTokens.contains(UInt8(ascii: "\n")))
     #expect(coordinator.status(for: directory) == .completed)
     await harness.wait { TranscriptionJob.load(for: directory) == nil }
     #expect(await harness.service.deletedFileIds == ["file-1"])
@@ -1545,7 +1564,19 @@ struct AttributionCoordinatorTests {
     let pending = try #require(coordinator.refreshAttribution(in: directory))
     switch action {
     case .quit:
-      coordinator.suspendNewJobs()
+      coordinator.prepareForTermination()
+      #expect(harness.speakersAtHook == [[1]])
+    case .move:
+      coordinator.endPendingAttributions()
+      #expect(harness.speakersAtHook == [[1]])
+      try FileManager.default.moveItem(
+        at: directory, to: harness.root.appendingPathComponent("moved"))
+    case .timeout:
+      await harness.wait { deadlineStarted }
+      clock.advance(by: .seconds(119))
+      #expect(harness.hookedDirectories.isEmpty)
+      clock.advance(by: .seconds(1))
+      await harness.wait { harness.hookedDirectories == [directory] }
       #expect(harness.speakersAtHook == [[1]])
     case .delete:
       try FileManager.default.removeItem(at: directory)
@@ -1564,7 +1595,7 @@ struct AttributionCoordinatorTests {
     await pending.value
     #expect(harness.hookedDirectories == (action == .delete ? [] : [directory]))
     #expect(saveAttempts == (action == .saveFailure ? 1 : 0))
-    if action == .delete {
+    if action == .delete || action == .move {
       #expect(!FileManager.default.fileExists(atPath: directory.path))
     } else if action == .replace {
       #expect(TranscriptDocument.load(for: directory)?.segments.first?.text == "new")
@@ -1572,11 +1603,46 @@ struct AttributionCoordinatorTests {
       #expect(try Data(contentsOf: sidecar) == before)
       #expect(coordinator.status(for: directory) == .completed)
     }
+    if action == .saveFailure {
+      #expect(try Data(contentsOf: TranscriptTokens.url(for: directory)) == originalTokens)
+    }
     #expect(TranscriptionJob.load(for: directory) == nil)
     #expect(coordinator.finishCount(for: directory) == 1)
   }
 
-  @Test func bothRecordingsReloadAndCanBeRestoredOffline() async throws {
+  @Test func failedReplacementSaveLeavesPreviousPaidHookPending() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = true
+    let gate = AnalysisGate()
+    harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    let directory = try harness.makeRecording("call")
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { await gate.calls == 1 }
+    let pending = try #require(coordinator.refreshAttribution(in: directory))
+    let transcriptURL = TranscriptDocument.sidecarURL(for: directory)
+    let original = directory.appendingPathComponent("original")
+    try FileManager.default.moveItem(at: transcriptURL, to: original)
+    try FileManager.default.createDirectory(at: transcriptURL, withIntermediateDirectories: false)
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait {
+      if case .error = coordinator.status(for: directory) { true } else { false }
+    }
+    guard case .error = coordinator.status(for: directory) else {
+      Issue.record("The replacement transcript write should fail")
+      await gate.release()
+      return
+    }
+    #expect(!pending.isCancelled)
+    #expect(harness.hookedDirectories.isEmpty)
+    try FileManager.default.removeItem(at: transcriptURL)
+    try FileManager.default.moveItem(at: original, to: transcriptURL)
+    await gate.release()
+    await pending.value
+    #expect(harness.speakersAtHook == [[TranscriptSegment.localSpeaker]])
+  }
+
+  @Test func concurrentPaidAttributionsReloadBothRecordings() async throws {
     let harness = try TranscriptionHarness()
     harness.micEnabled = true
     let gate = AnalysisGate()
@@ -1586,6 +1652,7 @@ struct AttributionCoordinatorTests {
     for directory in directories { coordinator.transcribe(recordingDirectory: directory) }
     await harness.wait { await gate.calls == 2 }
     let tasks = directories.compactMap { coordinator.refreshAttribution(in: $0) }
+    for directory in directories { coordinator.cancelLazyAnalysis(in: directory) }
     await gate.release()
     for task in tasks { await task.value }
     for directory in directories {
@@ -1600,51 +1667,132 @@ struct AttributionCoordinatorTests {
         [TranscriptSegment.localSpeaker], [TranscriptSegment.localSpeaker],
       ])
     #expect(harness.textAtHook.allSatisfy { $0.contains("You: hello") })
-    let damagedURL = TranscriptTokens.url(for: directories[0])
-    var damaged = try #require(
-      JSONSerialization.jsonObject(with: Data(contentsOf: damagedURL)) as? [String: Any])
-    damaged["attribution"] = ["version": "bad"]
-    try JSONSerialization.data(withJSONObject: damaged).write(to: damagedURL, options: .atomic)
-    await coordinator.refreshAttribution(in: directories[0])?.value
-    #expect(await gate.calls == 2)
+  }
+
+  private func saveFixture(in directory: URL, local: Bool = false) throws {
+    var document = TranscriptDocument(
+      tokens: [TranscriptToken(text: "hello", startMs: 100, endMs: 200, speaker: 1)],
+      createdAt: Date())
+    var tokens = try #require(document.fetchedTokens)
+    tokens.sourceAudio = RecordingStore.audioName
+    if local {
+      tokens.attribution = SpeakerAttribution(
+        version: MicActivity.version, parameters: .init(),
+        thresholds: TestFixtures.thresholds, localTokenIndices: [0], appliedAt: Date())
+      document.segments = tokens.project()
+    }
+    try document.save(for: directory)
+    try TranscriptTokens.write(JSONEncoder().encode(tokens), for: directory)
+  }
+
+  private func replaceAttribution(in directory: URL, with record: [String: Any]) throws {
+    let url = TranscriptTokens.url(for: directory)
+    var json = try #require(
+      JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+    json["attribution"] = record
+    try JSONSerialization.data(withJSONObject: json).write(to: url, options: .atomic)
+  }
+
+  @Test func pendingLaunchRestoreWorksOfflineAndClearsOnceComplete() async throws {
+    let harness = try TranscriptionHarness()
     harness.apiKey = nil
+    let coordinator = harness.makeCoordinator()
+    #expect(coordinator.restoreProviderSpeakersIfPending() == nil)
+    let directories = try ["attributed", "damaged"].map(harness.makeRecording)
+    for directory in directories { try saveFixture(in: directory, local: true) }
+    try replaceAttribution(in: directories[1], with: ["version": "bad"])
+    harness.micEnabled = true
+    coordinator.attributionSettingChanged()
     harness.micEnabled = false
+    let interrupted = try #require(coordinator.restoreProviderSpeakersIfPending())
+    coordinator.prepareForTermination()
+    await interrupted.value
     let offline = harness.makeCoordinator()
-    offline.resumePendingJobs()
-    await harness.wait { directories.allSatisfy { offline.finishCount(for: $0) == 1 } }
+    let sweep = try #require(offline.restoreProviderSpeakersIfPending())
+    await sweep.value
     for directory in directories {
-      let doc = try #require(TranscriptDocument.load(for: directory))
-      #expect(doc.segments.first?.speaker == 1)
+      #expect(offline.finishCount(for: directory) == 1)
+      #expect(TranscriptDocument.load(for: directory)?.segments.first?.speaker == 1)
       #expect(
         try String(contentsOf: TranscriptDocument.plainTextURL(for: directory), encoding: .utf8)
           .contains("Speaker 2: hello"))
-      #expect(TranscriptTokens.load(for: directory)?.attribution == nil)
+      #expect(TranscriptTokens.load(for: directory)?.hasAttributionRecord == false)
     }
+    #expect(harness.makeCoordinator().restoreProviderSpeakersIfPending() == nil)
+    #expect(harness.hookedDirectories.isEmpty)
+    #expect(await harness.service.createCount == 0)
+  }
+
+  private enum OlderRecord: CaseIterable { case missingProvenance, invalidVersion, invalidIndices }
+
+  @Test(arguments: OlderRecord.allCases)
+  private func openingRepairsOldAttributionOffline(record: OlderRecord) async throws {
+    let harness = try TranscriptionHarness()
     harness.micEnabled = true
-    let pending = try #require(offline.refreshAttribution(in: directories[0]))
-    await harness.wait { await gate.calls == 3 }
+    harness.apiKey = nil
+    let gate = AnalysisGate()
+    harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    let directory = try harness.makeRecording("opened")
+    let unopened = try harness.makeRecording("unopened")
+    try saveFixture(in: directory)
+    try saveFixture(in: unopened)
+    var old: [String: Any] = [
+      "version": 1, "localTokenIndices": [],
+      "parameters": ["sampleRate": 8000], "thresholds": ["micThresholdDBFS": -48],
+    ]
+    switch record {
+    case .missingProvenance: break
+    case .invalidVersion: old["version"] = "bad"
+    case .invalidIndices: old["localTokenIndices"] = "bad"
+    }
+    try replaceAttribution(in: directory, with: old)
+    let decoded = TranscriptTokens.load(for: directory)?.attribution
+    if record == .missingProvenance {
+      #expect(decoded?.parameters.sampleRate == 8000)
+      #expect(
+        decoded?.parameters.minimumLocalFraction == MicActivity.Parameters().minimumLocalFraction)
+      #expect(decoded?.thresholds.micThresholdDBFS == -48)
+      #expect(decoded?.thresholds.usedAdaptiveMicThreshold == false)
+    } else {
+      #expect(decoded == nil)
+    }
+    let pending = try #require(coordinator.refreshAttribution(in: directory))
     await gate.release()
     await pending.value
-    await offline.refreshAttribution(in: directories[0])?.value
-    #expect(await gate.calls == 3)
+    #expect(TranscriptTokens.load(for: directory)?.attribution?.version == MicActivity.version)
     #expect(
-      TranscriptDocument.load(for: directories[0])?.segments.first?.speaker
+      TranscriptDocument.load(for: directory)?.segments.first?.speaker
         == TranscriptSegment.localSpeaker)
-    #expect(TranscriptDocument.load(for: directories[1])?.segments.first?.speaker == 1)
-    var previous = try #require(TranscriptTokens.load(for: directories[0]))
-    previous.attribution = SpeakerAttribution(
-      version: 0, parameters: .init(),
-      thresholds: .init(
-        micThresholdDBFS: -50, usedAdaptiveMicThreshold: false, systemThresholdDBFS: -105),
-      localTokenIndices: [], appliedAt: .distantPast)
-    try JSONEncoder().encode(previous).write(
-      to: TranscriptTokens.url(for: directories[0]), options: .atomic)
-    await offline.refreshAttribution(in: directories[0])?.value
-    #expect(await gate.calls == 4)
-    #expect(
-      TranscriptTokens.load(for: directories[0])?.attribution?.version == MicActivity.version)
-    #expect(harness.hookedDirectories.count == 2)
-    #expect(await harness.service.createCount == 2)
+    #expect(TranscriptDocument.load(for: unopened)?.segments.first?.speaker == 1)
+    let relaunched = harness.makeCoordinator()
+    await relaunched.refreshAttribution(in: directory)?.value
+    #expect(relaunched.refreshAttribution(in: directory) == nil)
+    #expect(await gate.calls == 1)
+    #expect(harness.hookedDirectories.isEmpty)
+    #expect(await harness.service.createCount == 0)
+  }
+
+  @Test func closingDetailCancelsLazyAnalysisAndReopeningCanRetry() async throws {
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = true
+    let directory = try harness.makeRecording("opened")
+    try saveFixture(in: directory)
+    let gate = AnalysisGate()
+    harness.analyzeMic = { await gate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    let first = try #require(coordinator.refreshAttribution(in: directory))
+    await harness.wait { await gate.calls == 1 }
+    coordinator.cancelLazyAnalysis(in: directory)
+    #expect(first.isCancelled)
+    await gate.release()
+    await first.value
+    #expect(coordinator.finishCount(for: directory) == 0)
+    #expect(TranscriptTokens.load(for: directory)?.attribution == nil)
+    await coordinator.refreshAttribution(in: directory)?.value
+    #expect(coordinator.finishCount(for: directory) == 1)
+    #expect(await gate.calls == 2)
+    #expect(harness.hookedDirectories.isEmpty)
   }
 
   @Test func togglingDuringAnalysisKeepsOnlyTheLatestProjection() async throws {
@@ -1723,10 +1871,31 @@ struct AttributionCoordinatorTests {
     coordinator.transcribe(recordingDirectory: directory)
     await harness.wait { await gate.calls == 1 }
     #expect(harness.hookedDirectories.isEmpty)
+    let transcriptURL = TranscriptDocument.sidecarURL(for: directory)
+    let inode =
+      try FileManager.default.attributesOfItem(atPath: transcriptURL.path)[.systemFileNumber]
+      as? NSNumber
     await gate.release()
     await harness.wait { harness.speakersAtHook == [[1]] }
     #expect(coordinator.refreshAttribution(in: directory) == nil)
     #expect(await gate.calls == 1)
+    #expect(coordinator.finishCount(for: directory) == 1)
+    if outcome == .noMatches {
+      let attribution = try #require(TranscriptTokens.load(for: directory)?.attribution)
+      #expect(attribution.version == MicActivity.version && attribution.localTokenIndices.isEmpty)
+      let relaunched = harness.makeCoordinator()
+      await relaunched.refreshAttribution(in: directory)?.value
+      #expect(relaunched.refreshAttribution(in: directory) == nil)
+      #expect(await gate.calls == 1)
+      harness.micEnabled = false
+      await relaunched.restoreProviderSpeakersIfPending()?.value
+      #expect(TranscriptTokens.load(for: directory)?.hasAttributionRecord == false)
+      #expect(relaunched.finishCount(for: directory) == 0)
+      #expect(
+        try FileManager.default.attributesOfItem(atPath: transcriptURL.path)[.systemFileNumber]
+          as? NSNumber == inode)
+      harness.micEnabled = true
+    }
     coordinator.transcribe(recordingDirectory: directory)
     await harness.wait { harness.hookedDirectories.count == 2 }
     #expect(await gate.calls == 2)
@@ -1761,7 +1930,7 @@ struct AttributionCoordinatorTests {
     #expect(harness.hookedDirectories.map(\.path) == [directory.path])
     if reason == .suspended {
       harness.micEnabled = true
-      coordinator.suspendNewJobs()
+      coordinator.prepareForTermination()
       #expect(coordinator.refreshAttribution(in: directory) == nil)
     } else {
       let task = coordinator.refreshAttribution(in: directory)

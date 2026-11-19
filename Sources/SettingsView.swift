@@ -653,6 +653,7 @@ struct SettingsView: View {
       actionError = "Recording in progress. Existing recordings were left where they are."
       return
     }
+    transcription.endPendingAttributions()
     Task.detached {
       var failed: [String] = []
       for directory in RecordingStore.directories(in: source) {
@@ -851,6 +852,7 @@ nonisolated enum SettingsKeys {
   static let notifyOnError = "notifyOnError"
   static let excludedBundleIDs = "excludedBundleIDs"
   static let micAttribution = "micAttribution"
+  static let micAttributionRestorePending = "micAttributionRestorePending"
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
   static let transcriptHookPath = "transcriptHookPath"

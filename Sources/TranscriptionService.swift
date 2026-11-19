@@ -171,9 +171,22 @@ nonisolated struct SpeakerAttribution: Codable, Sendable {
   let appliedAt: Date
 }
 
+extension SpeakerAttribution {
+  nonisolated init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    version = try values.decode(Int.self, forKey: .version)
+    localTokenIndices = try values.decode([Int].self, forKey: .localTokenIndices)
+    parameters =
+      try values.decodeIfPresent(MicActivity.Parameters.self, forKey: .parameters) ?? .init()
+    thresholds =
+      try values.decodeIfPresent(MicActivity.Thresholds.self, forKey: .thresholds) ?? .init()
+    appliedAt = try values.decodeIfPresent(Date.self, forKey: .appliedAt) ?? .distantPast
+  }
+}
+
 nonisolated struct TranscriptTokens: Codable, Sendable {
   private enum CodingKeys: String, CodingKey { case tokens, createdAt, sourceAudio, attribution }
-  private var malformedAttribution = false
+  private(set) var hasAttributionRecord = false
   let tokens: [TranscriptToken]
   let createdAt: Date
   var sourceAudio: String?
@@ -189,49 +202,64 @@ nonisolated struct TranscriptTokens: Codable, Sendable {
     tokens = try container.decode([TranscriptToken].self, forKey: .tokens)
     createdAt = try container.decode(Date.self, forKey: .createdAt)
     sourceAudio = try container.decodeIfPresent(String.self, forKey: .sourceAudio)
-    do {
-      attribution = try container.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution)
-    } catch {
-      // Provider tokens can still restore a transcript whose local labels are already on disk.
-      malformedAttribution = true
-    }
+    hasAttributionRecord = container.contains(.attribution)
+    attribution = try? container.decode(SpeakerAttribution.self, forKey: .attribution)
   }
 
-  static func url(for directory: URL) -> URL { directory.appendingPathComponent("tokens.json") }
+  static let fileName = "tokens.json"
+  static func url(for directory: URL) -> URL { directory.appendingPathComponent(fileName) }
 
   @concurrent
-  static func encodeForPaidSave(_ sidecar: Self?) async -> Data? {
-    guard let sidecar else { return nil }
+  static func encodeForPaidSave(_ tokens: Self?, in directory: URL) async -> Data? {
+    guard let tokens else { return nil }
     do {
-      return try JSONEncoder().encode(sidecar)
+      return try JSONEncoder().encode(tokens)
     } catch {
       Log.warning(
         Log.transcription, "attribution",
-        "Could not encode timed tokens: \(error.localizedDescription)")
+        "could not encode timed tokens for \(directory.lastPathComponent): \(error.localizedDescription)"
+      )
       return nil
     }
   }
 
-  static func write(_ data: Data?, for directory: URL) throws {
-    let url = url(for: directory)
-    if let data {
-      try data.write(to: url, options: .atomic)
-    } else if unlink(url.path) != 0, errno != ENOENT {
+  static func commitPaidSave(_ data: Data?, in directory: URL) -> Bool {
+    do {
+      guard let data else {
+        try remove(for: directory)
+        return false
+      }
+      try write(data, for: directory)
+      return true
+    } catch {
+      Log.warning(
+        Log.transcription, "attribution",
+        "could not save timed tokens for \(directory.lastPathComponent): \(error.localizedDescription)"
+      )
+      return false
+    }
+  }
+
+  static func write(_ data: Data, for directory: URL) throws {
+    try data.write(to: url(for: directory), options: .atomic)
+  }
+
+  static func remove(for directory: URL) throws {
+    if unlink(url(for: directory).path) != 0, errno != ENOENT {
       throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
   }
 
-  var canAnalyze: Bool {
-    guard !tokens.isEmpty, !malformedAttribution else { return false }
-    guard let sourceAudio else {
-      Log.info(Log.transcription, "attribution", "Skipping transcript with unknown source audio")
-      return false
-    }
-    guard sourceAudio == RecordingStore.audioName else {
-      Log.info(Log.transcription, "attribution", "Skipping transcript from a non-raw audio source")
-      return false
-    }
-    return true
+  enum Ineligibility: String {
+    case empty = "no timed tokens"
+    case unknownSource = "unknown source audio"
+    case processedSource = "non-raw source audio"
+  }
+
+  var analysisIneligibility: Ineligibility? {
+    guard !tokens.isEmpty else { return .empty }
+    guard let sourceAudio else { return .unknownSource }
+    return sourceAudio == RecordingStore.audioName ? nil : .processedSource
   }
 
   private struct AttributionProbe: Decodable {
@@ -316,10 +344,10 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     self.model = model
   }
 
-  init(tokens: [TranscriptToken], language: String? = nil, createdAt: Date) {
-    let sidecar = TranscriptTokens(tokens: tokens, createdAt: createdAt)
-    self.init(segments: sidecar.project(), language: language, createdAt: createdAt)
-    fetchedTokens = sidecar
+  init(tokens originalTokens: [TranscriptToken], language: String? = nil, createdAt: Date) {
+    let tokens = TranscriptTokens(tokens: originalTokens, createdAt: createdAt)
+    self.init(segments: tokens.project(), language: language, createdAt: createdAt)
+    fetchedTokens = tokens
   }
 
   /// Hand-written for the same reason as `RecordingMetadata`'s. Here the cost of
@@ -363,10 +391,6 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     return try Encoded(
       json: encoder.encode(self),
       text: Data(plainText(for: directory, metadata: RecordingMetadata.load(in: directory)).utf8))
-  }
-
-  func save(for directory: URL) throws {
-    try Self.save(encoded(for: directory), for: directory)
   }
 
   static func save(_ encoded: Encoded, for directory: URL) throws {
@@ -1128,6 +1152,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
     let originals = tokens.compactMap { token -> TranscriptToken? in
       guard token["translation_status"] as? String != "translation" else { return nil }
+      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int.
       let speaker = token["speaker"] as? Int ?? (token["speaker"] as? String).flatMap(Int.init) ?? 0
       return TranscriptToken(
         text: token["text"] as? String ?? "",

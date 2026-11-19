@@ -6,6 +6,12 @@ import Testing
 
 @testable import Blackbox
 
+extension TranscriptDocument {
+  func save(for directory: URL) throws {
+    try Self.save(encoded(for: directory), for: directory)
+  }
+}
+
 extension Duration {
   fileprivate var timeInterval: TimeInterval {
     let seconds = Double(components.seconds)
@@ -15,6 +21,8 @@ extension Duration {
 }
 
 enum TestFixtures {
+  nonisolated static let thresholds = MicActivity.Thresholds()
+
   static func recordingDirectory(named name: String) throws -> URL {
     let base = try #require(Bundle.module.resourceURL)
       .appendingPathComponent("Fixtures", isDirectory: true)

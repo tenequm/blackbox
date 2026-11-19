@@ -706,7 +706,8 @@ struct RecordingDetailView: View {
   // Transcription
   @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @State private var transcript: TranscriptDocument?
-  @State private var hasSavedTokens: Bool?
+  @State private var transcriptLoaded = false
+  @State private var hasSavedTokens = false
 
   var body: some View {
     VStack(spacing: 0) {
@@ -773,17 +774,21 @@ struct RecordingDetailView: View {
       guard !Task.isCancelled, count == transcription.finishCount(for: recording.url) else {
         return
       }
-      let firstLoad = hasSavedTokens == nil
+      let firstLoad = !transcriptLoaded
+      transcriptLoaded = true
       transcript = loaded.document
       hasSavedTokens = loaded.hasTokens
-      if firstLoad, let transcript {
-        transcription.refreshAttribution(in: recording.url, document: transcript)
+      if firstLoad, let transcript, hasSavedTokens,
+        micAttribution
+          || transcript.segments.contains(where: { $0.speaker == TranscriptSegment.localSpeaker })
+      {
+        transcription.refreshAttribution(in: recording.url)
       }
     }
     .onChange(of: micAttribution) { _, enabled in
       // SettingsView schedules the library-wide restore on disable.
-      if enabled, let transcript {
-        transcription.refreshAttribution(in: recording.url, document: transcript)
+      if enabled, transcriptLoaded, hasSavedTokens, transcript != nil {
+        transcription.refreshAttribution(in: recording.url)
       }
     }
     // The cached metadata is the source for every write below, and `.id` is the
@@ -792,7 +797,8 @@ struct RecordingDetailView: View {
     // wrote it back over the new one.
     .onChange(of: recording.title) { _, _ in loadMetadata() }
     .onDisappear {
-      hasSavedTokens = nil
+      transcriptLoaded = false
+      transcription.cancelLazyAnalysis(in: recording.url)
       teardownPlayer()
     }
     .focusable()
@@ -1312,6 +1318,7 @@ struct RecordingDetailView: View {
       // An existing transcript then wins over an error, because a failed
       // re-transcribe must not cost the user the transcript they already had.
       // The row's indicator still shows the failure.
+      // Leave the pane empty until the first disk read settles so the Transcribe button cannot flash.
       if transcriptionStatus.isActive {
         VStack(spacing: 12) {
           // Determinate wherever the stage can actually report itself. Mixing
@@ -1335,10 +1342,10 @@ struct RecordingDetailView: View {
             .disabled(transcriptionStatus == .cancelling)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if hasSavedTokens == nil {
-        ProgressView("Loading transcript")
+      } else if !transcriptLoaded {
+        Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
       } else if let transcript, !transcript.segments.isEmpty {
-        if micAttribution, hasSavedTokens == false {
+        if micAttribution, !hasSavedTokens {
           Text("This transcript has no saved speaker tokens for local voice labelling.")
             .font(.caption)
             .foregroundStyle(.secondary)

@@ -61,8 +61,10 @@ struct MicActivityTests {
     let tokens = times.map { TranscriptToken(text: "word", startMs: $0.0, endMs: $0.1, speaker: 2) }
     let result = try #require(await MicActivity.analyze(audio: url, tokens: tokens))
     #expect(result.localTokenIndices == (systemSilent ? [1, 2, 4] : [1, 4]))
-    #expect(result.thresholds.systemThresholdDBFS == -105)
-    #expect(result.thresholds.micThresholdDBFS == -50)
+    #expect(
+      result.thresholds.systemThresholdDBFS == result.parameters.minimumDBFS
+        + result.parameters.systemMarginDB)
+    #expect(result.thresholds.micThresholdDBFS == result.parameters.micFloorDBFS)
     #expect(!result.thresholds.usedAdaptiveMicThreshold)
   }
 
@@ -116,20 +118,20 @@ struct MicActivityTests {
   }
 
   @Test func projectionRestoresProviderLabelsAndNames() throws {
-    let tokens = [(" Hello", 1), (" there", 2), (" remote", 2)].enumerated().map { index, word in
+    let originalTokens = [(" Hello", 1), (" there", 2), (" remote", 2)].enumerated().map {
+      index, word in
       TranscriptToken(
         text: word.0, startMs: Double(index * 100), endMs: Double(index * 100 + 90), speaker: word.1
       )
     }
-    let document = TranscriptDocument(tokens: tokens, createdAt: Date())
-    var sidecar = try #require(document.fetchedTokens)
+    let document = TranscriptDocument(tokens: originalTokens, createdAt: Date())
+    var tokens = try #require(document.fetchedTokens)
     let originals = document.segments
-    sidecar.attribution = SpeakerAttribution(
-      version: 1, parameters: .init(),
-      thresholds: .init(
-        micThresholdDBFS: -50, usedAdaptiveMicThreshold: false, systemThresholdDBFS: -105),
+    tokens.attribution = SpeakerAttribution(
+      version: MicActivity.version, parameters: .init(),
+      thresholds: TestFixtures.thresholds,
       localTokenIndices: [0, 1], appliedAt: Date())
-    let local = sidecar.project()
+    let local = tokens.project()
     #expect(local.map(\.text) == ["Hello there", "remote"])
     #expect(local.map(\.speaker) == [TranscriptSegment.localSpeaker, 2])
     let names = ["2": "Remote"]
@@ -141,11 +143,11 @@ struct MicActivityTests {
       TranscriptSegment.speakerName(
         for: TranscriptSegment.localSpeaker,
         names: [String(TranscriptSegment.localSpeaker): "Local"]) == "Local")
-    sidecar.attribution = nil
-    #expect(sidecar.project().map(\.speaker) == [1, 2])
-    #expect(sidecar.project().map(\.text) == ["Hello", "there remote"])
-    #expect(sidecar.project().map(\.id) == originals.map(\.id))
-    #expect(sidecar.tokens == tokens)
+    tokens.attribution = nil
+    #expect(tokens.project().map(\.speaker) == [1, 2])
+    #expect(tokens.project().map(\.text) == ["Hello", "there remote"])
+    #expect(tokens.project().map(\.id) == originals.map(\.id))
+    #expect(tokens.tokens == originalTokens)
   }
 
   private enum Sidecar: CaseIterable { case legacy, malformedJSON, malformedTokens }

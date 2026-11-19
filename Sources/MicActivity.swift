@@ -2,8 +2,8 @@ import AVFoundation
 import os
 
 nonisolated enum MicActivity {
-  /// Bump to re-analyse recordings with an older attribution on next open.
-  static let version = 1
+  /// Bump when the analysis or its provenance changes so enabled recordings are re-analysed on open.
+  static let version = 2
   private static let queue = DispatchQueue(label: "blackbox.mic-attribution", qos: .utility)
 
   /// Section 4 of `docs/plans/2611-03-mic-gated-you-attribution.md` defines 20 ms frames,
@@ -21,12 +21,37 @@ nonisolated enum MicActivity {
     var systemMarginDB: Float = 15
     var paddingMs = 40.0
     var minimumLocalFraction = 0.60
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+      let values = try decoder.container(keyedBy: CodingKeys.self)
+      sampleRate = try values.decodeIfPresent(Int.self, forKey: .sampleRate) ?? sampleRate
+      frameSamples = try values.decodeIfPresent(Int.self, forKey: .frameSamples) ?? frameSamples
+      noisePercentile =
+        try values.decodeIfPresent(Double.self, forKey: .noisePercentile) ?? noisePercentile
+      energyEpsilon =
+        try values.decodeIfPresent(Double.self, forKey: .energyEpsilon) ?? energyEpsilon
+      minimumDBFS = try values.decodeIfPresent(Float.self, forKey: .minimumDBFS) ?? minimumDBFS
+      micMarginDB = try values.decodeIfPresent(Float.self, forKey: .micMarginDB) ?? micMarginDB
+      micFloorDBFS = try values.decodeIfPresent(Float.self, forKey: .micFloorDBFS) ?? micFloorDBFS
+      maximumGapFrames =
+        try values.decodeIfPresent(Int.self, forKey: .maximumGapFrames) ?? maximumGapFrames
+      minimumRunFrames =
+        try values.decodeIfPresent(Int.self, forKey: .minimumRunFrames) ?? minimumRunFrames
+      systemMarginDB =
+        try values.decodeIfPresent(Float.self, forKey: .systemMarginDB) ?? systemMarginDB
+      paddingMs = try values.decodeIfPresent(Double.self, forKey: .paddingMs) ?? paddingMs
+      minimumLocalFraction =
+        try values.decodeIfPresent(Double.self, forKey: .minimumLocalFraction)
+        ?? minimumLocalFraction
+    }
   }
 
   struct Thresholds: Codable, Sendable {
-    let micThresholdDBFS: Float
-    let usedAdaptiveMicThreshold: Bool
-    let systemThresholdDBFS: Float
+    var micThresholdDBFS = Parameters().micFloorDBFS
+    var usedAdaptiveMicThreshold = false
+    var systemThresholdDBFS = Parameters().minimumDBFS + Parameters().systemMarginDB
   }
 
   private struct Frame {
@@ -56,20 +81,29 @@ nonisolated enum MicActivity {
     audio: URL, tokens: [TranscriptToken], checkCancelled: () throws -> Void
   ) throws -> SpeakerAttribution? {
     try checkCancelled()
+    let name = audio.deletingLastPathComponent().lastPathComponent
     let asset = AVURLAsset(url: audio)
     let tracks = try asset.loadAudioTracksBlocking(missingTracks: CocoaError(.fileReadCorruptFile))
     guard tracks.count == 2 else {
-      Log.info(Log.transcription, "attribution", "Skipping capture with an unsupported track count")
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): unsupported track count"
+      )
       return nil
     }
     guard let systemChannels = try channelCount(asset, track: tracks[0]),
       let micChannels = try channelCount(asset, track: tracks[1])
     else {
-      Log.info(Log.transcription, "attribution", "Skipping capture with an empty audio track")
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): empty audio track")
       return nil
     }
     guard systemChannels == 2, micChannels == 1 else {
-      Log.info(Log.transcription, "attribution", "Skipping unsupported audio channel layout")
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): unsupported audio channel layout"
+      )
       return nil
     }
     let parameters = Parameters()
@@ -77,7 +111,10 @@ nonisolated enum MicActivity {
       let system = try energies(asset, track: tracks[0], channels: 2, parameters, checkCancelled),
       let mic = try energies(asset, track: tracks[1], channels: 1, parameters, checkCancelled)
     else {
-      Log.info(Log.transcription, "attribution", "Skipping tracks without complete audio frames")
+      Log.info(
+        Log.transcription, "attribution",
+        "skipping \(name): tracks without complete audio frames"
+      )
       return nil
     }
     try checkCancelled()
@@ -260,5 +297,18 @@ nonisolated enum MicActivity {
     let upper = end + parameters.paddingMs
     let local = localMilliseconds(before: upper) - localMilliseconds(before: lower)
     return upper > lower && local >= (upper - lower) * parameters.minimumLocalFraction
+  }
+}
+
+extension MicActivity.Thresholds {
+  nonisolated init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    micThresholdDBFS =
+      try values.decodeIfPresent(Float.self, forKey: .micThresholdDBFS) ?? micThresholdDBFS
+    usedAdaptiveMicThreshold =
+      try values.decodeIfPresent(Bool.self, forKey: .usedAdaptiveMicThreshold)
+      ?? usedAdaptiveMicThreshold
+    systemThresholdDBFS =
+      try values.decodeIfPresent(Float.self, forKey: .systemThresholdDBFS) ?? systemThresholdDBFS
   }
 }
