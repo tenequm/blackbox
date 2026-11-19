@@ -65,6 +65,12 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
     try? FileManager.default.removeItem(at: url(for: recordingDirectory))
   }
 
+  mutating func markManual(for recordingDirectory: URL) {
+    guard isAutomatic else { return }
+    isAutomatic = false
+    save(for: recordingDirectory)
+  }
+
   /// Failures are logged rather than swallowed: this record is the only thing
   /// naming what a job has put on Soniox, so losing a write is how audio ends up
   /// stranded there with nothing left to identify it.
@@ -253,6 +259,13 @@ final class TranscriptionCoordinator {
 
   private var statuses: [String: TranscriptionStatus] = [:]
 
+  private struct InFlightJob {
+    let task: Task<Void, Never>
+    /// Installed once the runner has loaded its record. Until then a request
+    /// updates the sidecar the runner will read.
+    var markManual: (() -> Void)?
+  }
+
   /// One task per recording directory, keyed by the same path `statuses` uses -
   /// so "is this job in flight" and "what is this job's status" cannot
   /// disagree.
@@ -266,7 +279,7 @@ final class TranscriptionCoordinator {
   ///
   /// `@ObservationIgnored` because nothing observes it, and a dictionary of
   /// tasks would otherwise fire a SwiftUI invalidation per job start.
-  @ObservationIgnored private var jobs: [String: Task<Void, Never>] = [:]
+  @ObservationIgnored private var jobs: [String: InFlightJob] = [:]
 
   /// Set when the app is terminating. New work still writes its sidecar and
   /// shows as queued, so `resumePendingJobs()` picks it up next launch - but
@@ -434,7 +447,7 @@ final class TranscriptionCoordinator {
   /// trash gets an empty job, and an empty job has no ids to delete - which
   /// left the uploaded audio on Soniox with nothing naming it.
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
-    jobs[recordingDirectory.path]?.cancel()
+    jobs[recordingDirectory.path]?.task.cancel()
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
     guard let job else { return }
@@ -442,7 +455,7 @@ final class TranscriptionCoordinator {
   }
 
   func cancel(recordingDirectory: URL) {
-    if let task = jobs[recordingDirectory.path] {
+    if let task = jobs[recordingDirectory.path]?.task {
       // Marked synchronously. Cancellation is only observed at the next
       // suspension point, and an upload can sit inside one for minutes, so
       // without this the button stayed live and the spinner unchanged - which
@@ -525,15 +538,13 @@ final class TranscriptionCoordinator {
 
   private func enqueue(_ recordingDirectory: URL, isAutomatic: Bool) {
     let key = recordingDirectory.path
-    // Ahead of the in-flight guard on purpose: an explicit request has to
-    // outrank the automatic flag even when an automatic job for the same
-    // recording is already queued, or resume would later drop the job the user
-    // asked for by hand.
-    if !isAutomatic, var existing = TranscriptionJob.load(for: recordingDirectory),
-      existing.isAutomatic
-    {
-      existing.isAutomatic = false
-      existing.save(for: recordingDirectory)
+    if !isAutomatic {
+      if let markManual = jobs[key]?.markManual {
+        markManual()
+        return
+      }
+      var queued = TranscriptionJob.load(for: recordingDirectory)
+      queued?.markManual(for: recordingDirectory)
     }
     guard jobs[key] == nil else { return }
     if TranscriptionJob.load(for: recordingDirectory) == nil {
@@ -543,7 +554,7 @@ final class TranscriptionCoordinator {
     // The sidecar is written either way, so a recording reported during quit is
     // picked up by the next launch rather than lost.
     guard !isSuspended else { return }
-    jobs[key] = Task { [weak self] in await self?.run(recordingDirectory) }
+    jobs[key] = InFlightJob(task: Task { [weak self] in await self?.run(recordingDirectory) })
   }
 
   // MARK: - Job Runner
@@ -569,6 +580,7 @@ final class TranscriptionCoordinator {
     // user another click, being wrong the other way spends their money.
     var job =
       TranscriptionJob.load(for: recordingDirectory) ?? TranscriptionJob(isAutomatic: true)
+    jobs[key]?.markManual = { job.markManual(for: recordingDirectory) }
 
     guard let audioURL = RecordingStore.audioURL(in: recordingDirectory) else {
       Log.error(Log.transcription, "transcription", "no audio file in \(name), dropping job")
@@ -594,7 +606,7 @@ final class TranscriptionCoordinator {
       // case this floor exists for - treating "cannot tell" as "long enough"
       // would let exactly those files through.
       let seconds = await dependencies.durationSeconds(audioURL)
-      if seconds ?? 0 < Self.minimumAutomaticSeconds {
+      if job.isAutomatic, seconds ?? 0 < Self.minimumAutomaticSeconds {
         let measured = seconds.map { String(format: "%.1fs", $0) } ?? "an unreadable duration"
         Log.info(
           Log.transcription, "transcription",

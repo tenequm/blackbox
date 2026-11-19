@@ -61,7 +61,6 @@ actor FakeTranscriptionService: TranscriptionServicing {
   ) async throws -> String {
     progressHandler = onProgress
     uploadCount += 1
-    if let uploadError { throw uploadError }
     uploadsInFlight += 1
     maxConcurrentUploads = max(maxConcurrentUploads, uploadsInFlight)
     defer { uploadsInFlight -= 1 }
@@ -74,6 +73,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
       try? await Task.sleep(for: .milliseconds(2))
       if !holdIgnoresCancellation { try Task.checkCancellation() }
     }
+    if let uploadError { throw uploadError }
     await afterUpload?()
     onProgress(.uploading(1))
     return "file-\(uploadCount)"
@@ -883,6 +883,65 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { coordinator.status(for: directory) == .completed }
 
     #expect(await harness.service.uploadCount == 1)
+  }
+
+  enum ManualRequestTiming: Sendable {
+    case duringUpload, duringBackoff
+  }
+
+  @Test(
+    "a manual request survives an upload retry with auto-transcribe turned off",
+    arguments: [ManualRequestTiming.duringUpload, .duringBackoff])
+  func manualRequestSurvivesRetry(timing: ManualRequestTiming) async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let backoff = AsyncStream<Void>.makeStream()
+    defer { backoff.continuation.finish() }
+    harness.sleepHandler = { _ in
+      for await _ in backoff.stream { break }
+    }
+    await harness.service.setHoldsUpload(true)
+    await harness.service.setUploadError(TranscriptionError.serverError(503, "busy"))
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: directory)
+    await harness.wait { await harness.service.uploadsInFlight == 1 }
+    try #require(await harness.service.uploadsInFlight == 1)
+    if timing == .duringUpload { coordinator.transcribe(recordingDirectory: directory) }
+    await harness.service.setHoldsUpload(false)
+
+    await harness.wait { TranscriptionJob.load(for: directory)?.attempts == 1 }
+    try #require(TranscriptionJob.load(for: directory)?.attempts == 1)
+    if timing == .duringBackoff { coordinator.transcribe(recordingDirectory: directory) }
+    #expect(TranscriptionJob.load(for: directory)?.isAutomatic == false)
+    harness.autoEnabled = false
+    await harness.service.setUploadError(nil)
+    backoff.continuation.finish()
+
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    #expect(TranscriptDocument.load(for: directory) != nil)
+    #expect(await harness.service.uploadCount == 2)
+    #expect(await harness.service.createCount == 1)
+  }
+
+  @Test("a later automatic trigger and setting change preserve a manual upload")
+  func automaticTriggerPreservesManualRequest() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    await harness.service.setHoldsUpload(true)
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { await harness.service.uploadsInFlight == 1 }
+    try #require(await harness.service.uploadsInFlight == 1)
+    coordinator.recordingFinished(recordingDirectory: directory)
+    harness.autoEnabled = false
+    await harness.service.setHoldsUpload(false)
+
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    #expect(TranscriptDocument.load(for: directory) != nil)
+    #expect(await harness.service.uploadCount == 1)
+    #expect(await harness.service.createCount == 1)
   }
 
   @Test("consent withdrawn during a retry wait stops the job before it bills")
