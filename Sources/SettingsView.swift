@@ -26,6 +26,7 @@ struct SettingsView: View {
   /// a synchronous Keychain round-trip in it pays `SecItemCopyMatching` every
   /// time this view's body runs.
   @State private var sonioxAPIKey = ""
+  @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
   @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
   @State private var keyCheck: APIKeyCheck = .untested
@@ -469,6 +470,19 @@ struct SettingsView: View {
           .buttonStyle(.link)
       }
 
+      Toggle("Label my voice as You", isOn: $micAttribution)
+        .help(
+          "Existing speaker names stay with their original speaker IDs. Renaming You applies to all speech labelled You."
+        )
+        .onChange(of: micAttribution) { _, enabled in
+          if !enabled { transcription.micAttributionDisabled() }
+        }
+      Text(
+        "Uses your microphone track to find your own speech. Experimental: works best with headphones."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
       Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
         .disabled(sonioxAPIKey.isEmpty)
       if sonioxAPIKey.isEmpty {
@@ -814,6 +828,7 @@ nonisolated enum SettingsKeys {
   static let notifyOnSaved = "notifyOnSaved"
   static let notifyOnError = "notifyOnError"
   static let excludedBundleIDs = "excludedBundleIDs"
+  static let micAttribution = "micAttribution"
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
   static let sonioxAPIKey = "sonioxAPIKey"

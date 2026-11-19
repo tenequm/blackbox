@@ -166,7 +166,7 @@ enum AECProcessor {
     let chunkSize = 1024
 
     let asset = AVURLAsset(url: inputURL)
-    let tracks = try loadAudioTracksBlocking(asset)
+    let tracks = try asset.loadAudioTracksBlocking()
     guard tracks.count >= 2 else {
       Log.info(Log.recorder, "aec", "single-track recording, skipping")
       return false
@@ -336,22 +336,6 @@ enum AECProcessor {
 
   // MARK: - Helpers
 
-  /// Synchronous track load for the blocking work queue. The async
-  /// `loadTracks` would resume on the cooperative pool, which is exactly what
-  /// this path must stay off of.
-  nonisolated private static func loadAudioTracksBlocking(_ asset: AVURLAsset) throws
-    -> [AVAssetTrack]
-  {
-    let done = DispatchSemaphore(value: 0)
-    nonisolated(unsafe) var result: Result<[AVAssetTrack], Error>?
-    asset.loadTracks(withMediaType: .audio) { tracks, error in
-      result = tracks.map(Result.success) ?? .failure(error ?? AECError.readFailed("no tracks"))
-      done.signal()
-    }
-    done.wait()
-    return try result!.get()
-  }
-
   nonisolated private static func extractSamples(from sampleBuffer: CMSampleBuffer) -> [Float] {
     guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return [] }
     let length = CMBlockBufferGetDataLength(blockBuffer)
@@ -461,5 +445,23 @@ enum AECError: Error, LocalizedError {
     case .readFailed(let msg): "AEC read failed: \(msg)"
     case .writeFailed(let msg): "AEC write failed: \(msg)"
     }
+  }
+}
+
+extension AVURLAsset {
+  /// Synchronous track load for the blocking work queue. The async
+  /// `loadTracks` would resume on the cooperative pool, which is exactly what
+  /// this path must stay off of.
+  nonisolated func loadAudioTracksBlocking() throws
+    -> [AVAssetTrack]
+  {
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: Result<[AVAssetTrack], Error>?
+    loadTracks(withMediaType: .audio) { tracks, error in
+      result = tracks.map(Result.success) ?? .failure(error ?? CocoaError(.fileReadCorruptFile))
+      done.signal()
+    }
+    done.wait()
+    return try result!.get()
   }
 }

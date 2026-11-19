@@ -704,6 +704,7 @@ struct RecordingDetailView: View {
   @State private var editedTitle = ""
 
   // Transcription
+  @AppStorage(SettingsKeys.micAttribution) private var micAttribution = false
   @State private var transcript: TranscriptDocument?
 
   var body: some View {
@@ -765,6 +766,12 @@ struct RecordingDetailView: View {
       // says the same thing.
       if recording.hasAudio { setupPlayer() }
       loadTranscript()
+      if let transcript {
+        transcription.refreshAttribution(in: recording.url, document: transcript)
+      }
+    }
+    .onChange(of: micAttribution) { _, enabled in
+      if enabled, transcript != nil { transcription.refreshAttribution(in: recording.url) }
     }
     // The cached metadata is the source for every write below, and `.id` is the
     // directory path, which a rename does not change - so renaming in the
@@ -1270,11 +1277,7 @@ struct RecordingDetailView: View {
   }
 
   private func speakerName(for speakerID: Int) -> String {
-    if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
-      return name
-    }
-    // `+ 1` on `Int.max` traps, and this value comes off disk.
-    return speakerID == -1 ? "You" : "Speaker \(speakerID &+ 1)"
+    TranscriptSegment.speakerName(for: speakerID, names: metadata?.speakers ?? [:])
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
@@ -1322,6 +1325,11 @@ struct RecordingDetailView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else if let transcript, !transcript.segments.isEmpty {
+        if micAttribution, transcript.tokens == nil {
+          Text("This transcript has no saved speaker tokens for local voice labelling.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         transcriptView(transcript)
       } else if case .error(let msg) = transcriptionStatus {
         VStack(spacing: 12) {

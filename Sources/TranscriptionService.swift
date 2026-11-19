@@ -131,7 +131,25 @@ nonisolated struct ExportedSegment: Codable, Sendable {
   var text: String
 }
 
+nonisolated struct TranscriptToken: Codable, Equatable, Sendable {
+  let text: String
+  let startMs: Double?
+  let endMs: Double?
+  let speaker: Int
+}
+
+nonisolated struct SpeakerAttribution: Codable, Sendable {
+  let version: Int
+  let parameters: MicActivity.Parameters
+  let sourceAudio: String
+  let localTokenIndices: [Int]
+  let appliedAt: Date
+}
+
 nonisolated struct TranscriptDocument: Codable, Sendable {
+  let tokens: [TranscriptToken]?
+  var sourceAudio: String?
+  var attribution: SpeakerAttribution?
   var segments: [TranscriptSegment]
   var language: String?
   var createdAt: Date
@@ -143,8 +161,9 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
 
   init(
     segments: [TranscriptSegment], language: String? = nil, createdAt: Date,
-    provider: String? = nil, model: String? = nil
+    provider: String? = nil, model: String? = nil, tokens: [TranscriptToken]? = nil
   ) {
+    self.tokens = tokens
     self.segments = segments
     self.language = language
     self.createdAt = createdAt
@@ -158,11 +177,42 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   /// by a re-billed one.
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    tokens = try? container.decodeIfPresent([TranscriptToken].self, forKey: .tokens)
+    attribution = try? container.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution)
+    sourceAudio = try? container.decodeIfPresent(String.self, forKey: .sourceAudio)
     segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
     language = try container.decodeIfPresent(String.self, forKey: .language)
     createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     provider = try container.decodeIfPresent(String.self, forKey: .provider)
     model = try container.decodeIfPresent(String.self, forKey: .model)
+  }
+
+  func project() -> [TranscriptSegment] {
+    guard let tokens else { return segments }
+    let local = Set(attribution?.localTokenIndices ?? [])
+    var projected: [TranscriptSegment] = []
+    var start = 0
+    while start < tokens.count {
+      let speaker = local.contains(start) ? -1 : tokens[start].speaker
+      var end = start + 1
+      while end < tokens.count, (local.contains(end) ? -1 : tokens[end].speaker) == speaker {
+        end += 1
+      }
+      let text = tokens[start..<end].map(\.text).joined().trimmingCharacters(in: .whitespaces)
+      if !text.isEmpty {
+        // The first provider token identifies this row across local re-projections.
+        let identity = (
+          createdAt.timeIntervalSinceReferenceDate.rounded(.down).bitPattern.bigEndian,
+          UInt64(start).bigEndian
+        )
+        let id = withUnsafeBytes(of: identity) { UUID(uuid: $0.loadUnaligned(as: uuid_t.self)) }
+        projected.append(
+          TranscriptSegment(
+            speaker: speaker, time: (tokens[start].startMs ?? 0) / 1000, text: text, id: id))
+      }
+      start = end
+    }
+    return projected
   }
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
@@ -193,8 +243,8 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
   var time: Double
   var text: String
 
-  init(speaker: Int, time: Double, text: String) {
-    self.id = UUID()
+  init(speaker: Int, time: Double, text: String, id: UUID = UUID()) {
+    self.id = id
     self.speaker = Self.clampSpeaker(speaker)
     self.time = Self.clampTime(time)
     self.text = text
@@ -217,6 +267,14 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
     self.speaker = Self.clampSpeaker((try? container.decode(Int.self, forKey: .speaker)) ?? 0)
     self.time = Self.clampTime((try? container.decode(Double.self, forKey: .time)) ?? 0)
     self.text = (try? container.decode(String.self, forKey: .text)) ?? ""
+  }
+
+  static func speakerName(for speakerID: Int, names: [String: String]) -> String {
+    if let name = names[String(speakerID)], !name.isEmpty {
+      return name
+    }
+    // `+ 1` on `Int.max` traps, and this value comes off disk.
+    return speakerID == -1 ? "You" : "Speaker \(speakerID &+ 1)"
   }
 
   /// Clamped at the parse boundary rather than in each formatter. `abs(Int.min)`
@@ -830,53 +888,13 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   }
 
   private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
-    var segments: [TranscriptSegment] = []
-    var currentSpeaker: Int?
-    var currentText = ""
-    var currentTime: Double = 0
-
-    for token in tokens {
-      // Skip translation tokens
-      if token["translation_status"] as? String == "translation" { continue }
-
-      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
-      let speaker: Int
-      if let s = token["speaker"] as? Int {
-        speaker = s
-      } else if let s = token["speaker"] as? String, let i = Int(s) {
-        speaker = i
-      } else {
-        speaker = 0
-      }
-      let text = token["text"] as? String ?? ""
-
-      if speaker != currentSpeaker {
-        if let s = currentSpeaker,
-          !currentText.trimmingCharacters(in: .whitespaces)
-            .isEmpty
-        {
-          segments.append(
-            TranscriptSegment(
-              speaker: s,
-              time: currentTime,
-              text: currentText.trimmingCharacters(in: .whitespaces)))
-        }
-        currentSpeaker = speaker
-        currentText = ""
-        currentTime = (token["start_ms"] as? Double ?? 0) / 1000.0
-      }
-      currentText += text
-    }
-
-    // Last segment
-    if let s = currentSpeaker,
-      !currentText.trimmingCharacters(in: .whitespaces).isEmpty
-    {
-      segments.append(
-        TranscriptSegment(
-          speaker: s,
-          time: currentTime,
-          text: currentText.trimmingCharacters(in: .whitespaces)))
+    let originals = tokens.compactMap { token -> TranscriptToken? in
+      guard token["translation_status"] as? String != "translation" else { return nil }
+      let speaker = token["speaker"] as? Int ?? (token["speaker"] as? String).flatMap(Int.init) ?? 0
+      return TranscriptToken(
+        text: token["text"] as? String ?? "",
+        startMs: Self.milliseconds(token["start_ms"]), endMs: Self.milliseconds(token["end_ms"]),
+        speaker: speaker)
     }
 
     let language =
@@ -885,8 +903,17 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
           && $0["translation_status"] as? String != "translation"
       })?["language"] as? String
 
-    return TranscriptDocument(
-      segments: segments, language: language, createdAt: Date())
+    var document = TranscriptDocument(
+      segments: [], language: language, createdAt: Date(), tokens: originals)
+    document.segments = document.project()
+    return document
+  }
+
+  private static func milliseconds(_ value: Any?) -> Double? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+      return nil
+    }
+    return number.doubleValue.isFinite ? number.doubleValue : nil
   }
 
   // MARK: - Cleanup

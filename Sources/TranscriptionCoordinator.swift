@@ -7,6 +7,7 @@ import Foundation
 /// A job interrupted by quit or a crash resumes from its persisted stage on the
 /// next launch instead of re-uploading audio that Soniox already holds.
 nonisolated struct TranscriptionJob: Codable, Sendable {
+  var sourceAudio: String?
   var fileId: String?
   var transcriptionId: String?
   var attempts: Int = 0
@@ -25,8 +26,10 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 
   init(
     fileId: String? = nil, transcriptionId: String? = nil, attempts: Int = 0,
-    isAutomatic: Bool = false, lastError: String? = nil, awaitingRemoteDelete: Bool = false
+    isAutomatic: Bool = false, lastError: String? = nil, awaitingRemoteDelete: Bool = false,
+    sourceAudio: String? = nil
   ) {
+    self.sourceAudio = sourceAudio
     self.fileId = fileId
     self.transcriptionId = transcriptionId
     self.attempts = attempts
@@ -43,6 +46,7 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// the format stays additive.
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    sourceAudio = try? container.decodeIfPresent(String.self, forKey: .sourceAudio)
     fileId = try container.decodeIfPresent(String.self, forKey: .fileId)
     transcriptionId = try container.decodeIfPresent(String.self, forKey: .transcriptionId)
     attempts = try container.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
@@ -135,6 +139,12 @@ final class TranscriptionCoordinator {
     /// scratch at four recording-sized files while still overlapping one job's
     /// network transmit with another's encode.
     var uploadConcurrency: Int = 2
+    var isMicAttributionEnabled: () -> Bool = {
+      UserDefaults.standard.bool(forKey: SettingsKeys.micAttribution)
+    }
+    var analyzeMic: @Sendable (URL, [TranscriptToken]) async throws -> SpeakerAttribution? =
+      MicActivity.analyze
+    var saveAttribution: (TranscriptDocument, URL) throws -> Void = { try $0.save(for: $1) }
   }
 
   // MARK: - Upload Gate
@@ -266,7 +276,13 @@ final class TranscriptionCoordinator {
   /// and delete remote artifacts for work that would otherwise resume.
   @ObservationIgnored private var isSuspended = false
 
-  func suspendNewJobs() { isSuspended = true }
+  @ObservationIgnored private var attributionTasks: [String: Task<Void, Never>] = [:]
+
+  func suspendNewJobs() {
+    isSuspended = true
+    for task in attributionTasks.values { task.cancel() }
+    attributionTasks.removeAll()
+  }
 
   @ObservationIgnored private let dependencies: Dependencies
   /// Outer nil means "not read yet". Cached because `hasAPIKey` is read from a
@@ -424,6 +440,7 @@ final class TranscriptionCoordinator {
   /// trash gets an empty job, and an empty job has no ids to delete - which
   /// left the uploaded audio on Soniox with nothing naming it.
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
+    attributionTasks.removeValue(forKey: recordingDirectory.path)?.cancel()
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
@@ -432,6 +449,9 @@ final class TranscriptionCoordinator {
   }
 
   func cancel(recordingDirectory: URL) {
+    let enrichment = attributionTasks.removeValue(forKey: recordingDirectory.path)
+    enrichment?.cancel()
+    if enrichment != nil && jobs[recordingDirectory.path] == nil { return }
     if let task = jobs[recordingDirectory.path] {
       // Marked synchronously. Cancellation is only observed at the next
       // suspension point, and an upload can sit inside one for minutes, so
@@ -646,6 +666,8 @@ final class TranscriptionCoordinator {
             return
           }
           statuses[key] = .mixing(fraction: 0)
+          job.sourceAudio = audioURL.lastPathComponent
+          job.save(for: recordingDirectory)
           job.fileId = try await service.upload(fileURL: audioURL) { [weak self] phase in
             Task { @MainActor [weak self] in
               self?.recordUploadProgress(phase, for: key)
@@ -676,7 +698,8 @@ final class TranscriptionCoordinator {
 
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
-        let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        var document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        document.sourceAudio = job.sourceAudio
 
         // The recording can be deleted while its job runs; writing the
         // transcript now would resurrect a file next to something that is
@@ -778,6 +801,89 @@ final class TranscriptionCoordinator {
     statuses[key] = status
     finishCounts[key, default: 0] += 1
     revision += 1
+    if status == .completed {
+      attributionTasks.removeValue(forKey: key)?.cancel()
+      if dependencies.isMicAttributionEnabled() {
+        refreshAttribution(in: URL(fileURLWithPath: key))
+      }
+    }
+  }
+
+  func micAttributionDisabled() {
+    for task in attributionTasks.values { task.cancel() }
+    attributionTasks.removeAll()
+    let root = dependencies.saveDirectory()
+    Task {
+      let directories = await Self.directoriesWithAttribution(in: root)
+      for directory in directories {
+        guard !dependencies.isMicAttributionEnabled(), !isSuspended else { return }
+        refreshAttribution(in: directory)
+        await Task.yield()
+      }
+    }
+  }
+
+  @concurrent
+  private static func directoriesWithAttribution(in root: URL) async -> [URL] {
+    RecordingStore.directories(in: root).filter {
+      TranscriptDocument.load(for: $0)?.attribution != nil
+    }
+  }
+
+  @discardableResult
+  func refreshAttribution(in directory: URL, document: TranscriptDocument? = nil) -> Task<
+    Void, Never
+  >? {
+    let key = directory.path
+    guard !isSuspended else { return nil }
+    if let pending = attributionTasks[key] { return pending }
+    if let document, !dependencies.isMicAttributionEnabled(), document.attribution == nil {
+      return nil
+    }
+    attributionTasks[key] = Task {
+      // Cancellation removes the entry synchronously. Its replacement owns the new entry.
+      defer { if !Task.isCancelled { attributionTasks[key] = nil } }
+      guard !Task.isCancelled, let saved = document ?? TranscriptDocument.load(for: directory)
+      else { return }
+      do {
+        let attribution: SpeakerAttribution?
+        if dependencies.isMicAttributionEnabled() {
+          guard saved.attribution?.version != MicActivity.version else { return }
+          guard let tokens = saved.tokens, saved.sourceAudio == RecordingStore.audioName else {
+            Log.info(
+              Log.transcription, "attribution",
+              "Skipping transcript without timed tokens on the raw capture")
+            return
+          }
+          attribution = try await dependencies.analyzeMic(
+            directory.appendingPathComponent(RecordingStore.audioName), tokens)
+          guard attribution != nil else {
+            Log.info(Log.transcription, "attribution", "Skipping unsupported or empty audio tracks")
+            return
+          }
+        } else {
+          guard saved.attribution != nil, saved.tokens != nil else { return }
+          attribution = nil
+        }
+        // Sidecar dates have whole-second precision. Compare tokens and source as well.
+        guard !Task.isCancelled, dependencies.isMicAttributionEnabled() == (attribution != nil),
+          var current = TranscriptDocument.load(for: directory),
+          current.createdAt == saved.createdAt,
+          current.tokens == saved.tokens, current.sourceAudio == saved.sourceAudio
+        else { return }
+        current.attribution = attribution
+        current.segments = current.project()
+        try dependencies.saveAttribution(current, directory)
+        finishCounts[key, default: 0] += 1
+      } catch {
+        if !Task.isCancelled {
+          Log.warning(
+            Log.transcription, "attribution",
+            "Could not update local speaker labels: \(error.localizedDescription)")
+        }
+      }
+    }
+    return attributionTasks[key]
   }
 
   /// Abandons a job without calling it a failure: the recording went away, the
