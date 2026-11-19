@@ -101,7 +101,8 @@ final class TranscriptionCoordinator {
       TranscriptionService(
         apiKey: key,
         model: TranscriptionService.resolvedModel(
-          UserDefaults.standard.string(forKey: SettingsKeys.sonioxModel)))
+          UserDefaults.standard.string(forKey: SettingsKeys.sonioxModel)),
+        contextURL: TranscriptionService.defaultContextURL)
     }
     var apiKey: () -> String? = {
       let key = KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey) ?? ""
@@ -135,6 +136,15 @@ final class TranscriptionCoordinator {
     /// scratch at four recording-sized files while still overlapping one job's
     /// network transmit with another's encode.
     var uploadConcurrency: Int = 2
+    /// Called once a transcript is on disk. The live value runs the user's
+    /// "after each transcript" command; tests capture the call instead, so a
+    /// developer's real hook never fires from a test run.
+    var onTranscriptSaved: (URL) -> Void = { directory in
+      guard !BlackboxTestMode.isEnabled else { return }
+      TranscriptHook.run(
+        for: directory,
+        path: UserDefaults.standard.string(forKey: SettingsKeys.transcriptHookPath))
+    }
   }
 
   // MARK: - Upload Gate
@@ -677,6 +687,9 @@ final class TranscriptionCoordinator {
         statuses[key] = .transcribing
         try await service.awaitCompletion(transcriptionId: transcriptionId)
         let document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+        // `fetchTranscript` does not check for cancellation itself, and past this
+        // point a late Cancel would still save and fire the after-transcript hook.
+        try Task.checkCancellation()
 
         // The recording can be deleted while its job runs; writing the
         // transcript now would resurrect a file next to something that is
@@ -711,6 +724,7 @@ final class TranscriptionCoordinator {
         releaseRemoteRecord(job, in: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
+        dependencies.onTranscriptSaved(recordingDirectory)
         return
       } catch {
         switch failurePolicy(for: error, attempts: job.attempts) {
@@ -920,5 +934,80 @@ final class TranscriptionCoordinator {
   /// 30s, 2m, 8m.
   nonisolated private static func backoff(forAttempt attempt: Int) -> Duration {
     .seconds(30 << (2 * max(0, attempt - 1)))
+  }
+}
+
+// MARK: - After-transcript hook
+
+/// Runs the user's "after each transcript" command, detached: Blackbox starts it
+/// and never waits, so a slow or stuck command cannot hold up transcription or
+/// quitting. It fires after every successful transcription, Transcribe Again
+/// included, so the command must be idempotent. The command learns which
+/// recording through environment variables, never through a shell line, so a
+/// recording title cannot inject anything. It inherits the app's minimal PATH.
+/// Output is appended to `hook.log` in the recording directory; nothing retries.
+nonisolated enum TranscriptHook {
+  static let logFileName = "hook.log"
+  static let recordingIDVariable = "BLACKBOX_RECORDING_ID"
+  static let recordingDirectoryVariable = "BLACKBOX_RECORDING_DIR"
+
+  /// The configured path as a runnable file, or nil when it is blank, missing,
+  /// a directory, or not executable.
+  static func executableURL(for path: String?) -> URL? {
+    let trimmed = (path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let url = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+      !isDirectory.boolValue, FileManager.default.isExecutableFile(atPath: url.path)
+    else { return nil }
+    return url
+  }
+
+  static func run(for recordingDirectory: URL, path: String?) {
+    let name = recordingDirectory.lastPathComponent
+    guard let executable = executableURL(for: path) else {
+      if !(path ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        Log.error(
+          Log.transcription, "hook",
+          "not running hook for \(name): \(path ?? "") is not an executable file")
+      }
+      return
+    }
+
+    let logPath = recordingDirectory.appendingPathComponent(logFileName).path
+    let descriptor = open(logPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
+    guard descriptor >= 0 else {
+      Log.error(
+        Log.transcription, "hook", "not running hook for \(name): cannot open \(logFileName)")
+      return
+    }
+    // The child gets its own copy at spawn, so the parent closes this as soon as
+    // `run()` returns instead of holding it for as long as the hook runs.
+    let log = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? log.close() }
+
+    let process = Process()
+    process.executableURL = executable
+    var environment = ProcessInfo.processInfo.environment
+    environment[recordingIDVariable] = name
+    environment[recordingDirectoryVariable] = recordingDirectory.path
+    process.environment = environment
+    process.currentDirectoryURL = recordingDirectory
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = log
+    process.standardError = log
+    process.terminationHandler = { finished in
+      Log.info(
+        Log.transcription, "hook", "hook for \(name) exited with \(finished.terminationStatus)")
+    }
+    do {
+      try process.run()
+      Log.info(Log.transcription, "hook", "started hook for \(name)")
+    } catch {
+      Log.error(
+        Log.transcription, "hook", "hook for \(name) failed to start: \(error.localizedDescription)"
+      )
+    }
   }
 }

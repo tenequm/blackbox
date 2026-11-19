@@ -28,6 +28,7 @@ struct SettingsView: View {
   @State private var sonioxAPIKey = ""
   @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
   @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
+  @AppStorage(SettingsKeys.transcriptHookPath) private var transcriptHookPath = ""
   @State private var keyCheck: APIKeyCheck = .untested
   @State private var revealAPIKey = false
   @State private var didCopyDiagnostics = false
@@ -468,6 +469,11 @@ struct SettingsView: View {
           .font(.caption)
           .buttonStyle(.link)
       }
+      Text(
+        "Vocabulary: a Soniox context JSON object at \((TranscriptionService.defaultContextURL.path as NSString).abbreviatingWithTildeInPath), such as {\"terms\": [\"Acme\"]}, is sent with each new transcription. A file that is not a JSON object, is over \(TranscriptionService.contextByteLimit) bytes, or that Soniox rejects is skipped."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
 
       Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
         .disabled(sonioxAPIKey.isEmpty)
@@ -482,6 +488,21 @@ struct SettingsView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
       }
+
+      TextField(
+        "Run after each transcript", text: $transcriptHookPath, prompt: Text("/path/to/executable"))
+      if !transcriptHookPath.trimmingCharacters(in: .whitespaces).isEmpty,
+        TranscriptHook.executableURL(for: transcriptHookPath) == nil
+      {
+        Text("Not an executable file, so nothing will run.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Text(
+        "Optional. Started without waiting after every successful transcription, Transcribe Again included, with \(TranscriptHook.recordingIDVariable) and \(TranscriptHook.recordingDirectoryVariable) set and a minimal PATH, so use absolute paths. Its output goes to \(TranscriptHook.logFileName) in the recording's folder."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
@@ -816,6 +837,7 @@ nonisolated enum SettingsKeys {
   static let excludedBundleIDs = "excludedBundleIDs"
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
+  static let transcriptHookPath = "transcriptHookPath"
   static let sonioxAPIKey = "sonioxAPIKey"
   static let playbackRate = "playbackRate"
   static let mainWindowTab = "mainWindowTab"
