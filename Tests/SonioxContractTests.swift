@@ -309,6 +309,36 @@ struct SonioxContractTests {
     #expect(body["client_reference_id"] as? String == "2026-03-11-call")
   }
 
+  @Test("a context file is sent as Soniox context; a bad one is left out")
+  func contextFileIsSentWhenValid() async throws {
+    let server = try StubHTTPServer { _ in .json(201, ["id": "t-1"]) }
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("blackbox-context-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let valid = directory.appendingPathComponent("valid.json")
+    try Data(#"{"terms":["GR8 Tech","Parimatch"]}"#.utf8).write(to: valid)
+    let broken = directory.appendingPathComponent("broken.json")
+    try Data("{terms".utf8).write(to: broken)
+    let oversized = directory.appendingPathComponent("oversized.json")
+    let manyTerms = Array(repeating: "Wallendoon Street", count: 700)
+    try JSONSerialization.data(withJSONObject: ["terms": manyTerms]).write(to: oversized)
+
+    for (url, expected) in [
+      (valid, ["GR8 Tech", "Parimatch"]), (broken, nil), (oversized, nil),
+      (directory.appendingPathComponent("missing.json"), nil),
+    ] as [(URL, [String]?)] {
+      let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL, contextURL: url)
+      _ = try await service.createTranscription(fileId: "f", reference: url.lastPathComponent)
+      let request = try #require(server.requests(path: "/v1/transcriptions").last)
+      let body = try #require(
+        try JSONSerialization.jsonObject(with: request.body) as? [String: Any])
+      let context = body["context"] as? [String: Any]
+      #expect(context?["terms"] as? [String] == expected, "\(url.lastPathComponent)")
+    }
+  }
+
   @Test("a blank configured model falls back to the default")
   func blankModelFallsBack() {
     #expect(TranscriptionService.resolvedModel(nil) == TranscriptionService.defaultModel)

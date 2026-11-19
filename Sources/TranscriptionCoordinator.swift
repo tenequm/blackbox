@@ -101,7 +101,8 @@ final class TranscriptionCoordinator {
       TranscriptionService(
         apiKey: key,
         model: TranscriptionService.resolvedModel(
-          UserDefaults.standard.string(forKey: SettingsKeys.sonioxModel)))
+          UserDefaults.standard.string(forKey: SettingsKeys.sonioxModel)),
+        contextURL: TranscriptionService.defaultContextURL)
     }
     var apiKey: () -> String? = {
       let key = KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey) ?? ""
@@ -135,6 +136,10 @@ final class TranscriptionCoordinator {
     /// scratch at four recording-sized files while still overlapping one job's
     /// network transmit with another's encode.
     var uploadConcurrency: Int = 2
+    /// Called once a transcript is on disk. The live value runs the user's
+    /// "after each transcript" command; tests capture the call instead, so a
+    /// developer's real hook never fires from a test run.
+    var onTranscriptSaved: (URL) -> Void = { TranscriptHook.run(for: $0) }
   }
 
   // MARK: - Upload Gate
@@ -711,6 +716,7 @@ final class TranscriptionCoordinator {
         releaseRemoteRecord(job, in: recordingDirectory)
         finish(key: key, status: .completed)
         Log.info(Log.transcription, "transcription", "transcribed \(name)")
+        dependencies.onTranscriptSaved(recordingDirectory)
         return
       } catch {
         switch failurePolicy(for: error, attempts: job.attempts) {
@@ -920,5 +926,68 @@ final class TranscriptionCoordinator {
   /// 30s, 2m, 8m.
   nonisolated private static func backoff(forAttempt attempt: Int) -> Duration {
     .seconds(30 << (2 * max(0, attempt - 1)))
+  }
+}
+
+// MARK: - After-transcript hook
+
+/// Runs the user's "after each transcript" command, detached: Blackbox starts it
+/// and never waits, so a slow or stuck command cannot hold up transcription or
+/// quitting. The command learns which recording through environment variables,
+/// never through a shell line, so a recording title can not inject anything.
+/// Its output goes to `hook.log` in the recording directory; nothing retries it.
+nonisolated enum TranscriptHook {
+  static let logFileName = "hook.log"
+
+  static func run(
+    for recordingDirectory: URL,
+    path: String? = UserDefaults.standard.string(forKey: SettingsKeys.transcriptHookPath)
+  ) {
+    let trimmed = (path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let executable = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+    let name = recordingDirectory.lastPathComponent
+    guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+      Log.error(
+        Log.transcription, "hook",
+        "not running hook for \(name): \(executable.path) is not executable")
+      return
+    }
+
+    let logURL = recordingDirectory.appendingPathComponent(logFileName)
+    if !FileManager.default.fileExists(atPath: logURL.path) {
+      FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    }
+    guard let log = try? FileHandle(forWritingTo: logURL) else {
+      Log.error(
+        Log.transcription, "hook", "not running hook for \(name): cannot open \(logFileName)")
+      return
+    }
+    _ = try? log.seekToEnd()
+
+    let process = Process()
+    process.executableURL = executable
+    var environment = ProcessInfo.processInfo.environment
+    environment["BLACKBOX_RECORDING_ID"] = name
+    environment["BLACKBOX_RECORDING_DIR"] = recordingDirectory.path
+    process.environment = environment
+    process.currentDirectoryURL = recordingDirectory
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = log
+    process.standardError = log
+    process.terminationHandler = { finished in
+      try? log.close()
+      Log.info(
+        Log.transcription, "hook", "hook for \(name) exited with \(finished.terminationStatus)")
+    }
+    do {
+      try process.run()
+      Log.info(Log.transcription, "hook", "started hook for \(name)")
+    } catch {
+      try? log.close()
+      Log.error(
+        Log.transcription, "hook", "hook for \(name) failed to start: \(error.localizedDescription)"
+      )
+    }
   }
 }

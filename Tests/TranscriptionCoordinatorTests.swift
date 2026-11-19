@@ -132,6 +132,8 @@ final class TranscriptionHarness {
   /// Captured by value in `makeCoordinator`, like `sleepHandler` - set it
   /// before building the coordinator.
   var uploadConcurrency = 2
+  /// Recordings the coordinator handed to the after-transcript hook.
+  var hookedDirectories: [URL] = []
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -163,7 +165,8 @@ final class TranscriptionHarness {
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
         durationSeconds: { [weak self] _ in await self?.duration },
         sweepTemporaryFiles: { [weak self] in await self?.sweepHandler?() },
-        uploadConcurrency: uploadConcurrency
+        uploadConcurrency: uploadConcurrency,
+        onTranscriptSaved: { [weak self] in self?.hookedDirectories.append($0) }
       ))
     return coordinator
   }
@@ -212,6 +215,66 @@ struct TranscriptionCoordinatorTests {
     #expect(await harness.service.deletedTranscriptionIds == ["transcription-1"])
     // The remote job is tagged with the recording it belongs to.
     #expect(await harness.service.references == ["call-1"])
+  }
+
+  @Test("the after-transcript hook fires once, only after the transcript is on disk")
+  func hookFiresAfterSave() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(harness.hookedDirectories == [directory])
+    #expect(TranscriptDocument.load(for: directory) != nil)
+  }
+
+  @Test("a failed transcription never fires the hook")
+  func hookSkipsFailures() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setUploadError(
+      TranscriptionError.balanceExhausted("prepaid balance is zero"))
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait {
+      if case .error = coordinator.status(for: directory) { return true }
+      return false
+    }
+
+    #expect(harness.hookedDirectories.isEmpty)
+  }
+
+  @Test("the hook command gets the recording through its environment and logs to hook.log")
+  func hookRunsCommandWithEnvironment() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let script = harness.root.appendingPathComponent("hook.sh")
+    try "#!/bin/sh\necho \"id=$BLACKBOX_RECORDING_ID dir=$BLACKBOX_RECORDING_DIR\"\n"
+      .write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    TranscriptHook.run(for: directory, path: script.path)
+
+    let log = directory.appendingPathComponent(TranscriptHook.logFileName)
+    await harness.wait {
+      ((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains("dir=")
+    }
+    let output = try String(contentsOf: log, encoding: .utf8)
+    #expect(output.contains("id=call-1 dir=\(directory.path)"))
+  }
+
+  @Test("a blank or non-executable hook path runs nothing")
+  func hookIgnoresBadPaths() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    TranscriptHook.run(for: directory, path: "  ")
+    TranscriptHook.run(for: directory, path: harness.root.appendingPathComponent("missing").path)
+    #expect(
+      !FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(TranscriptHook.logFileName).path))
   }
 
   @Test("a 409 while fetching the transcript is retried, not treated as failure")

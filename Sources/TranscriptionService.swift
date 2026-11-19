@@ -400,6 +400,9 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   private let apiKey: String
   private let model: String
   private let baseURL: String
+  /// Optional Soniox `context` (terms, general, text) sent with every job. Nil in
+  /// tests so a contract test never reads the user's real file.
+  private let contextURL: URL?
   private static let mixPrefix = "blackbox-mixed-"
   /// Prefixed like its sibling. `temporaryDirectory` is the user's shared
   /// `$TMPDIR` for a non-sandboxed app, so sweeping a bare `.multipart` suffix
@@ -447,11 +450,47 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   /// `baseURL` is injectable so the contract tests can point the client at a
   /// loopback stub that speaks the documented Soniox wire format.
-  init(apiKey: String, model: String = defaultModel, baseURL: String = defaultBaseURL) {
+  init(
+    apiKey: String, model: String = defaultModel, baseURL: String = defaultBaseURL,
+    contextURL: URL? = nil
+  ) {
     Self.assertEgressAllowed(baseURL)
     self.apiKey = apiKey
     self.model = model
     self.baseURL = baseURL
+    self.contextURL = contextURL
+  }
+
+  /// A hand-edited JSON file holding Soniox's `context` object as-is, typically
+  /// `{"terms": [...]}` with the names and product words speech-to-text mangles.
+  static let defaultContextURL = URL(
+    fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/Blackbox/context.json")
+  /// Soniox rejects a context over 8,000 tokens with `invalid_request`; ~10,000
+  /// characters is its own rule of thumb. Checked locally so a grown vocabulary
+  /// costs the context, never the transcription.
+  static let contextCharacterLimit = 10_000
+
+  /// Read on every job, so an edit applies from the next recording. Anything
+  /// wrong with the file - missing, not a JSON object, too large - means no
+  /// context, never a failed job.
+  static func loadContext(from url: URL?) -> [String: Any]? {
+    guard let url, let data = try? Data(contentsOf: url) else { return nil }
+    guard let text = String(data: data, encoding: .utf8), text.count <= contextCharacterLimit
+    else {
+      Log.warning(
+        Log.transcription, "transcription",
+        "ignoring \(url.lastPathComponent): over \(contextCharacterLimit) characters")
+      return nil
+    }
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      !object.isEmpty
+    else {
+      Log.warning(
+        Log.transcription, "transcription",
+        "ignoring \(url.lastPathComponent): not a non-empty JSON object")
+      return nil
+    }
+    return object
   }
 
   /// Checks a key without spending anything: the file list is the cheapest
@@ -713,7 +752,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   @concurrent
   func createTranscription(fileId: String, reference: String) async throws -> String {
-    let config: [String: Any] = [
+    var config: [String: Any] = [
       "model": model,
       "file_id": fileId,
       "enable_language_identification": true,
@@ -722,6 +761,9 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
       // client loses track of is still identifiable in the Soniox console.
       "client_reference_id": String(reference.prefix(Self.referenceLimit)),
     ]
+    if let context = Self.loadContext(from: contextURL) {
+      config["context"] = context
+    }
 
     var request = try makeRequest(.post, "/v1/transcriptions")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")

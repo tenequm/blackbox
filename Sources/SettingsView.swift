@@ -28,6 +28,7 @@ struct SettingsView: View {
   @State private var sonioxAPIKey = ""
   @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
   @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
+  @AppStorage(SettingsKeys.transcriptHookPath) private var transcriptHookPath = ""
   @State private var keyCheck: APIKeyCheck = .untested
   @State private var revealAPIKey = false
   @State private var didCopyDiagnostics = false
@@ -482,6 +483,14 @@ struct SettingsView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
       }
+
+      TextField(
+        "Run after each transcript", text: $transcriptHookPath, prompt: Text("/path/to/executable"))
+      Text(
+        "Optional. Started without waiting once a transcript is saved, with BLACKBOX_RECORDING_ID and BLACKBOX_RECORDING_DIR set; its output goes to hook.log in the recording's folder. Spelling: ~/Library/Application Support/Blackbox/context.json, if present, is sent to Soniox as context."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
@@ -816,6 +825,7 @@ nonisolated enum SettingsKeys {
   static let excludedBundleIDs = "excludedBundleIDs"
   static let autoTranscribe = "autoTranscribe"
   static let sonioxModel = "sonioxModel"
+  static let transcriptHookPath = "transcriptHookPath"
   static let sonioxAPIKey = "sonioxAPIKey"
   static let playbackRate = "playbackRate"
   static let mainWindowTab = "mainWindowTab"
