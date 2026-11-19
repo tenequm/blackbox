@@ -7,17 +7,6 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   nonisolated struct WindowTitle: Codable, Sendable, Equatable {
     let at: TimeInterval
     let title: String
-
-    init(at: TimeInterval, title: String) {
-      self.at = at
-      self.title = title
-    }
-
-    init(from decoder: Decoder) throws {
-      let container = try decoder.container(keyedBy: CodingKeys.self)
-      at = try container.decodeIfPresent(TimeInterval.self, forKey: .at) ?? 0
-      title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
-    }
   }
 
   var title: String
@@ -30,7 +19,7 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   private(set) var windowTitles: [WindowTitle]?
 
   static let fileName = "metadata.json"
-  private static let directoryKey = CodingUserInfoKey(rawValue: "recordingDirectory")!
+  static let windowTitleLimit = 200
 
   init(
     title: String, createdAt: Date, appName: String, speakers: [String: String],
@@ -57,24 +46,24 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
-    let directory = decoder.userInfo[Self.directoryKey] as? URL
-    createdAt =
-      try container.decodeIfPresent(Date.self, forKey: .createdAt)
-      ?? (try? directory?.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     appName = try container.decodeIfPresent(String.self, forKey: .appName) ?? ""
     speakers = try container.decodeIfPresent([String: String].self, forKey: .speakers) ?? [:]
     perAppBundleID = try container.decodeIfPresent(String.self, forKey: .perAppBundleID)
     perAppName = try container.decodeIfPresent(String.self, forKey: .perAppName)
     trackCount = try container.decodeIfPresent(Int.self, forKey: .trackCount)
-    windowTitles = try container.decodeIfPresent([WindowTitle].self, forKey: .windowTitles)
+    windowTitles = try? container.decode([WindowTitle].self, forKey: .windowTitles)
   }
 
   @discardableResult
   mutating func recordWindowTitles(_ titles: [String], at seconds: TimeInterval) -> Bool {
+    let remaining = Self.windowTitleLimit - (windowTitles?.count ?? 0)
+    guard remaining > 0 else { return false }
     var seen = Set(windowTitles?.map(\.title) ?? [])
-    let additions = titles.compactMap { title -> WindowTitle? in
-      guard !title.isEmpty, seen.insert(title).inserted else { return nil }
-      return WindowTitle(at: seconds, title: title)
+    var additions: [WindowTitle] = []
+    for title in titles where !title.isEmpty && seen.insert(title).inserted {
+      additions.append(WindowTitle(at: seconds, title: title))
+      if additions.count == remaining { break }
     }
     guard !additions.isEmpty else { return false }
     windowTitles = (windowTitles ?? []) + additions
@@ -85,7 +74,6 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     let url = directory.appendingPathComponent(fileName)
     guard let data = try? Data(contentsOf: url) else { return nil }
     let decoder = JSONDecoder()
-    decoder.userInfo[directoryKey] = directory
     decoder.dateDecodingStrategy = .iso8601
     return try? decoder.decode(RecordingMetadata.self, from: data)
   }
@@ -164,6 +152,8 @@ nonisolated struct ExportedSegment: Codable, Sendable {
   var speaker: String
   var time: String
   var text: String
+
+  var plainText: String { "[\(time)] \(speaker): \(text)" }
 }
 
 nonisolated struct TranscriptDocument: Codable, Sendable {
@@ -204,6 +194,10 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     recordingURL.appendingPathComponent("transcript.json")
   }
 
+  nonisolated static func plainTextURL(for recordingURL: URL) -> URL {
+    recordingURL.appendingPathComponent("transcript.txt")
+  }
+
   nonisolated static func load(for recordingURL: URL) -> TranscriptDocument? {
     let url = sidecarURL(for: recordingURL)
     guard let data = try? Data(contentsOf: url) else { return nil }
@@ -218,29 +212,24 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     encoder.dateEncodingStrategy = .iso8601
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(self)
-    let textURL = recordingURL.appendingPathComponent("transcript.txt")
-    let previousText: Data?
+    try data.write(to: url, options: .atomic)
+    savePlainText(for: recordingURL, metadata: RecordingMetadata.load(in: recordingURL))
+  }
+
+  func savePlainText(for directory: URL, metadata: RecordingMetadata?) {
+    let url = Self.plainTextURL(for: directory)
     do {
-      previousText = try Data(contentsOf: textURL)
-    } catch CocoaError.fileReadNoSuchFile {
-      previousText = nil
-    }
-    try plainText(for: recordingURL).write(to: textURL, atomically: true, encoding: .utf8)
-    do {
-      try data.write(to: url, options: .atomic)
+      try plainText(for: directory, metadata: metadata).write(
+        to: url, atomically: true, encoding: .utf8)
     } catch {
-      // A failed re-transcription must leave the previous pair together.
-      if let previousText {
-        try previousText.write(to: textURL, options: .atomic)
-      } else {
-        try FileManager.default.removeItem(at: textURL)
-      }
-      throw error
+      // A directory at the companion path can cause this failure. Never remove its contents.
+      _ = Darwin.remove(url.path)
+      Log.error(
+        Log.app, "transcription", "could not save text transcript: \(error.localizedDescription)")
     }
   }
 
-  private func plainText(for directory: URL) -> String {
-    let metadata = RecordingMetadata.load(in: directory)
+  private func plainText(for directory: URL, metadata: RecordingMetadata?) -> String {
     let start =
       metadata?.createdAt
       ?? (try? directory.resourceValues(forKeys: [.creationDateKey]).creationDate)
@@ -249,16 +238,14 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
       "# Recording: \(directory.lastPathComponent)",
       "# App: \(app.isEmpty ? "Unknown" : app)",
       "# Start (UTC): \(start?.ISO8601Format() ?? "Unknown")",
-      "# Soniox model: \(model ?? "Unknown")",
+      "# \(provider ?? "Unknown") model: \(model ?? "Unknown")",
       "# Language: \(language ?? "Unknown")",
       "",
     ]
     for segment in segments {
-      let seconds = Int(segment.time)
-      let time = String(format: "%d:%02d", seconds / 60, seconds % 60)
-      let text = segment.text.split(whereSeparator: \.isNewline).joined(separator: " ")
-      lines.append(
-        "[\(time)] \(TranscriptSegment.defaultSpeakerName(for: segment.speaker)): \(text)")
+      var exported = segment.exported(using: metadata)
+      exported.text = exported.text.split(whereSeparator: \.isNewline).joined(separator: " ")
+      lines.append(exported.plainText)
     }
     return lines.joined(separator: "\n") + "\n"
   }
@@ -271,7 +258,17 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
   var text: String
 
   static func defaultSpeakerName(for id: Int) -> String {
+    // `+ 1` on `Int.max` traps, and this value comes off disk.
     id == -1 ? "You" : "Speaker \(id &+ 1)"
+  }
+
+  func speakerName(in metadata: RecordingMetadata?) -> String {
+    if let name = metadata?.speakers[String(speaker)], !name.isEmpty { return name }
+    return Self.defaultSpeakerName(for: speaker)
+  }
+
+  func exported(using metadata: RecordingMetadata?) -> ExportedSegment {
+    ExportedSegment(speaker: speakerName(in: metadata), time: formatHMS(time), text: text)
   }
 
   init(speaker: Int, time: Double, text: String) {

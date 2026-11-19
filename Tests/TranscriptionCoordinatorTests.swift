@@ -869,33 +869,46 @@ struct TranscriptionCoordinatorTests {
     #expect(loaded.windowTitles == nil)
   }
 
+  @Test("a malformed window title loses only the title history")
+  func metadataSurvivesMalformedWindowTitle() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let json = #"{"title":"Standup","speakers":{"0":"Alex"},"windowTitles":[{"at":1,"title":42}]}"#
+    try Data(json.utf8).write(to: directory.appendingPathComponent(RecordingMetadata.fileName))
+    let metadata = try #require(RecordingMetadata.load(in: directory))
+    #expect(metadata.title == "Standup")
+    #expect(metadata.speakers == ["0": "Alex"])
+    #expect(metadata.windowTitles == nil)
+  }
+
   @Test("saving a transcript writes and replaces the readable companion")
   func savesPlainTextTranscript() throws {
     let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call-1")
     try RecordingMetadata(
-      title: "Standup", createdAt: Date(timeIntervalSince1970: 0), appName: "Meet", speakers: [:]
+      title: "Standup", createdAt: Date(timeIntervalSince1970: 0), appName: "Meet",
+      speakers: ["0": "Alex"]
     )
     .save(in: directory)
     var document = TranscriptDocument(
       segments: [
         TranscriptSegment(speaker: -1, time: 0.92, text: "Hello"),
         TranscriptSegment(speaker: 0, time: 3605.9, text: "Hi\r\nthere"),
-      ], language: "en", createdAt: Date(), provider: "Soniox", model: "stt-async-v4")
+      ], language: "en", createdAt: Date(), provider: "Test Provider", model: "test-model")
     try document.save(for: directory)
 
-    let url = directory.appendingPathComponent("transcript.txt")
+    let url = TranscriptDocument.plainTextURL(for: directory)
     let text = try String(contentsOf: url, encoding: .utf8)
     #expect(
       text == """
         # Recording: call-1
         # App: Meet
         # Start (UTC): 1970-01-01T00:00:00Z
-        # Soniox model: stt-async-v4
+        # Test Provider model: test-model
         # Language: en
 
         [0:00] You: Hello
-        [60:05] Speaker 1: Hi there
+        [1:00:05] Alex: Hi there
 
         """)
 
@@ -907,18 +920,35 @@ struct TranscriptionCoordinatorTests {
     #expect(TranscriptDocument.load(for: directory)?.segments.map(\.text) == ["Replacement"])
   }
 
-  @Test("a failed JSON write rolls back the plain text companion", arguments: [true, false])
-  func rollsBackPlainText(hadText: Bool) throws {
+  @Test("a JSON write failure preserves the text companion and reports the JSON path")
+  func jsonWriteFailurePreservesText() throws {
     let harness = try TranscriptionHarness()
     let directory = try harness.makeRecording("call-1")
-    let textURL = directory.appendingPathComponent("transcript.txt")
+    let textURL = TranscriptDocument.plainTextURL(for: directory)
     let original = Data("previous transcript".utf8)
-    if hadText { try original.write(to: textURL) }
-    try FileManager.default.createDirectory(
-      at: TranscriptDocument.sidecarURL(for: directory), withIntermediateDirectories: false)
+    try original.write(to: textURL)
+    let jsonURL = TranscriptDocument.sidecarURL(for: directory)
+    try FileManager.default.createDirectory(at: jsonURL, withIntermediateDirectories: false)
     let document = TranscriptDocument(segments: [], createdAt: Date())
-    #expect(throws: (any Error).self) { try document.save(for: directory) }
-    #expect((try? Data(contentsOf: textURL)) == (hadText ? original : nil))
+    #expect {
+      try document.save(for: directory)
+    } throws: { error in
+      (error as? CocoaError)?.filePath == jsonURL.path
+    }
+    #expect(try Data(contentsOf: textURL) == original)
+  }
+
+  @Test("a text write failure keeps the updated JSON and removes the failed companion")
+  func textWriteFailurePreservesJSON() throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let textURL = TranscriptDocument.plainTextURL(for: directory)
+    try FileManager.default.createDirectory(at: textURL, withIntermediateDirectories: false)
+    let document = TranscriptDocument(
+      segments: [.init(speaker: 1, time: 2, text: "Saved")], createdAt: Date())
+    try document.save(for: directory)
+    #expect(TranscriptDocument.load(for: directory)?.segments.map(\.text) == ["Saved"])
+    #expect(!FileManager.default.fileExists(atPath: textURL.path))
   }
 
   @Test("a transcript written before a field existed still decodes")

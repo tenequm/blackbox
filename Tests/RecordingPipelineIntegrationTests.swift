@@ -64,18 +64,34 @@ struct RecordingPipelineIntegrationTests {
     let (pipeline, root) = try makePipeline()
     defer { try? FileManager.default.removeItem(at: root) }
     let directory = try pipeline.start(windowTitles: ["  Call  ", "", "  Call  ", "Chat"])
-    var metadata = try #require(RecordingMetadata.load(in: directory))
-    let repeated = metadata.recordWindowTitles(["Chat", ""], at: 30)
-    let added = metadata.recordWindowTitles(["Review", "  Call  ", "Review"], at: 60.5)
-    #expect(!repeated)
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      defer { group.addTask { _ = await pipeline.stop() } }
+      var metadata = try #require(RecordingMetadata.load(in: directory))
+      let repeated = metadata.recordWindowTitles(["Chat", ""], at: 30)
+      let added = metadata.recordWindowTitles(["Review", "  Call  ", "Review"], at: 60.5)
+      #expect(!repeated)
+      #expect(added)
+      try metadata.save(in: directory)
+      #expect(
+        RecordingMetadata.load(in: directory)?.windowTitles == [
+          .init(at: 0, title: "  Call  "), .init(at: 0, title: "Chat"),
+          .init(at: 60.5, title: "Review"),
+        ])
+    }
+  }
+
+  @Test("a sample stops appending titles when the history reaches 200 entries")
+  func windowTitleHistoryLimit() {
+    var metadata = RecordingMetadata(
+      title: "Call", createdAt: Date(), appName: "Meet", speakers: [:])
+    metadata.recordWindowTitles(["First"], at: 0)
+    let titles = (1...200).map { "Title \($0)" }
+    let added = metadata.recordWindowTitles(titles, at: 30)
     #expect(added)
-    try metadata.save(in: directory)
-    #expect(
-      RecordingMetadata.load(in: directory)?.windowTitles == [
-        .init(at: 0, title: "  Call  "), .init(at: 0, title: "Chat"),
-        .init(at: 60.5, title: "Review"),
-      ])
-    _ = await pipeline.stop()
+    #expect(metadata.windowTitles?.count == 200)
+    #expect(metadata.windowTitles?.last == .init(at: 30, title: "Title 199"))
+    let addedAfterLimit = metadata.recordWindowTitles(["Later"], at: 60)
+    #expect(!addedAfterLimit)
   }
 
   /// Pins the shape of what `stop()` hands back, which every consumer of a
