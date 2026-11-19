@@ -295,14 +295,90 @@ final class TranscriptionCoordinator {
   @ObservationIgnored private var settledAttributions: [String: AttributionFiles] = [:]
   @ObservationIgnored private var restoreSweep: Task<Void, Never>?
 
-  func prepareForTermination() {
-    isSuspended = true
-    endPendingAttributions()
+  private struct RecordingsMove {
+    let source: URL
+    let destination: URL
+    var owedHooks: [String: Int] = [:]
   }
 
-  func endPendingAttributions() {
+  private var recordingsMove: RecordingsMove?
+  var isMovingRecordings: Bool { recordingsMove != nil }
+
+  func prepareForTermination() {
+    isSuspended = true
+    for directory in cancelPendingAttributions() { dependencies.onTranscriptSaved(directory) }
+    if let move = recordingsMove {
+      for path in move.owedHooks.keys {
+        let source = URL(fileURLWithPath: path)
+        let target = move.destination.appendingPathComponent(source.lastPathComponent)
+        fireMoveHooks(
+          for: source, at: FileManager.default.fileExists(atPath: path) ? source : target)
+      }
+    }
+  }
+
+  private func cancelPendingAttributions() -> [URL] {
     restoreSweep?.cancel()
-    for key in attributionTasks.keys { endAttribution(for: key, fireHook: true) }
+    let owed = attributionTasks.values.compactMap(\.hookDirectory)
+    for key in attributionTasks.keys { endAttribution(for: key, fireHook: false) }
+    return owed
+  }
+
+  func moveRecordings(
+    from source: URL, to destination: URL,
+    moveItem: @Sendable (URL, URL) async throws -> Void = moveRecordingItem
+  ) async -> [String] {
+    recordingsMove = RecordingsMove(source: source, destination: destination)
+    for directory in cancelPendingAttributions() { dispatchPaidHook(in: directory) }
+    defer {
+      if let move = recordingsMove {
+        for path in move.owedHooks.keys {
+          let directory = URL(fileURLWithPath: path)
+          fireMoveHooks(for: directory, at: directory)
+        }
+      }
+      recordingsMove = nil
+      restoreProviderSpeakersIfPending()
+    }
+    let directories = await Task.detached { RecordingStore.directories(in: source) }.value
+    var failed: [String] = []
+    for directory in directories {
+      guard !isSuspended else { break }
+      let target = destination.appendingPathComponent(directory.lastPathComponent)
+      do {
+        try await moveItem(directory, target)
+        fireMoveHooks(for: directory, at: target)
+      } catch {
+        failed.append(directory.lastPathComponent)
+        Log.error(
+          Log.app, "settings",
+          "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
+        fireMoveHooks(for: directory, at: directory)
+      }
+    }
+    return failed
+  }
+
+  @concurrent
+  private static func moveRecordingItem(from source: URL, to destination: URL) async throws {
+    try FileManager.default.moveItem(at: source, to: destination)
+  }
+
+  private func dispatchPaidHook(in directory: URL) {
+    if let source = recordingsMove?.source,
+      directory.deletingLastPathComponent().path == source.path, !isSuspended
+    {
+      recordingsMove?.owedHooks[directory.path, default: 0] += 1
+    } else {
+      dependencies.onTranscriptSaved(directory)
+    }
+  }
+
+  private func fireMoveHooks(for source: URL, at directory: URL) {
+    guard let count = recordingsMove?.owedHooks.removeValue(forKey: source.path),
+      FileManager.default.fileExists(atPath: TranscriptDocument.sidecarURL(for: directory).path)
+    else { return }
+    for _ in 0..<count { dependencies.onTranscriptSaved(directory) }
   }
 
   @ObservationIgnored private let dependencies: Dependencies
@@ -463,6 +539,7 @@ final class TranscriptionCoordinator {
   /// left the uploaded audio on Soniox with nothing naming it.
   func forgetDeletedRecording(recordingDirectory: URL, job: TranscriptionJob?) {
     endAttribution(for: recordingDirectory.path, fireHook: false)
+    recordingsMove?.owedHooks[recordingDirectory.path] = nil
     settledAttributions[recordingDirectory.path] = nil
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
@@ -862,7 +939,7 @@ final class TranscriptionCoordinator {
     guard let pending = attributionTasks.removeValue(forKey: key) else { return }
     pending.timeout?.cancel()
     pending.task?.cancel()
-    if fireHook, let directory = pending.hookDirectory { dependencies.onTranscriptSaved(directory) }
+    if fireHook, let directory = pending.hookDirectory { dispatchPaidHook(in: directory) }
   }
 
   func cancelLazyAnalysis(in directory: URL) {
@@ -893,7 +970,8 @@ final class TranscriptionCoordinator {
 
   @discardableResult
   func restoreProviderSpeakersIfPending() -> Task<Void, Never>? {
-    guard restorePending, !dependencies.isMicAttributionEnabled(), !isSuspended else { return nil }
+    guard restorePending, !dependencies.isMicAttributionEnabled(), !isMovingRecordings, !isSuspended
+    else { return nil }
     restoreSweep?.cancel()
     let root = dependencies.saveDirectory()
     let sweep = Task(priority: .utility) {
@@ -926,7 +1004,8 @@ final class TranscriptionCoordinator {
     let document = finishPaidSave()
     let enabled = dependencies.isMicAttributionEnabled()
     attributionTasks[key] = PendingAttribution(enabled: enabled, hookDirectory: directory)
-    guard !isSuspended, enabled, let document, let tokens = document.fetchedTokens,
+    guard !isSuspended, !isMovingRecordings, enabled, let document,
+      let tokens = document.fetchedTokens,
       let files = AttributionFiles(in: directory, enabled: true)
     else {
       endAttribution(for: key, fireHook: true)
@@ -955,7 +1034,8 @@ final class TranscriptionCoordinator {
       if pending.enabled == enabled { return pending.task }
       endAttribution(for: key, fireHook: true)
     }
-    guard !isSuspended, let files = AttributionFiles(in: directory, enabled: enabled),
+    guard !isSuspended, !isMovingRecordings,
+      let files = AttributionFiles(in: directory, enabled: enabled),
       settledAttributions[key] != files
     else { return nil }
     attributionTasks[key] = PendingAttribution(enabled: enabled, hookDirectory: nil)

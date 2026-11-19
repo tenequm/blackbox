@@ -390,6 +390,7 @@ struct SettingsView: View {
           .truncationMode(.head)
         Spacer()
         Button("Choose…") { pickFolder() }
+          .disabled(transcription.isMovingRecordings)
       }
       if let stats = storageStats {
         Text(
@@ -653,30 +654,13 @@ struct SettingsView: View {
       actionError = "Recording in progress. Existing recordings were left where they are."
       return
     }
-    transcription.endPendingAttributions()
-    Task.detached {
-      var failed: [String] = []
-      for directory in RecordingStore.directories(in: source) {
-        let target = destination.appendingPathComponent(directory.lastPathComponent)
-        do {
-          try FileManager.default.moveItem(at: directory, to: target)
-        } catch {
-          // Was `try?`. This is the most destructive bulk operation in the app,
-          // and a partial move split the library across two folders silently.
-          failed.append(directory.lastPathComponent)
-          Log.error(
-            Log.app, "settings",
-            "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
-        }
-      }
+    Task {
+      let failed = await transcription.moveRecordings(from: source, to: destination)
       if !failed.isEmpty {
-        let names = failed
-        await MainActor.run {
-          actionError =
-            names.count == 1
-            ? "Could not move \"\(names[0])\". It is still in the old folder."
-            : "Could not move \(names.count) recordings. They are still in the old folder."
-        }
+        actionError =
+          failed.count == 1
+          ? "Could not move \"\(failed[0])\". It is still in the old folder."
+          : "Could not move \(failed.count) recordings. They are still in the old folder."
       }
     }
   }

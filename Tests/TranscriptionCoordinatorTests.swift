@@ -1502,13 +1502,17 @@ struct AttributionCoordinatorTests {
     private var waiting: [CheckedContinuation<Void, Never>] = []
 
     func analyze(audio: URL, tokens: [TranscriptToken]) async -> SpeakerAttribution {
-      calls += 1
-      if !isOpen { await withCheckedContinuation { waiting.append($0) } }
+      await waitForRelease()
       return SpeakerAttribution(
         version: MicActivity.version, parameters: .init(),
         thresholds: TestFixtures.thresholds,
         localTokenIndices: Array(tokens.indices),
         appliedAt: Date())
+    }
+
+    func waitForRelease() async {
+      calls += 1
+      if !isOpen { await withCheckedContinuation { waiting.append($0) } }
     }
 
     func release() {
@@ -1519,7 +1523,7 @@ struct AttributionCoordinatorTests {
   }
 
   private enum Interruption: CaseIterable {
-    case quit, move, delete, replace, saveFailure, disable
+    case quit, delete, replace, saveFailure, disable
   }
 
   @Test(arguments: Interruption.allCases)
@@ -1557,11 +1561,6 @@ struct AttributionCoordinatorTests {
     case .quit:
       coordinator.prepareForTermination()
       #expect(harness.speakersAtHook == [[1]])
-    case .move:
-      coordinator.endPendingAttributions()
-      #expect(harness.speakersAtHook == [[1]])
-      try FileManager.default.moveItem(
-        at: directory, to: harness.root.appendingPathComponent("moved"))
     case .delete:
       try FileManager.default.removeItem(at: directory)
       coordinator.forgetDeletedRecording(recordingDirectory: directory, job: nil)
@@ -1579,7 +1578,7 @@ struct AttributionCoordinatorTests {
     await pending.value
     #expect(harness.hookedDirectories == (action == .delete ? [] : [directory]))
     #expect(saveAttempts == (action == .saveFailure ? 1 : 0))
-    if action == .delete || action == .move {
+    if action == .delete {
       #expect(!FileManager.default.fileExists(atPath: directory.path))
     } else if action == .replace {
       #expect(TranscriptDocument.load(for: directory)?.segments.first?.text == "new")
@@ -1592,6 +1591,104 @@ struct AttributionCoordinatorTests {
     }
     #expect(TranscriptionJob.load(for: directory) == nil)
     #expect(coordinator.finishCount(for: directory) == 1)
+  }
+
+  @Test(arguments: [true, false])
+  func moveDeliversEachPaidHookAtTheSurvivingDirectory(succeeds: Bool) async throws {
+    let oldFolder = try TranscriptionHarness()
+    let harness = try TranscriptionHarness()
+    harness.micEnabled = true
+    let analysisGate = AnalysisGate()
+    harness.analyzeMic = { await analysisGate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    let source = try oldFolder.makeRecording("call")
+    let target = harness.root.appendingPathComponent("call")
+    if !succeeds {
+      try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+    }
+    coordinator.transcribe(recordingDirectory: source)
+    await harness.wait { await analysisGate.calls == 1 }
+    let analysis = try #require(coordinator.refreshAttribution(in: source))
+    let moveGate = AnalysisGate()
+    let move = Task {
+      await coordinator.moveRecordings(from: oldFolder.root, to: harness.root) { from, to in
+        await moveGate.waitForRelease()
+        try FileManager.default.moveItem(at: from, to: to)
+      }
+    }
+    await harness.wait { await moveGate.calls == 1 }
+    #expect(coordinator.isMovingRecordings)
+    #expect(analysis.isCancelled)
+    #expect(harness.hookedDirectories.isEmpty)
+    coordinator.transcribe(recordingDirectory: source)
+    let newRecording = try harness.makeRecording("new")
+    coordinator.transcribe(recordingDirectory: newRecording)
+    await harness.wait {
+      coordinator.finishCount(for: source) == 2
+        && coordinator.status(for: newRecording) == .completed
+    }
+    #expect(harness.hookedDirectories == [newRecording])
+    #expect(coordinator.refreshAttribution(in: source) == nil)
+    await moveGate.release()
+    #expect(await move.value == (succeeds ? [] : ["call"]))
+    await analysisGate.release()
+    await analysis.value
+    let final = succeeds ? target : source
+    #expect(harness.hookedDirectories.map(\.path) == [newRecording.path, final.path, final.path])
+    #expect(harness.speakersAtHook == [[1], [1], [1]])
+    #expect(await analysisGate.calls == 1)
+    #expect(!coordinator.isMovingRecordings)
+  }
+
+  @Test func deletingDuringAMoveSuppressesTheHookForThatRecording() async throws {
+    let oldFolder = try TranscriptionHarness()
+    let harness = try TranscriptionHarness()
+    let source = try oldFolder.makeRecording("call")
+    harness.micEnabled = true
+    let analysisGate = AnalysisGate()
+    harness.analyzeMic = { await analysisGate.analyze(audio: $0, tokens: $1) }
+    let coordinator = harness.makeCoordinator()
+    coordinator.transcribe(recordingDirectory: source)
+    await harness.wait { await analysisGate.calls == 1 }
+    let analysis = try #require(coordinator.refreshAttribution(in: source))
+    let moveGate = AnalysisGate()
+    let move = Task {
+      await coordinator.moveRecordings(from: oldFolder.root, to: harness.root) { from, to in
+        await moveGate.waitForRelease()
+        try FileManager.default.moveItem(at: from, to: to)
+      }
+    }
+    await harness.wait { await moveGate.calls == 1 }
+    #expect(coordinator.isMovingRecordings)
+    try FileManager.default.removeItem(at: source)
+    coordinator.forgetDeletedRecording(recordingDirectory: source, job: nil)
+    let replacement = try oldFolder.makeRecording("call")
+    try saveFixture(in: replacement)
+    await moveGate.release()
+    #expect(await move.value.isEmpty)
+    #expect(TranscriptDocument.load(for: harness.root.appendingPathComponent("call")) != nil)
+    await analysisGate.release()
+    await analysis.value
+    #expect(harness.hookedDirectories.isEmpty)
+  }
+
+  @Test func moveRestartsPendingRestorationInTheNewFolder() async throws {
+    let oldFolder = try TranscriptionHarness()
+    let harness = try TranscriptionHarness()
+    let directory = try oldFolder.makeRecording("attributed")
+    try saveFixture(in: directory, local: true)
+    let coordinator = harness.makeCoordinator()
+    harness.defaults.set(true, forKey: SettingsKeys.micAttributionRestorePending)
+    let interrupted = try #require(coordinator.restoreProviderSpeakersIfPending())
+    let failed = await coordinator.moveRecordings(from: oldFolder.root, to: harness.root)
+    #expect(failed.isEmpty)
+    #expect(interrupted.isCancelled)
+    let target = harness.root.appendingPathComponent("attributed")
+    await harness.wait { !harness.defaults.bool(forKey: SettingsKeys.micAttributionRestorePending) }
+    #expect(!harness.defaults.bool(forKey: SettingsKeys.micAttributionRestorePending))
+    #expect(TranscriptDocument.load(for: target)?.segments.first?.speaker == 1)
+    #expect(TranscriptTokens.load(for: target)?.hasAttributionRecord == false)
+    #expect(harness.hookedDirectories.isEmpty)
   }
 
   @Test func deadlineFiresOnceWhileAnalysisFinishes() async throws {
